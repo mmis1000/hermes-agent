@@ -533,6 +533,11 @@ def _telegramize_command_mentions(text: str, platform: Any) -> str:
 # ``config.yaml`` ``agent.gateway_auto_continue_freshness``.
 _AUTO_CONTINUE_FRESHNESS_SECS_DEFAULT = 60 * 60
 
+# Auto-continue chained turns triggered by iteration-budget exhaustion should
+# not recurse forever on a genuinely stuck task.  Each continuation pass gets a
+# fresh standalone review; this cap is a final backstop.
+_AUTO_CONTINUE_MAX_CHAIN_DEFAULT = 8
+
 
 def _coerce_gateway_timestamp(value: Any) -> Optional[float]:
     """Best-effort conversion of stored gateway timestamps to epoch seconds.
@@ -2254,27 +2259,72 @@ def _parse_session_key(session_key: str) -> "dict | None":
     return None
 
 
+def _trim_process_command(command: str, max_len: int = 140) -> str:
+    """Return a compact one-line command preview for user-facing status text."""
+    text = " ".join(str(command or "").split()) or "<unknown command>"
+    if len(text) <= max_len:
+        return text
+    return text[: max_len - 1].rstrip() + "…"
+
+
+
+def _format_process_output_excerpt(
+    output: str,
+    *,
+    max_lines: int = 6,
+    line_max_len: int = 160,
+    total_max_chars: int = 700,
+) -> str:
+    """Summarize recent process output into short bullet lines."""
+    from tools.ansi_strip import strip_ansi
+
+    cleaned = strip_ansi(output or "").replace("\r", "\n")
+    lines = [" ".join(line.strip().split()) for line in cleaned.splitlines() if line.strip()]
+    if not lines:
+        return "- No output yet."
+
+    truncated = len(lines) > max_lines
+    selected = lines[-max_lines:]
+    bullets = []
+    for line in selected:
+        if len(line) > line_max_len:
+            line = line[: line_max_len - 1].rstrip() + "…"
+        bullets.append(f"- {line}")
+
+    text = "\n".join(bullets)
+    if len(text) > total_max_chars:
+        text = text[:total_max_chars].rstrip()
+        last_newline = text.rfind("\n")
+        if last_newline > 0:
+            text = text[:last_newline]
+        text = text.rstrip()
+        truncated = True
+
+    if truncated:
+        text += "\n- …"
+    return text
+
+
+
 def _format_gateway_process_notification(evt: dict) -> "str | None":
-    """Format a watch pattern event from completion_queue into a [IMPORTANT:] message."""
+    """Format a watch-pattern event into concise user-facing status text."""
     evt_type = evt.get("type", "completion")
-    _sid = evt.get("session_id", "unknown")
-    _cmd = evt.get("command", "unknown")
 
     if evt_type == "watch_disabled":
         return f"[IMPORTANT: {evt.get('message', '')}]"
 
     if evt_type == "watch_match":
-        _pat = evt.get("pattern", "?")
-        _out = evt.get("output", "")
-        _sup = evt.get("suppressed", 0)
+        pattern = evt.get("pattern", "?")
+        suppressed = evt.get("suppressed", 0)
+        command = _trim_process_command(evt.get("command", "unknown"))
+        excerpt = _format_process_output_excerpt(evt.get("output", ""), max_lines=4, total_max_chars=500)
         text = (
-            f"[IMPORTANT: Background process {_sid} matched "
-            f"watch pattern \"{_pat}\".\n"
-            f"Command: {_cmd}\n"
-            f"Matched output:\n{_out}"
+            f"[IMPORTANT: Background task hit watch pattern \"{pattern}\".\n"
+            f"Command: {command}\n"
+            f"Matching output:\n{excerpt}"
         )
-        if _sup:
-            text += f"\n({_sup} earlier matches were suppressed by rate limit)"
+        if suppressed:
+            text += f"\nNote: {suppressed} earlier match event(s) were suppressed by rate limit."
         text += "]"
         return text
 
@@ -12234,6 +12284,294 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """Return the platform-specific reply anchor for GatewayRunner sends."""
         return _reply_anchor_for_event(event)
 
+    @staticmethod
+    def _resume_reason_phrase(reason: Optional[str]) -> Optional[str]:
+        if not reason:
+            return None
+        return {
+            "restart_timeout": "a gateway restart",
+            "shutdown_timeout": "a gateway shutdown",
+            "restart_interrupted": "a gateway interruption",
+        }.get(reason, "a prior interruption")
+
+    def _format_long_running_status_detail(
+        self,
+        activity: Optional[dict],
+        *,
+        continuation_depth: int = 0,
+        resume_reason: Optional[str] = None,
+        include_iteration: bool = True,
+    ) -> str:
+        """Return the user-facing detail shown inside long-running status bubbles.
+
+        The detail intentionally identifies continuation/resume context so stale
+        progress bubbles from earlier runs are distinguishable when a platform
+        keeps message history instead of editing/deleting older notices.
+        """
+        activity = activity or {}
+        parts: List[str] = []
+
+        if continuation_depth > 0:
+            parts.append(f"continuation run {continuation_depth + 1}")
+
+        reason_phrase = self._resume_reason_phrase(resume_reason)
+        if reason_phrase:
+            parts.append(f"resumed after {reason_phrase}")
+
+        api_call_count = activity.get("api_call_count")
+        max_iterations = activity.get("max_iterations")
+        if include_iteration and api_call_count is not None and max_iterations is not None:
+            parts.append(f"iteration {api_call_count}/{max_iterations}")
+
+        current_tool = activity.get("current_tool")
+        if current_tool:
+            parts.append(f"running: {current_tool}")
+        else:
+            last_activity_desc = str(activity.get("last_activity_desc") or "").strip()
+            if last_activity_desc:
+                parts.append(last_activity_desc)
+
+        return ", ".join(parts)
+
+    def _max_iteration_auto_continue_chain_limit(self) -> int:
+        """Return the recursion cap for iteration-budget auto-continues."""
+        raw = cfg_get("agent.max_iteration_auto_continue_chain", _AUTO_CONTINUE_MAX_CHAIN_DEFAULT)
+        try:
+            return max(0, int(raw))
+        except (TypeError, ValueError):
+            return _AUTO_CONTINUE_MAX_CHAIN_DEFAULT
+
+    @staticmethod
+    def _trim_iteration_review_text(value: Any, limit: int = 1200) -> str:
+        text = "" if value is None else str(value)
+        text = text.strip()
+        if len(text) <= limit:
+            return text
+        return text[: max(0, limit - 3)] + "..."
+
+    def _build_iteration_review_excerpt(self, messages: List[Dict[str, Any]], limit: int = 14) -> str:
+        """Return a compact transcript excerpt for the continuation judge."""
+        excerpt_lines: List[str] = []
+        for msg in messages[-limit:]:
+            role = msg.get("role") or "unknown"
+            if role == "assistant" and msg.get("tool_calls"):
+                tool_names = []
+                for tc in msg.get("tool_calls") or []:
+                    name = ((tc or {}).get("function") or {}).get("name")
+                    if name:
+                        tool_names.append(name)
+                content = f"tool_calls={', '.join(tool_names)}"
+            else:
+                content = self._trim_iteration_review_text(msg.get("content", ""))
+            if not content:
+                content = "(empty)"
+            excerpt_lines.append(f"[{role}] {content}")
+        return "\n".join(excerpt_lines)
+
+    @staticmethod
+    def _parse_iteration_review_decision(raw_text: str) -> Dict[str, str]:
+        """Parse the standalone review agent's JSON verdict.
+
+        Falls back to ``ask_user`` when the response is malformed.
+        """
+        text = (raw_text or "").strip()
+        if not text:
+            return {"decision": "ask_user", "reason": "review agent returned an empty verdict"}
+        if text.startswith("```"):
+            text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.IGNORECASE | re.DOTALL).strip()
+        try:
+            data = json.loads(text)
+        except Exception:
+            match = re.search(r"\{.*\}", text, re.DOTALL)
+            if not match:
+                return {
+                    "decision": "ask_user",
+                    "reason": f"review agent returned non-JSON output: {text[:240]}",
+                }
+            try:
+                data = json.loads(match.group(0))
+            except Exception:
+                return {
+                    "decision": "ask_user",
+                    "reason": f"review agent returned unparsable JSON: {text[:240]}",
+                }
+        decision = str((data or {}).get("decision") or "ask_user").strip().lower()
+        if decision not in {"auto_continue", "ask_user"}:
+            decision = "ask_user"
+        reason = str((data or {}).get("reason") or "").strip()
+        return {
+            "decision": decision,
+            "reason": reason or "review agent did not provide a reason",
+        }
+
+    def _judge_iteration_budget_exhaustion(
+        self,
+        *,
+        result: Dict[str, Any],
+        source: SessionSource,
+        session_id: str,
+        session_key: Optional[str] = None,
+    ) -> Dict[str, str]:
+        """Use a standalone agent to decide whether auto-continuation is safe."""
+        from run_agent import AIAgent
+
+        messages = list(result.get("messages") or [])
+        final_response = self._trim_iteration_review_text(result.get("final_response", ""), limit=1800)
+        excerpt = self._build_iteration_review_excerpt(messages)
+        turn_exit_reason = result.get("turn_exit_reason", "")
+        api_calls = int(result.get("api_calls", 0) or 0)
+        user_goal = ""
+        for msg in reversed(messages):
+            if msg.get("role") == "user" and msg.get("content"):
+                user_goal = self._trim_iteration_review_text(msg.get("content"), limit=1200)
+                break
+
+        user_config = _load_gateway_config()
+        model, runtime_kwargs = self._resolve_session_agent_runtime(
+            source=source,
+            session_key=session_key,
+            user_config=user_config,
+        )
+        turn_route = self._resolve_turn_agent_config(user_goal or "", model, runtime_kwargs)
+        prompt = (
+            "You are a continuation-review agent for Hermes. Hermes stopped because it hit its "
+            "tool-calling iteration budget. Decide whether the task appears to be making normal "
+            "forward progress and should be auto-continued immediately, or whether it looks stuck, "
+            "blocked, looping, or dependent on missing user input and should ask the user before "
+            "continuing.\n\n"
+            "Return JSON only with exactly this schema:\n"
+            '{"decision":"auto_continue|ask_user","reason":"short explanation"}\n\n'
+            "Prefer auto_continue when the transcript shows concrete progress on a large task even "
+            "if it is unfinished. Choose ask_user when the agent appears stalled, repetitive, "
+            "confused, waiting on missing information, or likely to waste more turns.\n\n"
+            f"Turn exit reason: {turn_exit_reason}\n"
+            f"API calls used: {api_calls}\n"
+            f"Latest user goal: {user_goal or '(unknown)'}\n\n"
+            f"Model's forced summary at budget exhaustion:\n{final_response or '(none)'}\n\n"
+            f"Recent transcript excerpt:\n{excerpt or '(no transcript excerpt)'}\n"
+        )
+
+        review_agent = None
+        try:
+            review_agent = AIAgent(
+                model=turn_route["model"],
+                **turn_route["runtime"],
+                max_iterations=4,
+                quiet_mode=True,
+                verbose_logging=False,
+                enabled_toolsets=[],
+                reasoning_config=self._reasoning_config,
+                service_tier=self._service_tier,
+                request_overrides=turn_route.get("request_overrides"),
+                session_id=f"{session_id}-continuation-review",
+                platform=_platform_config_key(source.platform),
+                user_id=source.user_id,
+                user_name=source.user_name,
+                chat_id=source.chat_id,
+                chat_name=source.chat_name,
+                chat_type=source.chat_type,
+                thread_id=source.thread_id,
+                session_db=self._session_db,
+                fallback_model=self._fallback_model,
+            )
+            review_agent.suppress_status_output = True
+            review_result = review_agent.run_conversation(user_message=prompt)
+            parsed = self._parse_iteration_review_decision(
+                (review_result or {}).get("final_response", "")
+            )
+            logger.info(
+                "Continuation review verdict for session %s: %s (%s)",
+                source.chat_id,
+                parsed.get("decision"),
+                parsed.get("reason"),
+            )
+            return parsed
+        except Exception as exc:
+            logger.warning("Continuation review failed: %s", exc)
+            return {
+                "decision": "ask_user",
+                "reason": f"continuation review failed: {exc}",
+            }
+        finally:
+            if review_agent is not None:
+                try:
+                    review_agent.shutdown_memory_provider()
+                except Exception:
+                    pass
+                try:
+                    review_agent.close()
+                except Exception:
+                    pass
+
+    def _build_iteration_continue_prompt(self, *, user_approved: bool = False) -> str:
+        if user_approved:
+            return (
+                "[System note: The previous turn hit the iteration budget. The user approved "
+                "continuing from the current transcript. Continue exactly from where you left off. "
+                "Do not repeat the forced summary you already gave. Resume the unfinished work and "
+                "only stop when the task is actually complete or you need fresh user input.]"
+            )
+        return (
+            "[System note: The previous turn hit the iteration budget. A standalone review judged "
+            "that the task is still progressing normally. Continue exactly from where you left off. "
+            "Do not repeat the forced summary you already gave. Resume the unfinished work and only "
+            "stop when the task is actually complete or you need fresh user input.]"
+        )
+
+    async def _request_iteration_continuation_approval(
+        self,
+        *,
+        source: SessionSource,
+        session_key: str,
+        reason: str,
+        metadata: Optional[dict],
+    ) -> bool:
+        """Ask the user whether a questionable long-running task should continue."""
+        adapter = self.adapters.get(source.platform)
+        if not adapter:
+            return False
+
+        future: asyncio.Future[str] = asyncio.get_running_loop().create_future()
+        approval_entry = {
+            "kind": "iteration_continue",
+            "future": future,
+            "created_at": time.time(),
+            "reason": reason,
+        }
+        self._pending_approvals[session_key] = approval_entry
+
+        prompt = (
+            "⚠️ **Continuation approval required:**\n"
+            "The agent hit its iteration budget. A standalone review could not confidently "
+            "determine that continuing would be productive without your input.\n\n"
+            f"Reason: {reason}\n\n"
+            "Reply `/approve` to let the agent continue from the saved transcript, or `/deny` to stop here "
+            "and keep the current summary."
+        )
+        try:
+            adapter.pause_typing_for_chat(source.chat_id)
+        except Exception:
+            pass
+        try:
+            await adapter.send(source.chat_id, prompt, metadata=metadata)
+        except Exception as exc:
+            logger.warning("Failed to send continuation approval prompt: %s", exc)
+            self._pending_approvals.pop(session_key, None)
+            return False
+
+        try:
+            decision = await asyncio.wait_for(future, timeout=self._APPROVAL_TIMEOUT_SECONDS)
+        except asyncio.TimeoutError:
+            logger.info("Continuation approval timed out for session %s", session_key)
+            self._pending_approvals.pop(session_key, None)
+            return False
+        finally:
+            current = self._pending_approvals.get(session_key)
+            if current is approval_entry:
+                self._pending_approvals.pop(session_key, None)
+
+        return decision == "approve"
+
 
     # ------------------------------------------------------------------
     # /approve & /deny — explicit dangerous-command approval
@@ -12242,6 +12580,124 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     _APPROVAL_TIMEOUT_SECONDS = 300  # 5 minutes
 
 
+
+    async def _handle_approve_command(self, event: MessageEvent) -> Optional[str]:
+        """Handle /approve command — unblock waiting agent thread(s).
+
+        The agent thread(s) are blocked inside tools/approval.py waiting for
+        the user to respond.  This handler signals the event so the agent
+        resumes and the terminal_tool executes the command inline — the same
+        flow as the CLI's synchronous input() approval.
+
+        Supports multiple concurrent approvals (parallel subagents,
+        execute_code).  ``/approve`` resolves the oldest pending command;
+        ``/approve all`` resolves every pending command at once.
+
+        Usage:
+            /approve              — approve oldest pending command once
+            /approve all          — approve ALL pending commands at once
+            /approve session      — approve oldest + remember for session
+            /approve all session  — approve all + remember for session
+            /approve always       — approve oldest + remember permanently
+            /approve all always   — approve all + remember permanently
+        """
+        source = event.source
+        session_key = self._session_key_for_source(source)
+
+        from tools.approval import (
+            resolve_gateway_approval, has_blocking_approval,
+        )
+
+        if not has_blocking_approval(session_key):
+            pending_entry = self._pending_approvals.get(session_key)
+            if pending_entry and pending_entry.get("kind") == "iteration_continue":
+                future = pending_entry.get("future")
+                if future is not None and not future.done():
+                    future.set_result("approve")
+                self._pending_approvals.pop(session_key, None)
+                _adapter = self.adapters.get(source.platform)
+                if _adapter:
+                    _adapter.resume_typing_for_chat(source.chat_id)
+                logger.info("User approved iteration-budget continuation via /approve")
+                return "✅ Continuation approved. The agent is resuming from the saved transcript..."
+            if pending_entry:
+                self._pending_approvals.pop(session_key)
+                return t("gateway.approval_expired")
+            return t("gateway.approve.no_pending")
+
+        # Parse args: support "all", "all session", "all always", "session", "always"
+        args = event.get_command_args().strip().lower().split()
+        resolve_all = "all" in args
+        remaining = [a for a in args if a != "all"]
+
+        if any(a in {"always", "permanent", "permanently"} for a in remaining):
+            choice = "always"
+        elif any(a in {"session", "ses"} for a in remaining):
+            choice = "session"
+        else:
+            choice = "once"
+
+        count = resolve_gateway_approval(session_key, choice, resolve_all=resolve_all)
+        if not count:
+            return t("gateway.approve.no_pending")
+
+        # Resume typing indicator — agent is about to continue processing.
+        _adapter = self.adapters.get(source.platform)
+        if _adapter:
+            _adapter.resume_typing_for_chat(source.chat_id)
+
+        logger.info("User approved %d dangerous command(s) via /approve (%s)", count, choice)
+        plural = "plural" if count > 1 else "singular"
+        return t(f"gateway.approve.{choice}_{plural}", count=count)
+
+    async def _handle_deny_command(self, event: MessageEvent) -> str:
+        """Handle /deny command — reject pending dangerous command(s).
+
+        Signals blocked agent thread(s) with a 'deny' result so they receive
+        a definitive BLOCKED message, same as the CLI deny flow.
+
+        ``/deny`` denies the oldest; ``/deny all`` denies everything.
+        """
+        source = event.source
+        session_key = self._session_key_for_source(source)
+
+        from tools.approval import (
+            resolve_gateway_approval, has_blocking_approval,
+        )
+
+        if not has_blocking_approval(session_key):
+            pending_entry = self._pending_approvals.get(session_key)
+            if pending_entry and pending_entry.get("kind") == "iteration_continue":
+                future = pending_entry.get("future")
+                if future is not None and not future.done():
+                    future.set_result("deny")
+                self._pending_approvals.pop(session_key, None)
+                _adapter = self.adapters.get(source.platform)
+                if _adapter:
+                    _adapter.resume_typing_for_chat(source.chat_id)
+                logger.info("User denied iteration-budget continuation via /deny")
+                return "❌ Continuation denied. Keeping the current summary."
+            if pending_entry:
+                self._pending_approvals.pop(session_key)
+                return t("gateway.deny.stale")
+            return t("gateway.deny.no_pending")
+
+        args = event.get_command_args().strip().lower()
+        resolve_all = "all" in args
+
+        count = resolve_gateway_approval(session_key, "deny", resolve_all=resolve_all)
+        if not count:
+            return t("gateway.deny.no_pending")
+
+        # Resume typing indicator — agent continues (with BLOCKED result).
+        _adapter = self.adapters.get(source.platform)
+        if _adapter:
+            _adapter.resume_typing_for_chat(source.chat_id)
+
+        logger.info("User denied %d dangerous command(s) via /deny", count)
+        if count > 1:
+            return t("gateway.deny.denied_plural", count=count)
+        return t("gateway.deny.denied_singular")
 
     # Built-in messaging platforms where the ``/update`` command is allowed.
     # ACP, API server, and webhooks are programmatic interfaces that should
@@ -13389,10 +13845,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     or (notify_mode == "error" and session.exit_code not in {0, None})
                 )
                 if should_notify:
-                    new_output = session.output_buffer[-1000:] if session.output_buffer else ""
+                    result_label = "success" if session.exit_code == 0 else "failure"
                     message_text = (
-                        f"[Background process {session_id} finished with exit code {session.exit_code}~ "
-                        f"Here's the final output:\n{new_output}]"
+                        f"Background task finished.\n"
+                        f"Result: {result_label} (exit code {session.exit_code})\n"
+                        f"Command: {_trim_process_command(session.command)}\n"
+                        f"Latest output:\n{_format_process_output_excerpt(session.output_buffer)}"
                     )
                     adapter = None
                     for p, a in self.adapters.items():
@@ -13414,10 +13872,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             elif has_new_output and notify_mode == "all" and not agent_notify:
                 # New output available -- deliver status update (only in "all" mode)
                 # Skip periodic updates for agent_notify watchers (they only care about completion)
-                new_output = session.output_buffer[-500:] if session.output_buffer else ""
                 message_text = (
-                    f"[Background process {session_id} is still running~ "
-                    f"New output:\n{new_output}]"
+                    f"Background task still running.\n"
+                    f"Command: {_trim_process_command(session.command)}\n"
+                    f"Latest output:\n{_format_process_output_excerpt(session.output_buffer, max_lines=4, total_max_chars=450)}"
                 )
                 adapter = None
                 for p, a in self.adapters.items():
@@ -14426,6 +14884,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         session_key: str = None,
         run_generation: Optional[int] = None,
         _interrupt_depth: int = 0,
+        _continuation_depth: int = 0,
+        _notify_started_at: Optional[float] = None,
         event_message_id: Optional[str] = None,
         channel_prompt: Optional[str] = None,
         persist_user_message: Optional[str] = None,
@@ -15968,15 +16428,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 and _interruption_is_fresh
             )
 
+            _resume_reason = (
+                getattr(_resume_entry, "resume_reason", None)
+                if _resume_entry is not None
+                else None
+            )
+
             if _is_resume_pending:
-                _reason = getattr(_resume_entry, "resume_reason", None) or "restart_timeout"
-                _reason_phrase = (
-                    "a gateway restart"
-                    if _reason == "restart_timeout"
-                    else "a gateway shutdown"
-                    if _reason == "shutdown_timeout"
-                    else "a gateway interruption"
-                )
+                _reason_phrase = self._resume_reason_phrase(_resume_reason) or "a gateway interruption"
                 _persist_user_message_override = message
                 # The empty-message case is the auto-resume startup turn
                 # synthesized by _schedule_resume_pending_sessions — there is
@@ -16456,7 +16915,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
         ):
             _NOTIFY_INTERVAL = None
-        _notify_start = time.time()
+        _notify_start = _notify_started_at or time.time()
 
         async def _notify_long_running():
             if _NOTIFY_INTERVAL is None:
@@ -16504,16 +16963,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if _agent_ref and hasattr(_agent_ref, "get_activity_summary"):
                     try:
                         _a = _agent_ref.get_activity_summary()
-                        _parts = []
-                        if _want_iteration_detail:
-                            _parts.append(
-                                f"iteration {_a['api_call_count']}/{_a['max_iterations']}"
-                            )
-                        _action = _a.get("current_tool") or _a.get("last_activity_desc")
-                        if _action:
-                            _parts.append(str(_action))
-                        if _parts:
-                            _status_detail = " — " + ", ".join(_parts)
+                        _detail = self._format_long_running_status_detail(
+                            _a,
+                            continuation_depth=_continuation_depth,
+                            resume_reason=_resume_reason if _is_resume_pending else None,
+                            include_iteration=_want_iteration_detail,
+                        )
+                        if _detail:
+                            _status_detail = " — " + _detail
                     except Exception:
                         pass
                 _heartbeat_text = f"⏳ Working — {_elapsed_mins} min{_status_detail}"
@@ -16545,6 +17002,41 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     logger.debug("Long-running notification error: %s", _ne)
 
         _notify_task = asyncio.create_task(_notify_long_running())
+        _support_tasks_stopped = False
+
+        async def _stop_run_support_tasks() -> None:
+            nonlocal _support_tasks_stopped
+            if _support_tasks_stopped:
+                return
+            _support_tasks_stopped = True
+
+            # Stop progress sender, interrupt monitor, and notification task.
+            if progress_task:
+                progress_task.cancel()
+            interrupt_monitor.cancel()
+            _notify_task.cancel()
+
+            # Wait for stream consumer to finish its final edit.
+            if stream_task:
+                try:
+                    await asyncio.wait_for(stream_task, timeout=5.0)
+                except (asyncio.TimeoutError, asyncio.CancelledError):
+                    stream_task.cancel()
+                    try:
+                        await stream_task
+                    except asyncio.CancelledError:
+                        pass
+
+            # Clean up tracking.
+            tracking_task.cancel()
+
+            # Wait for cancelled tasks.
+            for task in [progress_task, interrupt_monitor, tracking_task, _notify_task]:
+                if task:
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        pass
 
         try:
             # Run in thread pool to not block.  Use an *inactivity*-based
@@ -16824,6 +17316,53 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     pending = _leftover_steer
                     logger.debug("Delivering leftover /steer as next turn: '%s...'", pending[:40])
 
+            if (
+                result
+                and not pending
+                and not pending_event
+                and not result.get("interrupted")
+                and str(result.get("turn_exit_reason", "")).startswith("max_iterations_reached")
+            ):
+                _chain_limit = self._max_iteration_auto_continue_chain_limit()
+                if _continuation_depth >= _chain_limit > 0:
+                    logger.info(
+                        "Skipping auto-continuation for session %s because chain depth %d reached limit %d",
+                        session_key or "?",
+                        _continuation_depth,
+                        _chain_limit,
+                    )
+                else:
+                    _review_result = await self._run_in_executor_with_context(
+                        lambda: self._judge_iteration_budget_exhaustion(
+                            result=result,
+                            source=source,
+                            session_id=session_id,
+                            session_key=session_key,
+                        )
+                    )
+                    _review_decision = (_review_result or {}).get("decision") or "ask_user"
+                    _review_reason = (_review_result or {}).get("reason") or ""
+                    if _review_decision == "auto_continue":
+                        pending = self._build_iteration_continue_prompt(user_approved=False)
+                        logger.info(
+                            "Auto-continuing iteration-exhausted task for session %s (%s)",
+                            session_key or "?",
+                            _review_reason,
+                        )
+                    else:
+                        _approved = await self._request_iteration_continuation_approval(
+                            source=source,
+                            session_key=session_key,
+                            reason=_review_reason,
+                            metadata=_status_thread_metadata,
+                        )
+                        if _approved:
+                            pending = self._build_iteration_continue_prompt(user_approved=True)
+                            logger.info(
+                                "User approved continuation after iteration review for session %s",
+                                session_key or "?",
+                            )
+
             # Safety net: if the pending text is a slash command (e.g. "/stop",
             # "/new"), discard it — commands should never be passed to the agent
             # as user input.  The primary fix is in base.py (commands bypass the
@@ -16986,7 +17525,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     except Exception:
                         pass
 
-                followup_result = await self._run_agent(
+                # Stop this run's support tasks before recursing so older
+                # notifiers/progress workers don't keep emitting stale status
+                # while the follow-up turn is running.
+                await _stop_run_support_tasks()
+
+                return await self._run_agent(
                     message=next_message,
                     context_prompt=context_prompt,
                     history=updated_history,
@@ -16995,47 +17539,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     session_key=session_key,
                     run_generation=run_generation,
                     _interrupt_depth=_interrupt_depth + 1,
+                    _continuation_depth=_continuation_depth + (1 if pending == self._build_iteration_continue_prompt(user_approved=False) or pending == self._build_iteration_continue_prompt(user_approved=True) else 0),
+                    _notify_started_at=_notify_start,
                     event_message_id=next_message_id,
                     channel_prompt=next_channel_prompt,
                 )
-                return _preserve_queued_followup_history_offset(result, followup_result)
         finally:
-            # Stop progress sender, interrupt monitor, and notification task
-            if progress_task:
-                progress_task.cancel()
-            interrupt_monitor.cancel()
-            _notify_task.cancel()
-
-            # Wait for stream consumer to finish its final edit
-            if stream_task:
-                # If the agent never created a stream consumer (e.g. non-
-                # streaming code path, or a test stub returning synchronously)
-                # there is nothing to flush — cancel immediately instead of
-                # waiting out the 5s timeout on a task that's just polling for
-                # a consumer that will never arrive.  This was a 5-second
-                # cost per non-streaming test run.
-                _has_stream_consumer = (
-                    stream_consumer_holder
-                    and stream_consumer_holder[0] is not None
-                )
-                if not _has_stream_consumer:
-                    stream_task.cancel()
-                    try:
-                        await stream_task
-                    except asyncio.CancelledError:
-                        pass
-                else:
-                    try:
-                        await asyncio.wait_for(stream_task, timeout=5.0)
-                    except (asyncio.TimeoutError, asyncio.CancelledError):
-                        stream_task.cancel()
-                        try:
-                            await stream_task
-                        except asyncio.CancelledError:
-                            pass
-            
-            # Clean up tracking
-            tracking_task.cancel()
+            await _stop_run_support_tasks()
             if session_key:
                 # Only release the slot if this run's generation still owns
                 # it.  A /stop or /new that bumped the generation while we
@@ -17047,14 +17557,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
             if self._draining:
                 self._update_runtime_status("draining")
-            
-            # Wait for cancelled tasks
-            for task in [progress_task, interrupt_monitor, tracking_task, _notify_task]:
-                if task:
-                    try:
-                        await task
-                    except asyncio.CancelledError:
-                        pass
 
         # If streaming already delivered the response, mark it so the
         # caller's send() is skipped (avoiding duplicate messages).
