@@ -131,6 +131,57 @@ class FailingAgent:
         }
 
 
+class IterationAutoContinueAgent:
+    """First run exhausts iterations; second run keeps working long enough
+    for periodic status notifications to fire."""
+
+    _call_count = 0
+
+    def __init__(self, **kwargs):
+        type(self)._call_count += 1
+        self.instance_id = type(self)._call_count
+        self.tool_progress_callback = kwargs.get("tool_progress_callback")
+        self.tools = []
+
+    def get_activity_summary(self):
+        if self.instance_id == 1:
+            return {
+                "last_activity_ts": time.time(),
+                "last_activity_desc": "waiting for non-streaming API response",
+                "seconds_since_activity": 0.0,
+                "current_tool": "terminal",
+                "api_call_count": 25,
+                "max_iterations": 90,
+                "budget_used": 25,
+                "budget_max": 90,
+            }
+        return {
+            "last_activity_ts": time.time(),
+            "last_activity_desc": "receiving stream response",
+            "seconds_since_activity": 0.0,
+            "current_tool": None,
+            "api_call_count": 27,
+            "max_iterations": 90,
+            "budget_used": 27,
+            "budget_max": 90,
+        }
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        if self.instance_id == 1:
+            return {
+                "final_response": "forced summary",
+                "messages": [{"role": "user", "content": "keep going"}],
+                "api_calls": 25,
+                "turn_exit_reason": "max_iterations_reached(25/90)",
+            }
+        time.sleep(0.12)
+        return {
+            "final_response": "done",
+            "messages": [{"role": "user", "content": "keep going"}],
+            "api_calls": 27,
+        }
+
+
 def _make_runner(adapter):
     gateway_run = importlib.import_module("gateway.run")
     GatewayRunner = gateway_run.GatewayRunner
@@ -365,3 +416,51 @@ async def test_cleanup_chains_with_existing_callback(monkeypatch, tmp_path):
     # deletes at least one progress bubble.
     assert pre_existing_fired == [True]
     assert len(adapter.deleted) >= 1
+
+
+@pytest.mark.asyncio
+async def test_auto_continue_cancels_stale_long_running_notifier(monkeypatch, tmp_path):
+    """Auto-continued runs should make the status text itself identify the
+    later run, so older progress bubbles are distinguishable in chat history."""
+
+    gateway_run = importlib.import_module("gateway.run")
+    runner = object.__new__(gateway_run.GatewayRunner)
+
+    detail = runner._format_long_running_status_detail(
+        {
+            "api_call_count": 27,
+            "max_iterations": 90,
+            "current_tool": None,
+            "last_activity_desc": "receiving stream response",
+        },
+        continuation_depth=1,
+        resume_reason=None,
+    )
+
+    assert "continuation run 2" in detail
+    assert "iteration 27/90" in detail
+    assert "receiving stream response" in detail
+
+
+@pytest.mark.asyncio
+async def test_resume_pending_status_labels_restarted_run(monkeypatch, tmp_path):
+    """Restart-resumed turns should label their status bubbles so stale progress
+    breadcrumbs from older runs are easier to distinguish in chat history."""
+
+    gateway_run = importlib.import_module("gateway.run")
+    runner = object.__new__(gateway_run.GatewayRunner)
+
+    detail = runner._format_long_running_status_detail(
+        {
+            "api_call_count": 12,
+            "max_iterations": 90,
+            "current_tool": "terminal",
+            "last_activity_desc": "running after restart",
+        },
+        continuation_depth=0,
+        resume_reason="restart_interrupted",
+    )
+
+    assert "resumed after a gateway interruption" in detail
+    assert "iteration 12/90" in detail
+    assert "running: terminal" in detail

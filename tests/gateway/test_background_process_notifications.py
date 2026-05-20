@@ -29,7 +29,10 @@ class _FakeRegistry:
 
     def get(self, session_id):
         if self._sessions:
-            return self._sessions.pop(0)
+            session = self._sessions.pop(0)
+            if session is not None and not hasattr(session, "command"):
+                session.command = "pytest -q"
+            return session
         return None
 
     def is_completion_consumed(self, session_id):
@@ -130,7 +133,7 @@ class TestLoadBackgroundNotificationsMode:
                 None,  # process disappears → watcher exits
             ],
             1,
-            "is still running",
+            "Background task still running.",
         ),
         # result mode: running output → no update
         (
@@ -154,7 +157,7 @@ class TestLoadBackgroundNotificationsMode:
             "result",
             [SimpleNamespace(output_buffer="done\n", exited=True, exit_code=0)],
             1,
-            "finished with exit code 0",
+            "Result: success (exit code 0)",
         ),
         # error mode: exit 0 → no notification
         (
@@ -168,14 +171,14 @@ class TestLoadBackgroundNotificationsMode:
             "error",
             [SimpleNamespace(output_buffer="traceback\n", exited=True, exit_code=1)],
             1,
-            "finished with exit code 1",
+            "Result: failure (exit code 1)",
         ),
         # all mode: exited → notifies
         (
             "all",
             [SimpleNamespace(output_buffer="ok\n", exited=True, exit_code=0)],
             1,
-            "finished with exit code 0",
+            "Result: success (exit code 0)",
         ),
     ],
 )
