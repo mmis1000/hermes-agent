@@ -9440,7 +9440,11 @@ class HermesCLI:
         if not last_response.strip():
             return
 
-        decision = mgr.evaluate_after_turn(last_response, user_initiated=True)
+        decision = mgr.evaluate_after_turn(
+            last_response,
+            user_initiated=True,
+            transcript_messages=self.conversation_history or [],
+        )
         msg = decision.get("message") or ""
         if msg:
             _cprint(f"  {msg}")

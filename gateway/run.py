@@ -8158,6 +8158,10 @@ class GatewayRunner:
         """Inner handler that runs under the _running_agents sentinel guard."""
         _msg_start_time = time.time()
         _platform_name = source.platform.value if hasattr(source.platform, "value") else str(source.platform)
+        # Keep the literal inbound text before auto-skill/context expansion so
+        # direct user messages can become first-class task intents without
+        # lossy prompt wrappers replacing the raw task contract.
+        _raw_inbound_user_text = event.text or ""
         _msg_preview = (event.text or "")[:80].replace("\n", " ")
         logger.info(
             "inbound message: platform=%s user=%s chat=%s msg=%r",
@@ -8735,6 +8739,22 @@ class GatewayRunner:
         if message_text is None:
             return
 
+        _task_intent_mgr = None
+        _task_intent_notice = ""
+        _is_direct_user_task_message = (
+            not bool(getattr(event, "internal", False))
+            and not event.is_command()
+            and bool((_raw_inbound_user_text or "").strip())
+        )
+        if _is_direct_user_task_message:
+            try:
+                from hermes_cli.task_intents import TaskIntentManager
+
+                _task_intent_mgr = TaskIntentManager(session_entry.session_id)
+                _task_intent_mgr.record_direct_message(_raw_inbound_user_text)
+            except Exception as _task_exc:
+                logger.debug("direct task-intent record failed for %s: %s", session_key, _task_exc)
+
         # Bind this gateway run generation to the adapter's active-session
         # event so deferred post-delivery callbacks can be released by the
         # same run that registered them.
@@ -8840,6 +8860,23 @@ class GatewayRunner:
             )
             response = _sanitize_gateway_final_response(source.platform, response)
 
+            if _task_intent_mgr is not None and response:
+                try:
+                    _direct_decision = _task_intent_mgr.evaluate_after_response(response)
+                    _notice_parts = []
+                    if _direct_decision.get("guard_vetoed_done"):
+                        _notice_parts.append(
+                            "⚠️ Direct-message completion guard kept the task active: "
+                            + str(_direct_decision.get("reason") or "raw preserved task is not complete")
+                        )
+                    _preserved_notice = _task_intent_mgr.format_preserved_state_notice()
+                    if _preserved_notice:
+                        _notice_parts.append(_preserved_notice)
+                    if _notice_parts:
+                        _task_intent_notice = "\n\n".join(_notice_parts)
+                except Exception as _task_eval_exc:
+                    logger.debug("direct task-intent evaluation failed for %s: %s", session_key, _task_eval_exc)
+
             # If the agent's session_id changed during compression, update
             # session_entry so transcript writes below go to the right session.
             if agent_result.get("session_id") and agent_result["session_id"] != session_entry.session_id:
@@ -8889,6 +8926,9 @@ class GatewayRunner:
                 _footer_line = ""
             if _footer_line and response and not agent_result.get("already_sent"):
                 response = f"{response}\n\n{_footer_line}"
+
+            if _task_intent_notice and response and not agent_result.get("already_sent"):
+                response = f"{response}\n\n{_task_intent_notice}"
 
             # Emit agent:end hook
             await self.hooks.emit("agent:end", {
@@ -10984,7 +11024,17 @@ class GatewayRunner:
         if not mgr.is_active():
             return
 
-        decision = mgr.evaluate_after_turn(final_response or "", user_initiated=True)
+        _goal_transcript = []
+        try:
+            _goal_transcript = self.session_store.load_transcript(sid) or []
+        except Exception:
+            _goal_transcript = []
+
+        decision = mgr.evaluate_after_turn(
+            final_response or "",
+            user_initiated=True,
+            transcript_messages=_goal_transcript,
+        )
         msg = decision.get("message") or ""
 
         # Defer the status line until after the adapter has delivered the
@@ -11003,6 +11053,17 @@ class GatewayRunner:
         if not prompt or source is None:
             return
 
+        try:
+            from hermes_cli.task_intents import TaskIntentManager as _TaskIntentManager
+
+            _TaskIntentManager(sid).add_machine_preserved_message(
+                prompt,
+                origin="goal_continuation",
+                status="queued",
+            )
+        except Exception as exc:
+            logger.debug("goal continuation: preserved raw machine message failed: %s", exc)
+
         # Enqueue via the adapter's FIFO so a user message already in
         # flight preempts the continuation naturally.
         try:
@@ -11015,6 +11076,7 @@ class GatewayRunner:
                     source=source,
                     message_id=None,
                     channel_prompt=None,
+                    internal=True,
                 )
                 self._enqueue_fifo(_quick_key, cont_event, adapter)
         except Exception as exc:
@@ -13827,16 +13889,103 @@ class GatewayRunner:
 
     @staticmethod
     def _trim_iteration_review_text(value: Any, limit: int = 1200) -> str:
-        text = "" if value is None else str(value)
-        text = text.strip()
+        text = str(value or "").strip()
         if len(text) <= limit:
             return text
         return text[: max(0, limit - 3)] + "..."
 
+    @staticmethod
+    def _is_synthetic_iteration_control_message(text: Any) -> bool:
+        """Return True for Hermes-injected max-iteration control prompts.
+
+        These messages are not the user's actual task requirements. Treating them
+        as the "latest user goal" causes continuation review and follow-up
+        prompts to anchor on Hermes' synthetic summarize/continue instructions
+        instead of the user's real objective.
+        """
+        content = str(text or "").strip()
+        if not content:
+            return False
+        if content.startswith("You've reached the maximum number of tool-calling iterations allowed."):
+            return True
+        return content.startswith("[System note: The previous turn hit the iteration budget.")
+
+    def _extract_latest_real_user_goal(self, messages: List[Dict[str, Any]], limit: int = 1200) -> str:
+        """Return the latest non-synthetic user instruction from a transcript.
+
+        If a compaction handoff preserved a structured unresolved task contract,
+        prefer that as the primary goal anchor and merge any later live user
+        supplement into it.
+        """
+        latest_live_user = ""
+        latest_live_user_idx = -1
+        for idx in range(len(messages or []) - 1, -1, -1):
+            msg = (messages or [])[idx]
+            if msg.get("role") != "user":
+                continue
+            content = msg.get("content")
+            if not content or self._is_synthetic_iteration_control_message(content):
+                continue
+            latest_live_user = self._trim_iteration_review_text(content, limit=limit)
+            latest_live_user_idx = idx
+            break
+
+        try:
+            from agent.context_compressor import ContextCompressor
+
+            latest_contract = None
+            latest_contract_idx = -1
+            for idx, msg in enumerate(messages or []):
+                parsed = ContextCompressor._parse_preserved_task_contract_from_text(msg.get("content"))
+                if parsed:
+                    latest_contract = parsed
+                    latest_contract_idx = idx
+
+            if latest_contract:
+                primary = str(latest_contract.get("primary_request") or "").strip()
+                supplements = [
+                    str(item).strip()
+                    for item in (latest_contract.get("supplements") or [])
+                    if str(item).strip()
+                ]
+                if (
+                    latest_live_user
+                    and latest_live_user_idx > latest_contract_idx
+                    and latest_live_user != primary
+                    and latest_live_user not in supplements
+                ):
+                    if ContextCompressor._is_explicit_task_replacement(latest_live_user):
+                        primary = latest_live_user
+                        supplements = []
+                    else:
+                        supplements.append(latest_live_user)
+
+                lines = []
+                if primary:
+                    lines.extend(["Primary unresolved task:", primary])
+                if supplements:
+                    lines.extend(["", "Supplements / constraints:"])
+                    lines.extend(f"- {item}" for item in supplements)
+                combined = "\n".join(lines).strip()
+                if combined:
+                    return self._trim_iteration_review_text(combined, limit=limit)
+        except Exception:
+            pass
+
+        return latest_live_user
+
     def _build_iteration_review_excerpt(self, messages: List[Dict[str, Any]], limit: int = 14) -> str:
         """Return a compact transcript excerpt for the continuation judge."""
         excerpt_lines: List[str] = []
-        for msg in messages[-limit:]:
+        filtered_messages = [
+            msg
+            for msg in (messages or [])
+            if not (
+                msg.get("role") == "user"
+                and self._is_synthetic_iteration_control_message(msg.get("content"))
+            )
+        ]
+        for msg in filtered_messages[-limit:]:
             role = msg.get("role") or "unknown"
             if role == "assistant" and msg.get("tool_calls"):
                 tool_names = []
@@ -13904,11 +14053,7 @@ class GatewayRunner:
         excerpt = self._build_iteration_review_excerpt(messages)
         turn_exit_reason = result.get("turn_exit_reason", "")
         api_calls = int(result.get("api_calls", 0) or 0)
-        user_goal = ""
-        for msg in reversed(messages):
-            if msg.get("role") == "user" and msg.get("content"):
-                user_goal = self._trim_iteration_review_text(msg.get("content"), limit=1200)
-                break
+        user_goal = self._extract_latest_real_user_goal(messages, limit=1200)
 
         user_config = _load_gateway_config()
         model, runtime_kwargs = self._resolve_session_agent_runtime(
@@ -13987,19 +14132,30 @@ class GatewayRunner:
                 except Exception:
                     pass
 
-    def _build_iteration_continue_prompt(self, *, user_approved: bool = False) -> str:
+    def _build_iteration_continue_prompt(
+        self,
+        *,
+        user_approved: bool = False,
+        user_goal: str = "",
+    ) -> str:
+        goal_clause = ""
+        if user_goal:
+            goal_clause = (
+                " Preserve the user's original goal and all explicit requirements: "
+                f"{self._trim_iteration_review_text(user_goal, limit=700)}"
+            )
         if user_approved:
             return (
                 "[System note: The previous turn hit the iteration budget. The user approved "
                 "continuing from the current transcript. Continue exactly from where you left off. "
                 "Do not repeat the forced summary you already gave. Resume the unfinished work and "
-                "only stop when the task is actually complete or you need fresh user input.]"
+                f"only stop when the task is actually complete or you need fresh user input.{goal_clause}]"
             )
         return (
             "[System note: The previous turn hit the iteration budget. A standalone review judged "
             "that the task is still progressing normally. Continue exactly from where you left off. "
             "Do not repeat the forced summary you already gave. Resume the unfinished work and only "
-            "stop when the task is actually complete or you need fresh user input.]"
+            f"stop when the task is actually complete or you need fresh user input.{goal_clause}]"
         )
 
     async def _request_iteration_continuation_approval(
@@ -18056,8 +18212,12 @@ class GatewayRunner:
                     )
                     _review_decision = (_review_result or {}).get("decision") or "ask_user"
                     _review_reason = (_review_result or {}).get("reason") or ""
+                    _real_user_goal = self._extract_latest_real_user_goal(result.get("messages") or [])
                     if _review_decision == "auto_continue":
-                        pending = self._build_iteration_continue_prompt(user_approved=False)
+                        pending = self._build_iteration_continue_prompt(
+                            user_approved=False,
+                            user_goal=_real_user_goal,
+                        )
                         logger.info(
                             "Auto-continuing iteration-exhausted task for session %s (%s)",
                             session_key or "?",
@@ -18071,7 +18231,10 @@ class GatewayRunner:
                             metadata=_status_thread_metadata,
                         )
                         if _approved:
-                            pending = self._build_iteration_continue_prompt(user_approved=True)
+                            pending = self._build_iteration_continue_prompt(
+                                user_approved=True,
+                                user_goal=_real_user_goal,
+                            )
                             logger.info(
                                 "User approved continuation after iteration review for session %s",
                                 session_key or "?",

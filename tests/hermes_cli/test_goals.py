@@ -27,8 +27,20 @@ def hermes_home(tmp_path, monkeypatch):
     from hermes_cli import goals
 
     goals._DB_CACHE.clear()
+    try:
+        from hermes_cli import task_intents
+
+        task_intents._DB_CACHE.clear()
+    except Exception:
+        pass
     yield home
     goals._DB_CACHE.clear()
+    try:
+        from hermes_cli import task_intents
+
+        task_intents._DB_CACHE.clear()
+    except Exception:
+        pass
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -175,6 +187,40 @@ class TestJudgeGoal:
         assert verdict == "continue"
         assert reason == "not yet"
 
+    def test_judge_goal_includes_task_contract_in_prompt(self):
+        from hermes_cli import goals
+
+        fake_client = MagicMock()
+        fake_client.chat.completions.create.return_value = MagicMock(
+            choices=[
+                MagicMock(
+                    message=MagicMock(content='{"done": false, "reason": "missing requirements"}')
+                )
+            ]
+        )
+        with patch(
+            "agent.auxiliary_client.get_text_auxiliary_client",
+            return_value=(fake_client, "judge-model"),
+        ):
+            verdict, reason, parse_failed = goals.judge_goal(
+                "ship the full feature",
+                "implemented the first slice",
+                task_contract=(
+                    "Primary unresolved task:\n"
+                    "ship the full feature\n\n"
+                    "Supplements / constraints:\n"
+                    "- include subtitles\n"
+                    "- keep recurring characters stable"
+                ),
+            )
+
+        assert verdict == "continue"
+        assert reason == "missing requirements"
+        assert parse_failed is False
+        prompt = fake_client.chat.completions.create.call_args.kwargs["messages"][1]["content"]
+        assert "include subtitles" in prompt
+        assert "keep recurring characters stable" in prompt
+
 
 # ──────────────────────────────────────────────────────────────────────
 # GoalManager lifecycle + persistence
@@ -245,11 +291,20 @@ class TestGoalManager:
         from hermes_cli.goals import GoalManager
 
         mgr1 = GoalManager(session_id="persist-sid")
-        mgr1.set("do the thing")
+        mgr1.set(
+            "do the thing",
+            task_contract=(
+                "Primary unresolved task:\n"
+                "do the thing\n\n"
+                "Supplements / constraints:\n"
+                "- preserve all requirements"
+            ),
+        )
 
         mgr2 = GoalManager(session_id="persist-sid")
         assert mgr2.state is not None
         assert mgr2.state.goal == "do the thing"
+        assert "preserve all requirements" in (mgr2.state.task_contract or "")
         assert mgr2.is_active()
 
     def test_evaluate_after_turn_done(self, hermes_home):
@@ -277,12 +332,24 @@ class TestGoalManager:
         mgr.set("a long goal")
 
         with patch.object(goals, "judge_goal", return_value=("continue", "more work", False)):
-            decision = mgr.evaluate_after_turn("made some progress")
+            decision = mgr.evaluate_after_turn(
+                "made some progress",
+                transcript_messages=[
+                    {
+                        "role": "user",
+                        "content": "Do the full multi-scene job with subtitles and recurring characters.",
+                    },
+                    {"role": "assistant", "content": "Started implementation."},
+                    {"role": "user", "content": "Low resolution is okay for the first pass."},
+                ],
+            )
 
         assert decision["verdict"] == "continue"
         assert decision["should_continue"] is True
         assert decision["continuation_prompt"] is not None
         assert "a long goal" in decision["continuation_prompt"]
+        assert "Low resolution is okay for the first pass." in decision["continuation_prompt"]
+        assert "multi-scene" in (mgr.state.task_contract or "")
         assert mgr.state.status == "active"
         assert mgr.state.turns_used == 1
 
@@ -738,3 +805,30 @@ class TestStatusLineSubgoalCount:
         mgr.add_subgoal("b")
         line = mgr.status_line()
         assert "2 subgoals" in line
+
+def test_goal_done_veto_preserves_plural_more_styles_contract(hermes_home, monkeypatch):
+    from hermes_cli.goals import GoalManager
+    import hermes_cli.goals as goals
+
+    monkeypatch.setattr(goals, "judge_goal", lambda *a, **kw: ("done", "model said done", False))
+
+    mgr = GoalManager("sid-goal-veto")
+    mgr.set("add more styles")
+    decision = mgr.evaluate_after_turn("I added one style. Done.")
+
+    assert decision["verdict"] == "continue"
+    assert decision["should_continue"] is True
+    assert "done vetoed" in decision["reason"]
+    assert mgr.state is not None
+    assert mgr.state.status == "active"
+
+
+def test_goal_continuation_prompt_marks_raw_contract_authoritative(hermes_home):
+    from hermes_cli.goals import GoalManager
+
+    mgr = GoalManager("sid-goal-raw-contract")
+    mgr.set("continue", task_contract="Primary unresolved task:\nadd more styles")
+    prompt = mgr.next_continuation_prompt() or ""
+
+    assert "raw text is authoritative" in prompt
+    assert "add more styles" in prompt
