@@ -69,6 +69,7 @@ from agent.auxiliary_client import call_llm
 from hermes_constants import get_hermes_home
 from utils import is_truthy_value
 from hermes_cli.config import cfg_get
+from tools.environments.base import _apply_child_oom_score_adj
 
 try:
     from tools.website_policy import check_website_access
@@ -913,6 +914,7 @@ def _run_chrome_fallback_command(
                 stdin=subprocess.DEVNULL, env=browser_env,
                 **_popen_extra,
             )
+            _apply_child_oom_score_adj(proc.pid)
         finally:
             os.close(stdout_fd)
             os.close(stderr_fd)
@@ -2077,6 +2079,7 @@ def _run_browser_command(
                 env=browser_env,
                 **_popen_extra,
             )
+            _apply_child_oom_score_adj(proc.pid)
         finally:
             os.close(stdout_fd)
             os.close(stderr_fd)

@@ -41,6 +41,7 @@ import time
 import uuid
 
 _IS_WINDOWS = platform.system() == "Windows"
+from tools.environments.base import _apply_child_oom_score_adj
 from tools.environments.local import _find_shell, _resolve_safe_cwd, _sanitize_subprocess_env
 from hermes_cli._subprocess_compat import windows_hide_flags
 from dataclasses import dataclass, field
@@ -557,6 +558,7 @@ class ProcessRegistry:
                     dimensions=(30, 120),
                 )
                 session.pid = pty_proc.pid
+                _apply_child_oom_score_adj(session.pid)
                 # Store the pty handle on the session for read/write
                 session._pty = pty_proc
 
@@ -606,6 +608,7 @@ class ProcessRegistry:
             preexec_fn=None if _IS_WINDOWS else os.setsid,
             **_popen_kwargs,
         )
+        _apply_child_oom_score_adj(proc.pid)
 
         session.process = proc
         session.pid = proc.pid
