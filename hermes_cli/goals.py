@@ -138,6 +138,13 @@ JUDGE_SYSTEM_PROMPT = (
     "finishes.\n\n"
     "CONTINUE — not done, and there is a concrete next step the agent can "
     "take right now. This is the default when in doubt.\n\n"
+    "If a preserved unresolved task contract is provided, treat it as an "
+    "authoritative extension of the goal. Do NOT say done if the response "
+    "only completes one slice while preserved requirements remain unmet. "
+    "Plural/additional wording is semantically important: a request such as "
+    "'more styles', 'several variants', or 'additional scenes' is NOT "
+    "completed by producing exactly one style/variant/scene unless the user "
+    "explicitly narrowed the scope. When uncertain, CONTINUE.\n\n"
     "Reply ONLY with a single JSON object on one line. Shapes:\n"
     '{"verdict": "done", "reason": "<one sentence>"}\n'
     '{"verdict": "continue", "reason": "<one sentence>"}\n'
@@ -433,6 +440,11 @@ class GoalState:
     # constraints / boundaries / stop_when). Empty by default; a goal with
     # no contract behaves exactly like the original free-form goal.
     contract: GoalContract = field(default_factory=GoalContract)
+    # Raw preserved unresolved task requirements derived from transcript
+    # compaction/direct-message state. This complements the structured
+    # completion contract; raw text stays canonical for plural/additional
+    # wording that summaries can erase.
+    task_contract: Optional[str] = None
 
     def to_json(self) -> str:
         data = asdict(self)
@@ -464,6 +476,7 @@ class GoalState:
             waiting_reason=data.get("waiting_reason"),
             waiting_since=float(data.get("waiting_since", 0.0) or 0.0),
             contract=GoalContract.from_dict(data.get("contract")),
+            task_contract=data.get("task_contract"),
         )
 
     # --- contract helpers -------------------------------------------------
@@ -841,6 +854,7 @@ def judge_goal(
     subgoals: Optional[List[str]] = None,
     background_processes: Optional[List[Dict[str, Any]]] = None,
     contract: Optional[GoalContract] = None,
+    task_contract: str = "",
 ) -> Tuple[str, str, bool, Optional[Dict[str, Any]]]:
     """Ask the auxiliary model whether the goal is satisfied.
 
@@ -866,6 +880,12 @@ def judge_goal(
     — a contract, subgoals, and a background-process list can coexist in one
     judge prompt; when none are set, behavior is identical to the original
     free-form judge.
+
+    ``task_contract`` is raw preserved unresolved task text recovered from
+    transcript compaction/direct-message state. It is appended to the judge
+    prompt for every shape so free-form goals, structured contracts, subgoals,
+    and WAIT/background-process handling all retain the user's literal task
+    scope.
 
     This is deliberately fail-open: any error returns ``("continue", ..., False, None)``
     so a broken judge doesn't wedge progress — the turn budget and the
@@ -932,6 +952,14 @@ def judge_goal(
             response=_truncate(last_response, _JUDGE_RESPONSE_SNIPPET_CHARS),
             background_block=background_block,
             current_time=current_time,
+        )
+
+    if task_contract and task_contract.strip():
+        prompt += (
+            "\n\nPreserved unresolved task contract "
+            "(raw text is authoritative; all of these requirements must still be "
+            "satisfied unless the user explicitly changed scope):\n"
+            f"{_truncate(task_contract.strip(), 2500)}"
         )
 
     try:
@@ -1140,7 +1168,14 @@ class GoalManager:
 
     # --- mutation -----------------------------------------------------
 
-    def set(self, goal: str, *, max_turns: Optional[int] = None, contract: Optional[GoalContract] = None) -> GoalState:
+    def set(
+        self,
+        goal: str,
+        *,
+        max_turns: Optional[int] = None,
+        contract: Optional[GoalContract] = None,
+        task_contract: Optional[str] = None,
+    ) -> GoalState:
         goal = (goal or "").strip()
         if not goal:
             raise ValueError("goal text is empty")
@@ -1152,6 +1187,7 @@ class GoalManager:
             created_at=time.time(),
             last_turn_at=0.0,
             contract=contract if contract is not None else GoalContract(),
+            task_contract=(task_contract or "").strip() or None,
         )
         self._state = state
         save_goal(self.session_id, state)
@@ -1377,6 +1413,29 @@ class GoalManager:
             return False
         return False
 
+    @staticmethod
+    def _derive_task_contract_from_transcript(messages: Optional[list[Dict[str, Any]]]) -> str:
+        if not messages:
+            return ""
+        try:
+            from agent.context_compressor import ContextCompressor
+
+            contract = ContextCompressor._derive_preserved_task_contract_from_messages(messages)
+            if not contract:
+                return ""
+            primary = str(contract.get("primary_request") or "").strip()
+            supplements = [str(x).strip() for x in (contract.get("supplements") or []) if str(x).strip()]
+            if not primary:
+                return ""
+            lines = ["Primary unresolved task:", primary]
+            if supplements:
+                lines.extend(["", "Supplements / constraints:"])
+                lines.extend(f"- {item}" for item in supplements)
+            return "\n".join(lines)
+        except Exception as exc:
+            logger.debug("GoalManager: task contract derivation failed: %s", exc)
+            return ""
+
     # --- the main entry point called after every turn -----------------
 
     def evaluate_after_turn(
@@ -1385,6 +1444,7 @@ class GoalManager:
         *,
         user_initiated: bool = True,
         background_processes: Optional[List[Dict[str, Any]]] = None,
+        transcript_messages: Optional[list[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
         """Run the judge and update state. Return a decision dict.
 
@@ -1396,6 +1456,10 @@ class GoalManager:
         snapshot for this session. It's handed to the judge so it can decide
         to WAIT on an in-flight process (CI poller, build, ...) instead of
         re-poking the agent — the automatic counterpart to ``/goal wait``.
+
+        ``transcript_messages`` lets callers refresh the raw preserved task
+        contract from compaction history before judging so /goal completion
+        remains anchored to direct user wording and additive supplements.
 
         Decision keys:
           - ``status``: current goal status after update
@@ -1441,15 +1505,42 @@ class GoalManager:
         state.turns_used += 1
         state.last_turn_at = time.time()
 
+        if transcript_messages:
+            refreshed_contract = self._derive_task_contract_from_transcript(transcript_messages)
+            if refreshed_contract and refreshed_contract != (state.task_contract or ""):
+                state.task_contract = refreshed_contract
+
         verdict, reason, parse_failed, wait_directive = judge_goal(
             state.goal,
             last_response,
             subgoals=state.subgoals or None,
             background_processes=background_processes,
             contract=state.contract if state.has_contract() else None,
+            task_contract=state.task_contract or "",
         )
         state.last_verdict = verdict
         state.last_reason = reason
+
+        if verdict == "done":
+            try:
+                from hermes_cli.task_intents import should_veto_done_for_multiplicity
+
+                raw_goal_contract = "\n".join(
+                    part for part in (state.goal, state.task_contract or "") if part
+                )
+                if should_veto_done_for_multiplicity(
+                    raw_task_text=raw_goal_contract,
+                    response=last_response,
+                ):
+                    verdict = "continue"
+                    reason = (
+                        "done vetoed: preserved raw goal/task contract implies "
+                        "multiple/additional outputs but response only completed one slice"
+                    )
+                    state.last_verdict = verdict
+                    state.last_reason = reason
+            except Exception as exc:
+                logger.debug("GoalManager: multiplicity done-veto failed: %s", exc)
 
         # Track consecutive judge parse failures. Reset on any usable reply,
         # including API / transport errors (parse_failed=False) so a flaky
@@ -1557,6 +1648,7 @@ class GoalManager:
     def next_continuation_prompt(self) -> Optional[str]:
         if not self._state or self._state.status != "active":
             return None
+        raw_task_contract = (self._state.task_contract or "").strip()
         # Contract takes priority: it carries the verification surface and
         # constraints the agent must target. Subgoals fold in as extra
         # criteria appended to the contract block.
@@ -1568,16 +1660,24 @@ class GoalManager:
                     for i, text in enumerate(self._state.subgoals, start=1)
                 )
                 contract_block = f"{contract_block}\n{extra}"
-            return CONTINUATION_PROMPT_WITH_CONTRACT_TEMPLATE.format(
+            prompt = CONTINUATION_PROMPT_WITH_CONTRACT_TEMPLATE.format(
                 goal=self._state.goal,
                 contract_block=contract_block,
             )
-        if self._state.subgoals:
-            return CONTINUATION_PROMPT_WITH_SUBGOALS_TEMPLATE.format(
+        elif self._state.subgoals:
+            prompt = CONTINUATION_PROMPT_WITH_SUBGOALS_TEMPLATE.format(
                 goal=self._state.goal,
                 subgoals_block=self._state.render_subgoals_block(),
             )
-        return CONTINUATION_PROMPT_TEMPLATE.format(goal=self._state.goal)
+        else:
+            prompt = CONTINUATION_PROMPT_TEMPLATE.format(goal=self._state.goal)
+        if raw_task_contract:
+            prompt += (
+                "\n\n[Preserved unresolved task contract — raw text is authoritative; "
+                "do not summarize away plural/additional wording]\n"
+                f"{raw_task_contract}"
+            )
+        return prompt
 
     def render_contract(self) -> str:
         """Public helper for the /goal show + /goal draft slash commands."""

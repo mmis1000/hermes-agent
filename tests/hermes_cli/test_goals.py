@@ -1566,3 +1566,31 @@ class TestContractAndBackgroundCompose:
             )
         assert verdict == "done"
         assert wait_directive is None
+
+
+def test_goal_done_veto_preserves_plural_more_styles_contract(hermes_home, monkeypatch):
+    from hermes_cli.goals import GoalManager
+    import hermes_cli.goals as goals
+
+    monkeypatch.setattr(goals, "judge_goal", lambda *a, **kw: ("done", "model said done", False))
+
+    mgr = GoalManager("sid-goal-veto")
+    mgr.set("add more styles")
+    decision = mgr.evaluate_after_turn("I added one style. Done.")
+
+    assert decision["verdict"] == "continue"
+    assert decision["should_continue"] is True
+    assert "done vetoed" in decision["reason"]
+    assert mgr.state is not None
+    assert mgr.state.status == "active"
+
+
+def test_goal_continuation_prompt_marks_raw_contract_authoritative(hermes_home):
+    from hermes_cli.goals import GoalManager
+
+    mgr = GoalManager("sid-goal-raw-contract")
+    mgr.set("continue", task_contract="Primary unresolved task:\nadd more styles")
+    prompt = mgr.next_continuation_prompt() or ""
+
+    assert "raw text is authoritative" in prompt
+    assert "add more styles" in prompt

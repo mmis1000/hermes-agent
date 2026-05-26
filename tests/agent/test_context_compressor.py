@@ -2071,6 +2071,73 @@ class TestSummaryTargetRatio:
         c.protect_first_n = 3
         assert c._protect_head_size(msgs) == 3
 
+    def test_derive_preserved_task_contract_keeps_primary_and_supplements(self):
+        contract = ContextCompressor._derive_preserved_task_contract_from_messages(
+            [
+                {
+                    "role": "user",
+                    "content": "Do the full job: produce a multi-scene video with recurring characters and subtitle burn-in.",
+                },
+                {
+                    "role": "assistant",
+                    "content": "I will start by wiring the pipeline.",
+                },
+                {
+                    "role": "user",
+                    "content": "Low resolution is okay for the first pass.",
+                },
+            ]
+        )
+
+        assert contract == {
+            "primary_request": "Do the full job: produce a multi-scene video with recurring characters and subtitle burn-in.",
+            "supplements": ["Low resolution is okay for the first pass."],
+        }
+
+    def test_compress_appends_preserved_task_contract_block(self):
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = "summary text"
+
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            c = ContextCompressor(model="test", quiet_mode=True, protect_first_n=2, protect_last_n=2)
+        c.threshold_tokens = 1
+
+        msgs = [
+            {"role": "system", "content": "system prompt"},
+            {
+                "role": "user",
+                "content": "Do the full job: produce a multi-scene video with recurring characters and subtitle burn-in.",
+            },
+            {"role": "assistant", "content": "Working on it."},
+            {"role": "user", "content": "Low resolution is okay for the first pass."},
+            {"role": "assistant", "content": "Acknowledged."},
+        ]
+        msgs.extend(
+            {
+                "role": "user" if i % 2 == 0 else "assistant",
+                "content": f"filler {i}",
+            }
+            for i in range(12)
+        )
+        msgs.extend([
+            {"role": "user", "content": "tail user"},
+            {"role": "assistant", "content": "tail assistant"},
+        ])
+
+        with patch("agent.context_compressor.call_llm", return_value=mock_response):
+            result = c.compress(msgs)
+
+        summary_msg = next(
+            m for m in result if (m.get("content") or "").startswith(SUMMARY_PREFIX)
+        )
+        summary_text = summary_msg["content"]
+        assert "[PRESERVED UNRESOLVED TASK CONTRACT]" in summary_text
+        assert "Primary task:" in summary_text
+        assert "Do the full job: produce a multi-scene video with recurring characters and subtitle burn-in." in summary_text
+        assert "Supplements / constraints:" in summary_text
+        assert "- Low resolution is okay for the first pass." in summary_text
+
 
 class TestTokenBudgetTailProtection:
     """Tests for token-budget-based tail protection (PR #6240).

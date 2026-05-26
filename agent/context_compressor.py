@@ -68,6 +68,8 @@ SUMMARY_PREFIX = (
     "described here — avoid repeating it:"
 )
 LEGACY_SUMMARY_PREFIX = "[CONTEXT SUMMARY]:"
+PRESERVED_TASK_CONTRACT_BEGIN = "[PRESERVED UNRESOLVED TASK CONTRACT]"
+PRESERVED_TASK_CONTRACT_END = "[END PRESERVED UNRESOLVED TASK CONTRACT]"
 
 # Metadata key added to context compression summary messages so that frontends
 # (CLI, Desktop, gateway, TUI) can distinguish them from real assistant/user
@@ -184,6 +186,35 @@ _PATH_MENTION_RE = re.compile(r"(?:/|~/?|[A-Za-z]:\\)[^\s`'\")\]}<>]+")
 # the summary, the downstream model may re-emit it as an active directive on
 # the next turn, triggering bogus attachment sends (#14665).
 _MEDIA_DIRECTIVE_RE = re.compile(r"MEDIA:\S+")
+
+
+_EXPLICIT_TASK_REPLACEMENT_PREFIXES = (
+    "ignore the earlier task",
+    "ignore the previous task",
+    "forget the earlier task",
+    "forget the previous task",
+    "instead, ",
+    "instead ",
+    "only do ",
+    "just do ",
+    "switch to ",
+)
+
+_TASK_SUPPLEMENT_PREFIXES = (
+    "also ",
+    "and ",
+    "but ",
+    "use ",
+    "keep ",
+    "make sure ",
+    "low ",
+    "high ",
+    "no need ",
+    "don't need ",
+    "do not need ",
+    "you can ",
+    "for the first pass",
+)
 
 
 def _dedupe_append(items: list[str], value: str, *, limit: int) -> None:
@@ -1863,6 +1894,143 @@ This compaction should PRIORITISE preserving all information related to the focu
         return any(text.startswith(p) for p in _HISTORICAL_SUMMARY_PREFIXES)
 
     @staticmethod
+    def _is_explicit_task_replacement(text: str) -> bool:
+        normalized = str(text or "").strip().lower()
+        return any(normalized.startswith(prefix) for prefix in _EXPLICIT_TASK_REPLACEMENT_PREFIXES)
+
+    @staticmethod
+    def _looks_like_task_supplement(text: str) -> bool:
+        normalized = str(text or "").strip().lower()
+        if not normalized:
+            return False
+        if any(normalized.startswith(prefix) for prefix in _TASK_SUPPLEMENT_PREFIXES):
+            return True
+        return len(normalized) <= 140 and any(
+            marker in normalized
+            for marker in (" okay", " ok", " no need", " don't need", " do not need")
+        )
+
+    @classmethod
+    def _parse_preserved_task_contract_from_text(cls, text: Any) -> Optional[Dict[str, Any]]:
+        content = _content_text_for_contains(text)
+        if not content or PRESERVED_TASK_CONTRACT_BEGIN not in content or PRESERVED_TASK_CONTRACT_END not in content:
+            return None
+        start = content.find(PRESERVED_TASK_CONTRACT_BEGIN)
+        end = content.find(PRESERVED_TASK_CONTRACT_END, start)
+        if start < 0 or end < 0:
+            return None
+        block = content[start + len(PRESERVED_TASK_CONTRACT_BEGIN):end].strip()
+        if not block:
+            return None
+
+        primary = ""
+        supplements: List[str] = []
+        mode = None
+        for raw_line in block.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            lower = line.lower()
+            if lower == "primary task:":
+                mode = "primary"
+                continue
+            if lower == "supplements / constraints:":
+                mode = "supplements"
+                continue
+            if mode == "primary":
+                if primary:
+                    primary += "\n" + line
+                else:
+                    primary = line
+            elif mode == "supplements":
+                if line.startswith("- "):
+                    supplements.append(line[2:].strip())
+                else:
+                    supplements.append(line)
+
+        primary = primary.strip()
+        supplements = [s.strip() for s in supplements if s.strip()]
+        if not primary:
+            return None
+        return {
+            "primary_request": primary,
+            "supplements": supplements,
+        }
+
+    @classmethod
+    def _format_preserved_task_contract(cls, contract: Optional[Dict[str, Any]]) -> str:
+        if not contract:
+            return ""
+        primary = str((contract or {}).get("primary_request") or "").strip()
+        supplements = [str(s).strip() for s in ((contract or {}).get("supplements") or []) if str(s).strip()]
+        if not primary:
+            return ""
+        lines = [
+            PRESERVED_TASK_CONTRACT_BEGIN,
+            "Primary task:",
+            primary,
+        ]
+        if supplements:
+            lines.extend(["", "Supplements / constraints:"])
+            lines.extend(f"- {item}" for item in supplements)
+        lines.extend([
+            "",
+            "This block is programmatically preserved across compaction. Treat supplements as additive constraints, not replacements, unless the user explicitly changed scope.",
+            PRESERVED_TASK_CONTRACT_END,
+        ])
+        return "\n".join(lines)
+
+    @classmethod
+    def _derive_preserved_task_contract_from_messages(
+        cls,
+        messages: List[Dict[str, Any]],
+    ) -> Optional[Dict[str, Any]]:
+        contract: Dict[str, Any] = {"primary_request": "", "supplements": []}
+
+        for msg in messages or []:
+            content = msg.get("content")
+            parsed = cls._parse_preserved_task_contract_from_text(content)
+            if parsed:
+                if parsed.get("primary_request"):
+                    contract["primary_request"] = parsed["primary_request"]
+                for item in parsed.get("supplements") or []:
+                    if item and item not in contract["supplements"]:
+                        contract["supplements"].append(item)
+                continue
+
+            if msg.get("role") != "user":
+                continue
+
+            text = _content_text_for_contains(content).strip()
+            if not text:
+                continue
+            if cls._is_context_summary_content(text):
+                continue
+            if text.startswith("You've reached the maximum number of tool-calling iterations allowed."):
+                continue
+            if text.startswith("[System note: The previous turn hit the iteration budget."):
+                continue
+
+            if not contract["primary_request"]:
+                contract["primary_request"] = text
+                continue
+
+            if cls._is_explicit_task_replacement(text):
+                contract["primary_request"] = text
+                contract["supplements"] = []
+                continue
+
+            if text == contract["primary_request"] or text in contract["supplements"]:
+                continue
+
+            if cls._looks_like_task_supplement(text) or contract["primary_request"]:
+                contract["supplements"].append(text)
+
+        if not contract["primary_request"]:
+            return None
+        return contract
+
+    @staticmethod
     def _has_compressed_summary_metadata(message: Any) -> bool:
         """Return True if *message* carries the compressed-summary flag.
 
@@ -2485,6 +2653,8 @@ This compaction should PRIORITISE preserving all information related to the focu
         # Phase 3: Generate structured summary
         summary_focus_topic = focus_topic or self._derive_auto_focus_topic(messages)
         summary = self._generate_summary(turns_to_summarize, focus_topic=summary_focus_topic)
+        preserved_task_contract = self._derive_preserved_task_contract_from_messages(messages[:compress_end])
+        preserved_task_contract_text = self._format_preserved_task_contract(preserved_task_contract)
 
         # If summary generation failed, behavior splits on
         # ``abort_on_summary_failure`` (config: compression.abort_on_summary_failure):
@@ -2558,6 +2728,9 @@ This compaction should PRIORITISE preserving all information related to the focu
                 turns_to_summarize,
                 reason=self._last_summary_error,
             )
+
+        if preserved_task_contract_text:
+            summary = f"{summary}\n\n{preserved_task_contract_text}"
 
         _merge_summary_into_tail = False
         last_head_role = messages[compress_start - 1].get("role", "user") if compress_start > 0 else "user"

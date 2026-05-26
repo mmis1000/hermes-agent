@@ -8730,6 +8730,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             last_response,
             user_initiated=True,
             background_processes=_bg_procs,
+            transcript_messages=self.conversation_history or [],
         )
         msg = decision.get("message") or ""
         if msg:

@@ -122,6 +122,107 @@ def test_judge_iteration_budget_exhaustion_auto_continue(monkeypatch):
     assert captured["closed"] is True
 
 
+def test_judge_iteration_budget_exhaustion_skips_synthetic_summary_request(monkeypatch):
+    runner, _adapter = _make_runner()
+    source = _make_source()
+
+    captured = {}
+
+    class FakeReviewAgent:
+        def __init__(self, **kwargs):
+            self.suppress_status_output = False
+
+        def run_conversation(self, user_message):
+            captured["user_message"] = user_message
+            return {
+                "final_response": '{"decision":"auto_continue","reason":"still progressing"}'
+            }
+
+        def shutdown_memory_provider(self):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr("run_agent.AIAgent", FakeReviewAgent)
+
+    runner._judge_iteration_budget_exhaustion(
+        result={
+            "turn_exit_reason": "max_iterations_reached(90/90)",
+            "api_calls": 90,
+            "final_response": "I finished the first chunk and need to continue the remaining work.",
+            "messages": [
+                {"role": "user", "content": "Do the full task, not just the first subtask. Finish A, B, and C."},
+                {"role": "assistant", "tool_calls": [{"function": {"name": "terminal"}}]},
+                {"role": "tool", "content": "completed A"},
+                {
+                    "role": "user",
+                    "content": (
+                        "You've reached the maximum number of tool-calling iterations allowed. "
+                        "Please provide a final response summarizing what you've found and accomplished so far, "
+                        "without calling any more tools."
+                    ),
+                },
+            ],
+        },
+        source=source,
+        session_id="sess-1",
+        session_key=build_session_key(source),
+    )
+
+    assert "Do the full task, not just the first subtask. Finish A, B, and C." in captured["user_message"]
+    assert "You've reached the maximum number of tool-calling iterations allowed" not in captured["user_message"]
+
+
+def test_build_iteration_continue_prompt_preserves_real_user_goal_and_skips_synthetic():
+    runner, _adapter = _make_runner()
+
+    messages = [
+        {"role": "user", "content": "Complete the full task end-to-end, including validation and final delivery."},
+        {
+            "role": "user",
+            "content": (
+                "You've reached the maximum number of tool-calling iterations allowed. "
+                "Please provide a final response summarizing what you've found and accomplished so far, "
+                "without calling any more tools."
+            ),
+        },
+    ]
+
+    real_goal = runner._extract_latest_real_user_goal(messages)
+    prompt = runner._build_iteration_continue_prompt(user_approved=False, user_goal=real_goal)
+
+    assert "Complete the full task end-to-end, including validation and final delivery." in prompt
+    assert "You've reached the maximum number of tool-calling iterations allowed" not in prompt
+
+
+def test_extract_latest_real_user_goal_uses_preserved_contract_and_later_supplement():
+    runner, _adapter = _make_runner()
+
+    messages = [
+        {
+            "role": "user",
+            "content": (
+                "[CONTEXT COMPACTION — REFERENCE ONLY] Earlier turns were compacted into the summary below.\n"
+                "summary body\n\n"
+                "[PRESERVED UNRESOLVED TASK CONTRACT]\n"
+                "Primary task:\n"
+                "Do the full job: build a multi-scene video with recurring characters and subtitle burn-in.\n\n"
+                "Supplements / constraints:\n"
+                "- Keep the same characters across scenes.\n"
+                "[END PRESERVED UNRESOLVED TASK CONTRACT]"
+            ),
+        },
+        {"role": "user", "content": "Low resolution is okay for the first pass."},
+    ]
+
+    real_goal = runner._extract_latest_real_user_goal(messages)
+
+    assert "Do the full job: build a multi-scene video with recurring characters and subtitle burn-in." in real_goal
+    assert "Keep the same characters across scenes." in real_goal
+    assert "Low resolution is okay for the first pass." in real_goal
+
+
 @pytest.mark.asyncio
 async def test_request_iteration_continuation_approval_then_approve():
     runner, adapter = _make_runner()

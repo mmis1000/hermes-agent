@@ -8925,6 +8925,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """Inner handler that runs under the _running_agents sentinel guard."""
         _msg_start_time = time.time()
         _platform_name = source.platform.value if hasattr(source.platform, "value") else str(source.platform)
+        # Keep literal inbound text before auto-skill/context/timestamp expansion
+        # so direct user messages become first-class task intents without lossy
+        # prompt wrappers replacing the raw task contract.
+        _raw_inbound_user_text = event.text or ""
         _msg_preview = (event.text or "")[:80].replace("\n", " ")
         _reply_id = getattr(event, "reply_to_message_id", None)
         _reply_txt = (getattr(event, "reply_to_text", None) or "")[:80].replace("\n", " ")
@@ -9646,6 +9650,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception as _ts_err:
             logger.debug("Message timestamp injection failed (non-fatal): %s", _ts_err)
 
+        _task_intent_mgr = None
+        _task_intent_notice = ""
+        _is_direct_user_task_message = (
+            not bool(getattr(event, "internal", False))
+            and not event.is_command()
+            and bool((_raw_inbound_user_text or "").strip())
+        )
+        if _is_direct_user_task_message:
+            try:
+                from hermes_cli.task_intents import TaskIntentManager
+
+                _task_intent_mgr = TaskIntentManager(session_entry.session_id)
+                _task_intent_mgr.record_direct_message(_raw_inbound_user_text)
+            except Exception as _task_exc:
+                logger.debug("direct task-intent record failed for %s: %s", session_key, _task_exc)
+
         # Bind this gateway run generation to the adapter's active-session
         # event so deferred post-delivery callbacks can be released by the
         # same run that registered them.
@@ -9777,6 +9797,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 response = _sanitize_gateway_final_response(source.platform, response)
 
+            if _task_intent_mgr is not None and response:
+                try:
+                    _direct_decision = _task_intent_mgr.evaluate_after_response(response)
+                    _notice_parts = []
+                    if _direct_decision.get("guard_vetoed_done"):
+                        _notice_parts.append(
+                            "⚠️ Direct-message completion guard kept the task active: "
+                            + str(_direct_decision.get("reason") or "raw preserved task is not complete")
+                        )
+                    _preserved_notice = _task_intent_mgr.format_preserved_state_notice()
+                    if _preserved_notice:
+                        _notice_parts.append(_preserved_notice)
+                    if _notice_parts:
+                        _task_intent_notice = "\n\n".join(_notice_parts)
+                except Exception as _task_eval_exc:
+                    logger.debug("direct task-intent evaluation failed for %s: %s", session_key, _task_eval_exc)
+
             # Ordering contract: the agent thread already updated the contextvar
             # in conversation_compression.py; propagate to SessionEntry + _save().
             # If the agent's session_id changed during compression, update
@@ -9862,6 +9899,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _footer_line = ""
             if _footer_line and response and not agent_result.get("already_sent") and not _intentional_silence:
                 response = f"{response}\n\n{_footer_line}"
+
+            if _task_intent_notice and response and not agent_result.get("already_sent"):
+                response = f"{response}\n\n{_task_intent_notice}"
 
             # Emit agent:end hook
             await self.hooks.emit("agent:end", {
@@ -10761,10 +10801,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception:
             _bg_procs = None
 
+        _goal_transcript = []
+        try:
+            _goal_transcript = self.session_store.load_transcript(sid) or []
+        except Exception:
+            _goal_transcript = []
+
         decision = mgr.evaluate_after_turn(
             final_response or "",
             user_initiated=True,
             background_processes=_bg_procs,
+            transcript_messages=_goal_transcript,
         )
         msg = decision.get("message") or ""
 
@@ -10784,6 +10831,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not prompt or source is None:
             return
 
+        try:
+            from hermes_cli.task_intents import TaskIntentManager as _TaskIntentManager
+
+            _TaskIntentManager(sid).add_machine_preserved_message(
+                prompt,
+                origin="goal_continuation",
+                status="queued",
+            )
+        except Exception as _task_exc:
+            logger.debug("goal continuation: machine-preserved task-intent record failed: %s", _task_exc)
+
         # Enqueue via the adapter's FIFO so a user message already in
         # flight preempts the continuation naturally.
         try:
@@ -10796,6 +10854,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     source=source,
                     message_id=None,
                     channel_prompt=None,
+                    internal=True,
                 )
                 self._enqueue_fifo(_quick_key, cont_event, adapter)
         except Exception as exc:
