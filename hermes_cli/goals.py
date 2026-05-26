@@ -60,14 +60,23 @@ CONTINUATION_PROMPT_TEMPLATE = (
 
 JUDGE_SYSTEM_PROMPT = (
     "You are a strict judge evaluating whether an autonomous agent has "
-    "achieved a user's stated goal. You receive the goal text and the "
-    "agent's most recent response. Your only job is to decide whether "
-    "the goal is fully satisfied based on that response.\n\n"
+    "achieved a user's stated goal. You receive the goal text, the "
+    "agent's most recent response, and sometimes a preserved unresolved "
+    "task contract containing additional requirements and supplements. "
+    "Your only job is to decide whether the goal is fully satisfied based "
+    "on that response.\n\n"
     "A goal is DONE only when:\n"
     "- The response explicitly confirms the goal was completed, OR\n"
     "- The response clearly shows the final deliverable was produced, OR\n"
     "- The response explains the goal is unachievable / blocked / needs "
     "user input (treat this as DONE with reason describing the block).\n\n"
+    "If a preserved unresolved task contract is provided, treat it as an "
+    "authoritative extension of the goal. Do NOT say done if the response "
+    "only completes one slice while preserved requirements remain unmet. "
+    "Plural/additional wording is semantically important: a request such as "
+    "'more styles', 'several variants', or 'additional scenes' is NOT "
+    "completed by producing exactly one style/variant/scene unless the user "
+    "explicitly narrowed the scope. When uncertain, CONTINUE.\n\n"
     "Otherwise the goal is NOT done — CONTINUE.\n\n"
     "Reply ONLY with a single JSON object on one line:\n"
     '{\"done\": <true|false>, \"reason\": \"<one-sentence rationale>\"}'
@@ -79,6 +88,19 @@ JUDGE_USER_PROMPT_TEMPLATE = (
     "Agent's most recent response:\n{response}\n\n"
     "Is the goal satisfied?"
 )
+
+
+def _goal_judge_user_prompt(goal: str, response: str, task_contract: str = "") -> str:
+    prompt = JUDGE_USER_PROMPT_TEMPLATE.format(
+        goal=_truncate(goal, 2000),
+        response=_truncate(response, _JUDGE_RESPONSE_SNIPPET_CHARS),
+    )
+    if task_contract and task_contract.strip():
+        prompt += (
+            "\n\nPreserved unresolved task contract (all of these requirements must still be satisfied unless the user explicitly changed scope):\n"
+            f"{_truncate(task_contract.strip(), 2500)}"
+        )
+    return prompt
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -99,6 +121,7 @@ class GoalState:
     last_verdict: Optional[str] = None        # "done" | "continue" | "skipped"
     last_reason: Optional[str] = None
     paused_reason: Optional[str] = None       # why we auto-paused (budget, etc.)
+    task_contract: Optional[str] = None       # preserved unresolved task requirements
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), ensure_ascii=False)
@@ -116,6 +139,7 @@ class GoalState:
             last_verdict=data.get("last_verdict"),
             last_reason=data.get("last_reason"),
             paused_reason=data.get("paused_reason"),
+            task_contract=data.get("task_contract"),
         )
 
 
@@ -269,6 +293,7 @@ def judge_goal(
     goal: str,
     last_response: str,
     *,
+    task_contract: str = "",
     timeout: float = DEFAULT_JUDGE_TIMEOUT,
 ) -> Tuple[str, str]:
     """Ask the auxiliary model whether the goal is satisfied.
@@ -301,10 +326,7 @@ def judge_goal(
     if client is None or not model:
         return "continue", "no auxiliary client configured"
 
-    prompt = JUDGE_USER_PROMPT_TEMPLATE.format(
-        goal=_truncate(goal, 2000),
-        response=_truncate(last_response, _JUDGE_RESPONSE_SNIPPET_CHARS),
-    )
+    prompt = _goal_judge_user_prompt(goal, last_response, task_contract)
 
     try:
         resp = client.chat.completions.create(
@@ -387,7 +409,13 @@ class GoalManager:
 
     # --- mutation -----------------------------------------------------
 
-    def set(self, goal: str, *, max_turns: Optional[int] = None) -> GoalState:
+    def set(
+        self,
+        goal: str,
+        *,
+        max_turns: Optional[int] = None,
+        task_contract: Optional[str] = None,
+    ) -> GoalState:
         goal = (goal or "").strip()
         if not goal:
             raise ValueError("goal text is empty")
@@ -398,6 +426,7 @@ class GoalManager:
             max_turns=int(max_turns) if max_turns else self.default_max_turns,
             created_at=time.time(),
             last_turn_at=0.0,
+            task_contract=(task_contract or "").strip() or None,
         )
         self._state = state
         save_goal(self.session_id, state)
@@ -436,6 +465,32 @@ class GoalManager:
         self._state.last_reason = reason
         save_goal(self.session_id, self._state)
 
+    @staticmethod
+    def _derive_task_contract_from_transcript(messages: Optional[list[Dict[str, Any]]]) -> str:
+        if not messages:
+            return ""
+        try:
+            from agent.context_compressor import ContextCompressor
+
+            contract = ContextCompressor._derive_preserved_task_contract_from_messages(messages)
+            if not contract:
+                return ""
+            primary = str(contract.get("primary_request") or "").strip()
+            supplements = [
+                str(item).strip()
+                for item in (contract.get("supplements") or [])
+                if str(item).strip()
+            ]
+            if not primary:
+                return ""
+            lines = ["Primary unresolved task:", primary]
+            if supplements:
+                lines.extend(["", "Supplements / constraints:"])
+                lines.extend(f"- {item}" for item in supplements)
+            return "\n".join(lines).strip()
+        except Exception:
+            return ""
+
     # --- the main entry point called after every turn -----------------
 
     def evaluate_after_turn(
@@ -443,6 +498,7 @@ class GoalManager:
         last_response: str,
         *,
         user_initiated: bool = True,
+        transcript_messages: Optional[list[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
         """Run the judge and update state. Return a decision dict.
 
@@ -473,7 +529,34 @@ class GoalManager:
         state.turns_used += 1
         state.last_turn_at = time.time()
 
-        verdict, reason = judge_goal(state.goal, last_response)
+        if transcript_messages:
+            refreshed_contract = self._derive_task_contract_from_transcript(transcript_messages)
+            if refreshed_contract and refreshed_contract != (state.task_contract or ""):
+                state.task_contract = refreshed_contract
+
+        verdict, reason = judge_goal(
+            state.goal,
+            last_response,
+            task_contract=state.task_contract or "",
+        )
+        if verdict == "done":
+            try:
+                from hermes_cli.task_intents import should_veto_done_for_multiplicity
+
+                raw_goal_contract = "\n".join(
+                    part for part in (state.goal, state.task_contract or "") if part
+                )
+                if should_veto_done_for_multiplicity(
+                    raw_task_text=raw_goal_contract,
+                    response=last_response,
+                ):
+                    verdict = "continue"
+                    reason = (
+                        "done vetoed: preserved goal/task contract implies "
+                        "multiple/additional outputs but response only completed one slice"
+                    )
+            except Exception:
+                pass
         state.last_verdict = verdict
         state.last_reason = reason
 
@@ -520,7 +603,13 @@ class GoalManager:
     def next_continuation_prompt(self) -> Optional[str]:
         if not self._state or self._state.status != "active":
             return None
-        return CONTINUATION_PROMPT_TEMPLATE.format(goal=self._state.goal)
+        prompt = CONTINUATION_PROMPT_TEMPLATE.format(goal=self._state.goal)
+        if self._state.task_contract and self._state.task_contract.strip():
+            prompt += (
+                "\n\n[Preserved unresolved task contract — raw text is authoritative; do not summarize away plural/additional wording]\n"
+                f"{self._state.task_contract.strip()}"
+            )
+        return prompt
 
 
 __all__ = [
