@@ -13,6 +13,7 @@ import os
 import select
 import shlex
 import subprocess
+import sys
 import threading
 import time
 import uuid
@@ -132,6 +133,45 @@ def _pipe_stdin(proc: subprocess.Popen, data: str) -> None:
     threading.Thread(target=_write, daemon=True).start()
 
 
+def _read_child_oom_score_adj() -> int | None:
+    """Return the desired Linux child-process ``oom_score_adj`` value.
+
+    The gateway service can protect the main Hermes process with a negative
+    ``OOMScoreAdjust`` while child tool/browser/build subprocesses should be more
+    disposable under memory pressure. Read the desired child score from the
+    environment so operators can tune it without code changes.
+    """
+    raw = os.getenv("HERMES_CHILD_OOM_SCORE_ADJ", "300").strip()
+    if not raw:
+        return None
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.debug("Ignoring invalid HERMES_CHILD_OOM_SCORE_ADJ=%r", raw)
+        return None
+    return max(-1000, min(1000, value))
+
+
+def _apply_child_oom_score_adj(pid: int | None) -> None:
+    """Raise child-process OOM kill priority on Linux after spawn.
+
+    Do this parent-side instead of inside ``preexec_fn`` so Hermes avoids extra
+    Python work in the post-fork pre-exec window of multithreaded processes.
+    """
+    if not sys.platform.startswith("linux") or not pid:
+        return
+
+    value = _read_child_oom_score_adj()
+    if value is None:
+        return
+
+    try:
+        with open(f"/proc/{pid}/oom_score_adj", "w", encoding="utf-8") as fh:
+            fh.write(str(value))
+    except OSError:
+        pass
+
+
 def _popen_bash(
     cmd: list[str], stdin_data: str | None = None, **kwargs
 ) -> subprocess.Popen:
@@ -149,6 +189,7 @@ def _popen_bash(
         text=True,
         **kwargs,
     )
+    _apply_child_oom_score_adj(proc.pid)
     if stdin_data is not None:
         _pipe_stdin(proc, stdin_data)
     return proc

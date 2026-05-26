@@ -12,8 +12,8 @@ import tempfile
 import time
 from pathlib import Path
 
-from tools.environments.base import BaseEnvironment, _pipe_stdin
 from hermes_cli._subprocess_compat import windows_hide_flags
+from tools.environments.base import BaseEnvironment, _apply_child_oom_score_adj, _pipe_stdin
 
 _IS_WINDOWS = platform.system() == "Windows"
 
@@ -690,6 +690,7 @@ class LocalEnvironment(BaseEnvironment):
             cwd=_popen_cwd,
             **_popen_kwargs,
         )
+        _apply_child_oom_score_adj(proc.pid)
         if not _IS_WINDOWS:
             try:
                 proc._hermes_pgid = os.getpgid(proc.pid)
