@@ -1627,6 +1627,7 @@ class DiscordAdapter(BasePlatformAdapter):
         file_path: str,
         caption: Optional[str] = None,
         file_name: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         """Send a local file as a Discord attachment.
 
@@ -1636,11 +1637,13 @@ class DiscordAdapter(BasePlatformAdapter):
         if not self._client:
             return SendResult(success=False, error="Not connected")
 
-        channel = self._client.get_channel(int(chat_id))
+        target_id = metadata.get("thread_id") if metadata and metadata.get("thread_id") else chat_id
+        channel = self._client.get_channel(int(target_id))
         if not channel:
-            channel = await self._client.fetch_channel(int(chat_id))
+            channel = await self._client.fetch_channel(int(target_id))
         if not channel:
-            return SendResult(success=False, error=f"Channel {chat_id} not found")
+            target_kind = "Thread" if metadata and metadata.get("thread_id") else "Channel"
+            return SendResult(success=False, error=f"{target_kind} {target_id} not found")
 
         filename = file_name or os.path.basename(file_path)
         with open(file_path, "rb") as fh:
@@ -1652,7 +1655,26 @@ class DiscordAdapter(BasePlatformAdapter):
                     file=file,
                 )
             msg = await channel.send(content=caption if caption else None, file=file)
-        return SendResult(success=True, message_id=str(msg.id))
+        attachments = []
+        for att in getattr(msg, "attachments", []) or []:
+            attachments.append({
+                "id": str(getattr(att, "id", "")) if getattr(att, "id", None) is not None else None,
+                "filename": getattr(att, "filename", None),
+                "size": getattr(att, "size", None),
+                "content_type": getattr(att, "content_type", None),
+                "url": getattr(att, "url", None),
+                "proxy_url": getattr(att, "proxy_url", None),
+                "width": getattr(att, "width", None),
+                "height": getattr(att, "height", None),
+            })
+        raw_response: Dict[str, Any] = {
+            "channel_id": str(getattr(channel, "id", target_id)),
+            "attachments": attachments,
+        }
+        if metadata and metadata.get("thread_id"):
+            raw_response["thread_id"] = str(metadata["thread_id"])
+        self._last_self_message_id[str(getattr(channel, "id", target_id))] = str(msg.id)
+        return SendResult(success=True, message_id=str(msg.id), raw_response=raw_response)
 
     async def send_multiple_images(
         self,
@@ -2678,7 +2700,7 @@ class DiscordAdapter(BasePlatformAdapter):
     ) -> SendResult:
         """Send a local video file natively as a Discord attachment."""
         try:
-            return await self._send_file_attachment(chat_id, video_path, caption)
+            return await self._send_file_attachment(chat_id, video_path, caption, metadata=metadata)
         except FileNotFoundError:
             return SendResult(success=False, error=f"Video file not found: {video_path}")
         except Exception as e:  # pragma: no cover - defensive logging
@@ -2696,7 +2718,7 @@ class DiscordAdapter(BasePlatformAdapter):
     ) -> SendResult:
         """Send an arbitrary file natively as a Discord attachment."""
         try:
-            return await self._send_file_attachment(chat_id, file_path, caption, file_name=file_name)
+            return await self._send_file_attachment(chat_id, file_path, caption, file_name=file_name, metadata=metadata)
         except FileNotFoundError:
             return SendResult(success=False, error=f"File not found: {file_path}")
         except Exception as e:  # pragma: no cover - defensive logging
