@@ -96,7 +96,7 @@ class _patch_discord_sender:
         self._entry = None
         self._original = None
 
-    async def _adapter(self, pconfig, chat_id, message, *, thread_id=None, media_files=None):
+    async def _adapter(self, pconfig, chat_id, message, *, thread_id=None, media_files=None, force_document=False):
         token = getattr(pconfig, "token", None)
         return await self._mock(
             token, chat_id, message,

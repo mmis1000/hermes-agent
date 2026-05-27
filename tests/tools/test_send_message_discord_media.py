@@ -4,7 +4,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 from gateway.config import Platform, PlatformConfig
 from plugins.platforms.discord.adapter import _standalone_send
-from tools.send_message_tool import _send_to_platform
+from tools.send_message_tool import _send_to_platform, _send_via_adapter
 
 
 def _make_aiohttp_resp(status, json_data=None, text_data=None):
@@ -118,3 +118,88 @@ def test_send_to_platform_discord_preserves_attachment_metadata():
         )
 
     assert result == mock_result
+
+
+def test_send_via_adapter_live_discord_media_preserves_raw_response():
+    live_result = SimpleNamespace(
+        success=True,
+        message_id="1234567890",
+        error=None,
+        raw_response={
+            "channel_id": "1508919799395254446",
+            "thread_id": "1508919799395254446",
+            "attachments": [{"id": "att-1", "filename": "clip.mp4"}],
+        },
+    )
+    adapter = SimpleNamespace(
+        send=AsyncMock(return_value=SimpleNamespace(success=True, message_id="text-msg", error=None, raw_response=None)),
+        send_video=AsyncMock(return_value=live_result),
+        send_voice=AsyncMock(),
+        send_image_file=AsyncMock(),
+        send_document=AsyncMock(),
+    )
+    runner = SimpleNamespace(adapters={Platform.DISCORD: adapter})
+
+    with patch("gateway.run._gateway_runner_ref", return_value=runner):
+        result = asyncio.run(
+            _send_via_adapter(
+                Platform.DISCORD,
+                PlatformConfig(enabled=True, token="discord-token"),
+                "1498377115484164156",
+                "hello",
+                thread_id="1508919799395254446",
+                media_files=[("/tmp/clip.mp4", False)],
+            )
+        )
+
+    assert result["success"] is True
+    assert result["message_id"] == "1234567890"
+    assert result["channel_id"] == "1508919799395254446"
+    assert result["thread_id"] == "1508919799395254446"
+    assert result["attachments"][0]["id"] == "att-1"
+    adapter.send.assert_awaited_once()
+    adapter.send_video.assert_awaited_once_with(
+        chat_id="1498377115484164156",
+        video_path="/tmp/clip.mp4",
+        metadata={"thread_id": "1508919799395254446"},
+    )
+
+
+def test_send_to_platform_discord_prefers_live_adapter_for_media():
+    live_result = SimpleNamespace(
+        success=True,
+        message_id="media-msg",
+        error=None,
+        raw_response={
+            "channel_id": "1508919799395254446",
+            "thread_id": "1508919799395254446",
+            "attachments": [{"id": "att-live", "filename": "clip.mp4"}],
+        },
+    )
+    adapter = SimpleNamespace(
+        send=AsyncMock(return_value=SimpleNamespace(success=True, message_id="text-msg", error=None, raw_response=None)),
+        send_video=AsyncMock(return_value=live_result),
+        send_voice=AsyncMock(),
+        send_image_file=AsyncMock(),
+        send_document=AsyncMock(),
+    )
+    runner = SimpleNamespace(adapters={Platform.DISCORD: adapter})
+
+    entry = SimpleNamespace(standalone_sender_fn=AsyncMock(side_effect=AssertionError("standalone sender should not be used")))
+    with patch("gateway.run._gateway_runner_ref", return_value=runner), \
+         patch("gateway.platform_registry.platform_registry.get", return_value=entry):
+        result = asyncio.run(
+            _send_to_platform(
+                Platform.DISCORD,
+                PlatformConfig(enabled=True, token="discord-token"),
+                "1498377115484164156",
+                "hello",
+                thread_id="1508919799395254446",
+                media_files=[("/tmp/clip.mp4", False)],
+            )
+        )
+
+    assert result["success"] is True
+    assert result["message_id"] == "media-msg"
+    assert result["attachments"][0]["id"] == "att-live"
+    entry.standalone_sender_fn.assert_not_awaited()
