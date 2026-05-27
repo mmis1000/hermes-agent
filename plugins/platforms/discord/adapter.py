@@ -6873,12 +6873,15 @@ async def _standalone_send(
 
                 thread_id_created = data.get("id")
                 starter_msg_id = (data.get("message") or {}).get("id", thread_id_created)
+                starter_message = data.get("message") or {}
                 result = {
                     "success": True,
                     "platform": "discord",
                     "chat_id": chat_id,
                     "thread_id": thread_id_created,
                     "message_id": starter_msg_id,
+                    "channel_id": str(starter_message.get("channel_id") or thread_id_created or chat_id),
+                    "attachments": starter_message.get("attachments", []),
                 }
                 if warnings:
                     result["warnings"] = warnings
@@ -6926,7 +6929,16 @@ async def _standalone_send(
                 return {"error": error, "warnings": warnings}
             return {"error": error}
 
-        result = {"success": True, "platform": "discord", "chat_id": chat_id, "message_id": last_data.get("id")}
+        result = {
+            "success": True,
+            "platform": "discord",
+            "chat_id": chat_id,
+            "channel_id": str(last_data.get("channel_id") or thread_id or chat_id),
+            "message_id": last_data.get("id"),
+            "attachments": last_data.get("attachments", []),
+        }
+        if thread_id:
+            result["thread_id"] = str(thread_id)
         if warnings:
             result["warnings"] = warnings
         return result
