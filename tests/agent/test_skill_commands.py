@@ -486,6 +486,30 @@ Generate some audio.
         assert "test-skill" in msg
         assert "do stuff" in msg
 
+    def test_plan_invocation_includes_brainstorming(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(tmp_path, "brainstorming", body="Explore possibilities first.")
+            _make_skill(tmp_path, "plan", body="Write the non-execution plan.")
+            scan_skill_commands()
+            msg = build_skill_invocation_message("/plan", "build a new feature")
+
+        assert msg is not None
+        assert 'Plan mode includes the "brainstorming" skill' in msg
+        assert "Explore possibilities first." in msg
+        assert "Write the non-execution plan." in msg
+        assert msg.index("Explore possibilities first.") < msg.index("Write the non-execution plan.")
+        assert "build a new feature" in msg
+
+    def test_plan_invocation_still_works_without_brainstorming(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(tmp_path, "plan", body="Write the non-execution plan.")
+            scan_skill_commands()
+            msg = build_skill_invocation_message("/plan", "document exact steps")
+
+        assert msg is not None
+        assert "Write the non-execution plan." in msg
+        assert "document exact steps" in msg
+
     def test_returns_none_for_unknown(self, tmp_path):
         with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
             scan_skill_commands()

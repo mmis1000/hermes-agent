@@ -551,7 +551,7 @@ def build_skill_invocation_message(
         f'[IMPORTANT: The user has invoked the "{skill_name}" skill, indicating they want '
         "you to follow its instructions. The full skill content is loaded below.]"
     )
-    return _build_skill_message(
+    primary_message = _build_skill_message(
         loaded_skill,
         skill_dir,
         activation_note,
@@ -559,6 +559,35 @@ def build_skill_invocation_message(
         runtime_note=runtime_note,
         session_id=task_id,
     )
+
+    # Plan mode is the non-execution half of the feature-building workflow.
+    # Make the exploration/design phase deterministic for /plan instead of
+    # relying on the model to notice the related brainstorming skill from the
+    # compact skill index.
+    if skill_name == "plan" or cmd_key == "/plan":
+        brainstorming = _load_skill_payload("brainstorming", task_id=task_id)
+        if brainstorming:
+            brainstorming_skill, brainstorming_dir, brainstorming_name = brainstorming
+            try:
+                from tools.skill_usage import bump_use
+                bump_use(brainstorming_name)
+            except Exception:
+                pass
+            brainstorming_note = (
+                '[IMPORTANT: Plan mode includes the "brainstorming" skill for '
+                "new-feature/design exploration before implementation planning. "
+                "Follow its instructions unless the user's request is clearly "
+                "not creative design work.]"
+            )
+            brainstorming_message = _build_skill_message(
+                brainstorming_skill,
+                brainstorming_dir,
+                brainstorming_note,
+                session_id=task_id,
+            )
+            return f"{brainstorming_message}\n\n{primary_message}"
+
+    return primary_message
 
 
 def build_preloaded_skills_prompt(
