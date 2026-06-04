@@ -1961,8 +1961,21 @@ This compaction should PRIORITISE preserving all information related to the focu
     def _format_preserved_task_contract(cls, contract: Optional[Dict[str, Any]]) -> str:
         if not contract:
             return ""
-        primary = str((contract or {}).get("primary_request") or "").strip()
-        supplements = [str(s).strip() for s in ((contract or {}).get("supplements") or []) if str(s).strip()]
+
+        def _safe_contract_text(value: Any, *, limit: int = _FALLBACK_TURN_MAX_CHARS) -> str:
+            text = redact_sensitive_text(str(value or ""))
+            text = re.sub(r"\bgh[pousr]_[A-Za-z0-9_.-]+", "[REDACTED]", text)
+            text = re.sub(r"\s+", " ", text).strip()
+            if len(text) > limit:
+                text = text[: max(0, limit - 15)].rstrip() + " ...[truncated]"
+            return text
+
+        primary = _safe_contract_text((contract or {}).get("primary_request"))
+        supplements = [
+            _safe_contract_text(s)
+            for s in ((contract or {}).get("supplements") or [])[:8]
+            if _safe_contract_text(s)
+        ]
         if not primary:
             return ""
         lines = [
@@ -2730,7 +2743,17 @@ This compaction should PRIORITISE preserving all information related to the focu
             )
 
         if preserved_task_contract_text:
+            if self._last_summary_fallback_used:
+                trunc_marker = "\n...[fallback summary truncated]"
+                summary_budget = max(
+                    1000,
+                    _FALLBACK_SUMMARY_MAX_CHARS - len(preserved_task_contract_text) - len(trunc_marker) - 2,
+                )
+                if len(summary) > summary_budget:
+                    summary = summary[:summary_budget].rstrip() + trunc_marker
             summary = f"{summary}\n\n{preserved_task_contract_text}"
+            if self._last_summary_fallback_used and len(summary) > _FALLBACK_SUMMARY_MAX_CHARS:
+                summary = summary[: _FALLBACK_SUMMARY_MAX_CHARS - 42].rstrip() + "\n...[fallback summary truncated]"
 
         _merge_summary_into_tail = False
         last_head_role = messages[compress_start - 1].get("role", "user") if compress_start > 0 else "user"
