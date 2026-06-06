@@ -2757,7 +2757,12 @@ class TestSendViaAdapterStandaloneFallback:
             "done",
         )
 
-        assert result == {"success": True, "message_id": "ntfy-id"}
+        assert result == {
+            "success": True,
+            "platform": "ntfy",
+            "chat_id": "alerts-channel",
+            "message_id": "ntfy-id",
+        }
         assert recorded["chat_id"] == "alerts-channel"
         assert recorded["content"] == "done"
         assert recorded["metadata"] == {"publish_topic": "alerts-channel"}
