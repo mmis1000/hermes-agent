@@ -1,8 +1,10 @@
 """Tests for gateway session management."""
 import json
-import pytest
+from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch, MagicMock
+
+import pytest
 from gateway.config import Platform, HomeChannel, GatewayConfig, PlatformConfig
 from gateway.platforms.base import MessageEvent
 from gateway.session import (
@@ -633,6 +635,87 @@ class TestSessionStoreLookupBySessionId:
         assert store.lookup_by_session_id(entry.session_id) is entry
         assert store.lookup_by_session_id("missing") is None
         assert store.lookup_by_session_id("") is None
+
+
+class TestSessionStoreGoalResetGuard:
+    """Active /goal state must keep a gateway session attached."""
+
+    def _store(self, tmp_path, active_goal=True):
+        seen_session_ids = []
+
+        def has_active_goal(session_id):
+            seen_session_ids.append(session_id)
+            return active_goal
+
+        config = GatewayConfig()
+        # Isolate the daily-reset branch in these tests; otherwise a very old
+        # updated_at can legitimately hit the idle branch first.
+        config.default_reset_policy.idle_minutes = 10 * 365 * 24 * 60
+        with patch("gateway.session.SessionStore._ensure_loaded"):
+            store = SessionStore(
+                sessions_dir=tmp_path,
+                config=config,
+                has_active_goal_fn=has_active_goal,
+            )
+        store._loaded = True
+        store._db = None
+        return store, seen_session_ids
+
+    def test_get_or_create_session_does_not_daily_reset_active_goal(self, tmp_path):
+        store, seen_session_ids = self._store(tmp_path, active_goal=True)
+        source = SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="channel-1",
+            chat_type="group",
+            thread_id="thread-1",
+        )
+        entry = store.get_or_create_session(source)
+        original_session_id = entry.session_id
+        original_created_at = entry.created_at
+        entry.updated_at = datetime.now() - timedelta(days=2)
+        entry.total_tokens = 42
+
+        resumed = store.get_or_create_session(source)
+
+        assert resumed.session_id == original_session_id
+        assert resumed.created_at == original_created_at
+        assert resumed.was_auto_reset is False
+        assert seen_session_ids == [original_session_id]
+
+    def test_get_or_create_session_still_daily_resets_without_active_goal(self, tmp_path):
+        store, seen_session_ids = self._store(tmp_path, active_goal=False)
+        source = SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="channel-1",
+            chat_type="group",
+            thread_id="thread-1",
+        )
+        entry = store.get_or_create_session(source)
+        original_session_id = entry.session_id
+        entry.updated_at = datetime.now() - timedelta(days=2)
+        entry.total_tokens = 42
+
+        reset = store.get_or_create_session(source)
+
+        assert reset.session_id != original_session_id
+        assert reset.was_auto_reset is True
+        assert reset.auto_reset_reason == "daily"
+        assert seen_session_ids == [original_session_id]
+
+    def test_background_expiry_watcher_predicate_skips_active_goal(self, tmp_path):
+        store, seen_session_ids = self._store(tmp_path, active_goal=True)
+        source = SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="channel-1",
+            chat_type="group",
+            thread_id="thread-1",
+        )
+        entry = store.get_or_create_session(source)
+        entry.updated_at = datetime.now() - timedelta(days=2)
+        entry.total_tokens = 42
+
+        assert store._is_session_expired(entry) is False
+        assert seen_session_ids == [entry.session_id]
 
 
 class TestWhatsAppSessionKeyConsistency:

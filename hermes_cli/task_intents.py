@@ -50,6 +50,10 @@ _SCOPE_REDUCTION_PREFIXES = (
     "instead ",
     "instead, ",
     "switch to ",
+    "stop that ",
+    "stop this ",
+    "stop the previous task",
+    "cancel the previous task",
     "ignore the previous task",
     "ignore the earlier task",
     "forget the previous task",
@@ -69,6 +73,19 @@ _SUPPLEMENT_PREFIXES = (
     "you can ",
     "for the first pass",
 )
+
+_FORBIDDEN_JUDGE_REWRITE_KEYS = {
+    "summary",
+    "summarized_task",
+    "rewritten_task",
+    "rewrite",
+    "normalized_user_request",
+    "normalized_text",
+    "cleaned_text",
+    "paraphrase",
+    "paraphrased_text",
+    "canonical_text",
+}
 
 
 def _meta_key(session_id: str) -> str:
@@ -114,6 +131,64 @@ def _is_scope_reduction(text: str) -> bool:
 def _looks_like_supplement(text: str) -> bool:
     n = _norm(text)
     return any(n.startswith(prefix) for prefix in _SUPPLEMENT_PREFIXES)
+
+
+def clamp_raw_text(text: str, max_chars: int) -> str:
+    """Clamp raw text by exact prefix + ellipsis + exact suffix only.
+
+    This helper is intentionally mechanical. It does not normalize, summarize,
+    or otherwise rewrite wording; the ellipsis marks the only lost middle span.
+    """
+    raw = str(text or "")
+    try:
+        limit = int(max_chars)
+    except Exception:
+        limit = 0
+    if limit <= 0:
+        return ""
+    if len(raw) <= limit:
+        return raw
+    if limit == 1:
+        return "…"
+    head = max(0, limit // 2)
+    tail = max(0, limit - head - 1)
+    return raw[:head] + "…" + (raw[-tail:] if tail else "")
+
+
+def validate_judge_payload_no_rewrite(
+    payload: Dict[str, Any],
+    *,
+    raw_texts: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """Strip judge output down to annotation-only fields.
+
+    Relationship/completion judges may classify and cite exact evidence. They
+    must not supply substitute wording for the task. Any quote field that is not
+    an exact substring of the provided raw text is dropped.
+    """
+    if not isinstance(payload, dict):
+        return {}
+
+    cleaned: Dict[str, Any] = {}
+    rejected: List[str] = []
+    for key, value in payload.items():
+        if str(key).lower() in _FORBIDDEN_JUDGE_REWRITE_KEYS:
+            rejected.append(str(key))
+            continue
+        cleaned[key] = value
+
+    raw_haystack = "\n".join(str(t or "") for t in (raw_texts or []))
+    quotes = cleaned.get("evidence_quotes")
+    if isinstance(quotes, list):
+        cleaned["evidence_quotes"] = [
+            quote
+            for quote in quotes
+            if isinstance(quote, str) and quote and quote in raw_haystack
+        ]
+
+    if rejected:
+        cleaned["_rejected_rewrite_keys"] = rejected
+    return cleaned
 
 
 def _multiplicity_terms(text: str) -> List[str]:
@@ -199,6 +274,41 @@ class PreservedMachineMessage:
 
 
 @dataclass
+class RawTaskMessage:
+    raw_text: str
+    source: str = "user"
+    relationship_to_active_task: str = "new_task"
+    created_at: float = 0.0
+    id: str = ""
+
+    @classmethod
+    def create(
+        cls,
+        raw_text: str,
+        *,
+        source: str = "user",
+        relationship_to_active_task: str = "new_task",
+    ) -> "RawTaskMessage":
+        return cls(
+            raw_text=str(raw_text or ""),
+            source=source,
+            relationship_to_active_task=relationship_to_active_task,
+            created_at=_now(),
+            id=_new_id("raw"),
+        )
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "RawTaskMessage":
+        return cls(
+            raw_text=str((data or {}).get("raw_text") or ""),
+            source=str((data or {}).get("source") or "user"),
+            relationship_to_active_task=str((data or {}).get("relationship_to_active_task") or "new_task"),
+            created_at=float((data or {}).get("created_at") or 0.0),
+            id=str((data or {}).get("id") or _new_id("raw")),
+        )
+
+
+@dataclass
 class TaskIntentState:
     id: str
     kind: str
@@ -210,6 +320,7 @@ class TaskIntentState:
     task_contract: TaskContract
     completion_state: Dict[str, Any] = field(default_factory=dict)
     machine_preserved_messages: List[PreservedMachineMessage] = field(default_factory=list)
+    raw_messages: List[RawTaskMessage] = field(default_factory=list)
     last_relevance_check: Optional[Dict[str, Any]] = None
 
     def to_json(self) -> str:
@@ -225,6 +336,28 @@ class TaskIntentState:
             for item in (data.get("machine_preserved_messages") or [])
             if isinstance(item, dict)
         ]
+        raw_messages = [
+            RawTaskMessage.from_dict(item)
+            for item in (data.get("raw_messages") or [])
+            if isinstance(item, dict)
+        ]
+        if not raw_messages:
+            if contract.raw_primary_text:
+                raw_messages.append(
+                    RawTaskMessage.create(
+                        contract.raw_primary_text,
+                        source="user",
+                        relationship_to_active_task="legacy_primary",
+                    )
+                )
+            for supplement in contract.raw_supplements:
+                raw_messages.append(
+                    RawTaskMessage.create(
+                        supplement,
+                        source="user",
+                        relationship_to_active_task="legacy_supplement",
+                    )
+                )
         return cls(
             id=str(data.get("id") or _new_id("task")),
             kind=str(data.get("kind") or "direct_user_message"),
@@ -236,6 +369,7 @@ class TaskIntentState:
             task_contract=contract,
             completion_state=dict(data.get("completion_state") or {}),
             machine_preserved_messages=machine,
+            raw_messages=raw_messages,
             last_relevance_check=data.get("last_relevance_check"),
         )
 
@@ -288,23 +422,28 @@ class TaskIntentManager:
             return "replacement"
         if _looks_like_supplement(text):
             return "supplement"
-        # Short deictic follow-ups are ambiguous; unrelated direct asks are new tasks.
+        # While an active raw contract exists, default to preserving/merging the
+        # latest direct message. A future LLM judge may label high-confidence
+        # unrelated tasks, but that judge still must not rewrite user wording.
         n = _norm(text)
         if n in {"try the other one", "do that", "continue", "go on"}:
             return "unclear"
-        return "new_task"
+        return "supplement"
 
     def record_direct_message(self, raw_text: str) -> TaskIntentState:
-        text = str(raw_text or "").strip()
+        text = str(raw_text or "")
         relationship = self.classify_relationship(text)
         previous = self._state
         now = _now()
 
-        if previous and relationship == "supplement":
+        if previous and relationship in {"supplement", "unclear"}:
             contract = previous.task_contract
             if text and text not in contract.raw_supplements:
                 contract.raw_supplements.append(text)
             contract.refresh_metadata()
+            previous.raw_messages.append(
+                RawTaskMessage.create(text, source="user", relationship_to_active_task=relationship)
+            )
             previous.raw_text = text
             previous.updated_at = now
             previous.relationship_to_active_task = relationship
@@ -348,6 +487,9 @@ class TaskIntentManager:
                 task_contract=contract,
                 completion_state={"last_verdict": "unknown"},
                 machine_preserved_messages=[],
+                raw_messages=[
+                    RawTaskMessage.create(text, source="user", relationship_to_active_task=relationship)
+                ],
                 last_relevance_check=relevance,
             )
             self._state = state
@@ -367,6 +509,9 @@ class TaskIntentManager:
         assert self._state is not None
         item = PreservedMachineMessage.create(raw_text, origin=origin, status=status)
         self._state.machine_preserved_messages.append(item)
+        self._state.raw_messages.append(
+            RawTaskMessage.create(raw_text, source="machine", relationship_to_active_task=origin)
+        )
         self._state.updated_at = _now()
         save_task_intent(self.session_id, self._state)
         return item
@@ -436,9 +581,12 @@ class TaskIntentManager:
 __all__ = [
     "TaskContract",
     "PreservedMachineMessage",
+    "RawTaskMessage",
     "TaskIntentState",
     "TaskIntentManager",
+    "clamp_raw_text",
     "derive_contract_metadata",
+    "validate_judge_payload_no_rewrite",
     "should_veto_done_for_multiplicity",
     "load_task_intent",
     "save_task_intent",

@@ -775,13 +775,14 @@ class SessionStore:
     """
     
     def __init__(self, sessions_dir: Path, config: GatewayConfig,
-                 has_active_processes_fn=None):
+                 has_active_processes_fn=None, has_active_goal_fn=None):
         self.sessions_dir = sessions_dir
         self.config = config
         self._entries: Dict[str, SessionEntry] = {}
         self._loaded = False
         self._lock = threading.Lock()
         self._has_active_processes_fn = has_active_processes_fn
+        self._has_active_goal_fn = has_active_goal_fn
         
         # Initialize SQLite session database
         self._db = None
@@ -869,16 +870,29 @@ class SessionStore:
             profile=self._resolve_profile_for_key(source),
         )
     
+    def _has_active_goal(self, session_id: str) -> bool:
+        """Best-effort guard: sessions with active /goal must not expire."""
+        if not session_id or not self._has_active_goal_fn:
+            return False
+        try:
+            return bool(self._has_active_goal_fn(session_id))
+        except Exception as e:
+            logger.debug("Active-goal reset guard failed for %s: %s", session_id, e)
+            return False
+
     def _is_session_expired(self, entry: SessionEntry) -> bool:
         """Check if a session has expired based on its reset policy.
         
         Works from the entry alone — no SessionSource needed.
         Used by the background expiry watcher to proactively flush memories.
-        Sessions with active background processes are never considered expired.
+        Sessions with active background processes or active /goal state are
+        never considered expired.
         """
         if self._has_active_processes_fn:
             if self._has_active_processes_fn(entry.session_key):
                 return False
+        if self._has_active_goal(entry.session_id):
+            return False
 
         policy = self.config.get_reset_policy(
             platform=entry.platform,
@@ -914,12 +928,15 @@ class SessionStore:
         Returns the reset reason ("idle" or "daily") if a reset is needed,
         or None if the session is still valid.
         
-        Sessions with active background processes are never reset.
+        Sessions with active background processes or active /goal state are
+        never reset.
         """
         if self._has_active_processes_fn:
             session_key = self._generate_session_key(source)
             if self._has_active_processes_fn(session_key):
                 return None
+        if self._has_active_goal(entry.session_id):
+            return None
 
         policy = self.config.get_reset_policy(
             platform=source.platform,

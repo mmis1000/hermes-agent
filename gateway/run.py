@@ -2589,6 +2589,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self.session_store = SessionStore(
             self.config.sessions_dir, self.config,
             has_active_processes_fn=lambda key: process_registry.has_active_for_session(key),
+            has_active_goal_fn=self._goal_still_active_for_session,
         )
         self.delivery_router = DeliveryRouter(self.config)
         self._running = False
