@@ -42,37 +42,41 @@ _ONE_SLICE_PATTERNS = (
     re.compile(r"\bcreated\s+(one|1|a|single)\b", re.I),
 )
 
-_SCOPE_REDUCTION_PREFIXES = (
-    "actually just ",
-    "actually only ",
-    "just ",
-    "only ",
-    "instead ",
-    "instead, ",
-    "switch to ",
-    "stop that ",
-    "stop this ",
-    "stop the previous task",
-    "cancel the previous task",
-    "ignore the previous task",
-    "ignore the earlier task",
-    "forget the previous task",
-    "forget the earlier task",
-)
+RELATIONSHIP_LABELS = {
+    "same_task",
+    "related_question",
+    "supplement",
+    "possible_new_task",
+    "new_task",
+    "replacement",
+    "unclear",
+}
 
-_SUPPLEMENT_PREFIXES = (
-    "also ",
-    "and ",
-    "but ",
-    "use ",
-    "keep ",
-    "make sure ",
-    "no need ",
-    "don't need ",
-    "do not need ",
-    "you can ",
-    "for the first pass",
-)
+STATE_EFFECTS = {
+    "no_change",
+    "related_only",
+    "append_contract",
+    "create_candidate",
+    "pause_and_start",
+    "supersede",
+}
+
+_ALLOWED_RELATIONSHIP_EFFECTS = {
+    "same_task": {"no_change", "related_only"},
+    "related_question": {"no_change", "related_only"},
+    "supplement": {"append_contract"},
+    "possible_new_task": {"create_candidate", "no_change"},
+    "new_task": {"pause_and_start", "no_change"},
+    "replacement": {"supersede"},
+    "unclear": {"no_change", "create_candidate"},
+}
+
+_AUTHORITATIVE_SOURCE_KINDS = {
+    "direct_user",
+    "direct_external_user",
+    "structured_command",
+    "system_event",
+}
 
 _FORBIDDEN_JUDGE_REWRITE_KEYS = {
     "summary",
@@ -123,14 +127,31 @@ def _norm(text: str) -> str:
     return str(text or "").strip().lower()
 
 
-def _is_scope_reduction(text: str) -> bool:
-    n = _norm(text)
-    return any(n.startswith(prefix) for prefix in _SCOPE_REDUCTION_PREFIXES)
+def _string_list(value: Any) -> List[str]:
+    if value is None:
+        return []
+    if isinstance(value, (str, bytes)):
+        text = value.decode("utf-8", errors="replace") if isinstance(value, bytes) else value
+        return [text] if text else []
+    if isinstance(value, (list, tuple, set)):
+        return [str(item) for item in value if str(item)]
+    return [str(value)] if str(value) else []
 
 
-def _looks_like_supplement(text: str) -> bool:
-    n = _norm(text)
-    return any(n.startswith(prefix) for prefix in _SUPPLEMENT_PREFIXES)
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _normalize_relationship_effect(relationship: str, state_effect: str) -> tuple[str, str, str]:
+    relationship = relationship if relationship in RELATIONSHIP_LABELS else "unclear"
+    state_effect = state_effect if state_effect in STATE_EFFECTS else "no_change"
+    allowed = _ALLOWED_RELATIONSHIP_EFFECTS.get(relationship, {"no_change"})
+    if state_effect in allowed:
+        return relationship, state_effect, ""
+    return "unclear", "no_change", f"invalid_relationship_effect:{relationship}/{state_effect}"
 
 
 def clamp_raw_text(text: str, max_chars: int) -> str:
@@ -178,12 +199,12 @@ def validate_judge_payload_no_rewrite(
         cleaned[key] = value
 
     raw_haystack = "\n".join(str(t or "") for t in (raw_texts or []))
-    quotes = cleaned.get("evidence_quotes")
-    if isinstance(quotes, list):
+    quotes = _string_list(cleaned.get("evidence_quotes"))
+    if quotes:
         cleaned["evidence_quotes"] = [
             quote
             for quote in quotes
-            if isinstance(quote, str) and quote and quote in raw_haystack
+            if quote and quote in raw_haystack
         ]
 
     if rejected:
@@ -210,7 +231,10 @@ def derive_contract_metadata(*texts: str) -> Dict[str, Any]:
     return {
         "multiplicity_required": bool(terms),
         "multiplicity_terms": terms,
-        "explicit_scope_reduction": any(_is_scope_reduction(t) for t in texts if t),
+        # Compatibility key retained for persisted consumers. Natural-language
+        # prefix matching is intentionally not used for scope classification;
+        # relationship judges may annotate replacements as structured metadata.
+        "explicit_scope_reduction": False,
     }
 
 
@@ -274,12 +298,61 @@ class PreservedMachineMessage:
 
 
 @dataclass
+class TaskRelationshipDecision:
+    """Structured, non-rewriting annotation for one inbound task message.
+
+    The decision is advisory metadata. Canonical task text always comes from
+    the raw direct-user message, never from judge-authored prose.
+    """
+
+    relationship: str = "unclear"
+    state_effect: str = "no_change"
+    confidence: float = 0.0
+    reason_codes: List[str] = field(default_factory=list)
+    evidence_quotes: List[str] = field(default_factory=list)
+    raw_payload: Dict[str, Any] = field(default_factory=dict)
+    fallback_reason: str = ""
+
+    @classmethod
+    def from_payload(
+        cls,
+        payload: Optional[Dict[str, Any]],
+        *,
+        raw_texts: Optional[List[str]] = None,
+        fallback_reason: str = "",
+    ) -> "TaskRelationshipDecision":
+        cleaned = validate_judge_payload_no_rewrite(payload or {}, raw_texts=raw_texts)
+        relationship = str(cleaned.get("relationship") or "unclear").strip()
+        state_effect = str(cleaned.get("state_effect") or "no_change").strip()
+        relationship, state_effect, schema_warning = _normalize_relationship_effect(relationship, state_effect)
+        confidence = max(0.0, min(_safe_float(cleaned.get("confidence"), 0.0), 1.0))
+        reason_codes = _string_list(cleaned.get("reason_codes"))
+        if schema_warning:
+            reason_codes.append(schema_warning)
+        evidence_quotes = _string_list(cleaned.get("evidence_quotes"))
+        return cls(
+            relationship=relationship,
+            state_effect=state_effect,
+            confidence=confidence,
+            reason_codes=reason_codes,
+            evidence_quotes=evidence_quotes,
+            raw_payload=cleaned,
+            fallback_reason=fallback_reason,
+        )
+
+
+@dataclass
 class RawTaskMessage:
     raw_text: str
     source: str = "user"
     relationship_to_active_task: str = "new_task"
     created_at: float = 0.0
     id: str = ""
+    source_kind: str = "direct_user"
+    message_id: str = ""
+    state_effect: str = "no_change"
+    relationship_confidence: float = 0.0
+    judge_result: Dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def create(
@@ -288,6 +361,11 @@ class RawTaskMessage:
         *,
         source: str = "user",
         relationship_to_active_task: str = "new_task",
+        source_kind: str = "direct_user",
+        message_id: str = "",
+        state_effect: str = "no_change",
+        relationship_confidence: float = 0.0,
+        judge_result: Optional[Dict[str, Any]] = None,
     ) -> "RawTaskMessage":
         return cls(
             raw_text=str(raw_text or ""),
@@ -295,6 +373,11 @@ class RawTaskMessage:
             relationship_to_active_task=relationship_to_active_task,
             created_at=_now(),
             id=_new_id("raw"),
+            source_kind=source_kind,
+            message_id=str(message_id or ""),
+            state_effect=state_effect,
+            relationship_confidence=float(relationship_confidence or 0.0),
+            judge_result=dict(judge_result or {}),
         )
 
     @classmethod
@@ -303,8 +386,13 @@ class RawTaskMessage:
             raw_text=str((data or {}).get("raw_text") or ""),
             source=str((data or {}).get("source") or "user"),
             relationship_to_active_task=str((data or {}).get("relationship_to_active_task") or "new_task"),
-            created_at=float((data or {}).get("created_at") or 0.0),
+            created_at=_safe_float((data or {}).get("created_at"), 0.0),
             id=str((data or {}).get("id") or _new_id("raw")),
+            source_kind=str((data or {}).get("source_kind") or "direct_user"),
+            message_id=str((data or {}).get("message_id") or ""),
+            state_effect=str((data or {}).get("state_effect") or "no_change"),
+            relationship_confidence=_safe_float((data or {}).get("relationship_confidence"), 0.0),
+            judge_result=dict((data or {}).get("judge_result") or {}) if isinstance((data or {}).get("judge_result"), dict) else {},
         )
 
 
@@ -415,65 +503,190 @@ class TaskIntentManager:
     def state(self) -> Optional[TaskIntentState]:
         return self._state
 
-    def classify_relationship(self, text: str) -> str:
-        if self._state is None or self._state.status in {"completed", "discarded", "superseded"}:
-            return "new_task"
-        if _is_scope_reduction(text):
-            return "replacement"
-        if _looks_like_supplement(text):
-            return "supplement"
-        # While an active raw contract exists, default to preserving/merging the
-        # latest direct message. A future LLM judge may label high-confidence
-        # unrelated tasks, but that judge still must not rewrite user wording.
-        n = _norm(text)
-        if n in {"try the other one", "do that", "continue", "go on"}:
-            return "unclear"
-        return "supplement"
+    def classify_relationship(
+        self,
+        text: str,
+        *,
+        relationship_decision: Optional[Dict[str, Any] | TaskRelationshipDecision] = None,
+        source_kind: str = "direct_user",
+    ) -> TaskRelationshipDecision:
+        """Classify the latest message without natural-language phrase rules.
 
-    def record_direct_message(self, raw_text: str) -> TaskIntentState:
+        This method is intentionally conservative. It accepts structured judge
+        annotations, but never infers replacement/supplement from raw text
+        prefixes. If there is an active task and no valid structured decision,
+        the safe fallback is ``unclear/no_change``.
+        """
+        if source_kind not in _AUTHORITATIVE_SOURCE_KINDS:
+            return TaskRelationshipDecision(
+                relationship="unclear",
+                state_effect="no_change",
+                confidence=0.0,
+                reason_codes=["non_authoritative_source"],
+                fallback_reason="source cannot mutate task intent",
+            )
+
+        if self._state is None or self._state.status in {"completed", "discarded", "superseded"}:
+            return TaskRelationshipDecision(
+                relationship="new_task",
+                state_effect="no_change",
+                confidence=1.0,
+                reason_codes=["no_active_task"],
+            )
+
+        if isinstance(relationship_decision, TaskRelationshipDecision):
+            decision = TaskRelationshipDecision.from_payload(
+                {
+                    **(relationship_decision.raw_payload or {}),
+                    "relationship": relationship_decision.relationship,
+                    "state_effect": relationship_decision.state_effect,
+                    "confidence": relationship_decision.confidence,
+                    "reason_codes": _string_list(relationship_decision.reason_codes),
+                    "evidence_quotes": _string_list(relationship_decision.evidence_quotes),
+                },
+                raw_texts=[
+                    self._state.task_contract.raw_primary_text,
+                    *self._state.task_contract.raw_supplements,
+                    str(text or ""),
+                ],
+                fallback_reason=relationship_decision.fallback_reason,
+            )
+        elif isinstance(relationship_decision, dict):
+            decision = TaskRelationshipDecision.from_payload(
+                relationship_decision,
+                raw_texts=[
+                    self._state.task_contract.raw_primary_text,
+                    *self._state.task_contract.raw_supplements,
+                    str(text or ""),
+                ],
+            )
+        else:
+            decision = TaskRelationshipDecision(
+                relationship="unclear",
+                state_effect="no_change",
+                confidence=0.0,
+                reason_codes=["no_structured_relationship_decision"],
+                fallback_reason="no bounded judge decision supplied",
+            )
+
+        high_impact = decision.state_effect in {"pause_and_start", "supersede"} or decision.relationship in {"new_task", "replacement"}
+        if high_impact and decision.confidence < 0.85:
+            decision.relationship = "unclear"
+            decision.state_effect = "no_change"
+            decision.reason_codes.append("low_confidence_high_impact_downgrade")
+            decision.fallback_reason = decision.fallback_reason or "high-impact task mutation lacked confidence"
+        return decision
+
+    def record_direct_message(
+        self,
+        raw_text: str,
+        *,
+        source_kind: str = "direct_user",
+        message_id: str = "",
+        relationship_decision: Optional[Dict[str, Any] | TaskRelationshipDecision] = None,
+    ) -> TaskIntentState:
         text = str(raw_text or "")
-        relationship = self.classify_relationship(text)
+        decision = self.classify_relationship(
+            text,
+            relationship_decision=relationship_decision,
+            source_kind=source_kind,
+        )
+        relationship = decision.relationship
+        effect = decision.state_effect
         previous = self._state
         now = _now()
+        judge_result = {
+            "relationship": decision.relationship,
+            "state_effect": decision.state_effect,
+            "confidence": decision.confidence,
+            "reason_codes": list(decision.reason_codes),
+            "evidence_quotes": list(decision.evidence_quotes),
+            "fallback_reason": decision.fallback_reason,
+            "rejected_rewrite_keys": list((decision.raw_payload or {}).get("_rejected_rewrite_keys") or []),
+        }
 
-        if previous and relationship in {"supplement", "unclear"}:
-            contract = previous.task_contract
-            if text and text not in contract.raw_supplements:
+        if (previous is None or previous.status != "active") and source_kind not in _AUTHORITATIVE_SOURCE_KINDS:
+            contract = TaskContract(raw_primary_text="", raw_supplements=[], derived_metadata={})
+            contract.refresh_metadata()
+            return TaskIntentState(
+                id=_new_id("ignored_task"),
+                kind="ignored_non_authoritative_message",
+                raw_text=text,
+                created_at=now,
+                updated_at=now,
+                status="discarded",
+                relationship_to_active_task=relationship,
+                task_contract=contract,
+                completion_state={"last_verdict": "ignored"},
+                raw_messages=[
+                    RawTaskMessage.create(
+                        text,
+                        source="non_authoritative",
+                        relationship_to_active_task=relationship,
+                        source_kind=source_kind,
+                        message_id=message_id,
+                        state_effect=effect,
+                        relationship_confidence=decision.confidence,
+                        judge_result=judge_result,
+                    )
+                ],
+                last_relevance_check={
+                    "verdict": "ignored",
+                    "reason": "non-authoritative source cannot create task intent",
+                    "new_raw_text": text,
+                },
+            )
+
+        active_previous = previous if previous and previous.status == "active" else None
+
+        if active_previous and effect in {"append_contract", "related_only", "no_change", "create_candidate"}:
+            contract = active_previous.task_contract
+            if effect == "append_contract" and text and text not in contract.raw_supplements:
                 contract.raw_supplements.append(text)
             contract.refresh_metadata()
-            previous.raw_messages.append(
-                RawTaskMessage.create(text, source="user", relationship_to_active_task=relationship)
+            raw_source = "user" if source_kind in {"direct_user", "direct_external_user"} else source_kind
+            active_previous.raw_messages.append(
+                RawTaskMessage.create(
+                    text,
+                    source=raw_source,
+                    relationship_to_active_task=relationship,
+                    source_kind=source_kind,
+                    message_id=message_id,
+                    state_effect=effect,
+                    relationship_confidence=decision.confidence,
+                    judge_result=judge_result,
+                )
             )
-            previous.raw_text = text
-            previous.updated_at = now
-            previous.relationship_to_active_task = relationship
-            previous.status = "active"
-            self._state = previous
+            active_previous.raw_text = text
+            active_previous.updated_at = now
+            active_previous.relationship_to_active_task = relationship
+            active_previous.status = "active"
+            if effect == "create_candidate":
+                active_previous.last_relevance_check = {
+                    "verdict": "possible_new_task",
+                    "reason": "structured relationship judge marked this as a possible separate task; active task preserved",
+                    "previous_raw_text": active_previous.task_contract.raw_primary_text or active_previous.raw_text,
+                    "new_raw_text": text,
+                }
+            self._state = active_previous
         else:
             contract = TaskContract(raw_primary_text=text, raw_supplements=[], derived_metadata={})
             contract.refresh_metadata()
             relevance = None
-            if previous and relationship == "replacement":
-                previous.status = "superseded"
+            if active_previous and effect == "supersede":
+                active_previous.status = "superseded"
                 relevance = {
                     "verdict": "replacement",
-                    "reason": "latest direct message explicitly switches/replaces the previous task",
-                    "previous_raw_text": previous.task_contract.raw_primary_text or previous.raw_text,
+                    "reason": "structured relationship judge marked this as replacing the previous task",
+                    "previous_raw_text": active_previous.task_contract.raw_primary_text or active_previous.raw_text,
                     "new_raw_text": text,
                 }
-            elif previous and relationship == "unclear":
-                relevance = {
-                    "verdict": "unclear",
-                    "reason": "latest direct message may or may not relate to previous task",
-                    "previous_raw_text": previous.task_contract.raw_primary_text or previous.raw_text,
-                    "new_raw_text": text,
-                }
-            elif previous and relationship == "new_task":
-                previous.status = "paused"
+            elif active_previous and effect == "pause_and_start":
+                active_previous.status = "paused"
                 relevance = {
                     "verdict": "new_task",
-                    "reason": "latest direct message appears to start a new task; previous task is paused",
-                    "previous_raw_text": previous.task_contract.raw_primary_text or previous.raw_text,
+                    "reason": "structured relationship judge marked this as a separate new task; previous task is paused",
+                    "previous_raw_text": active_previous.task_contract.raw_primary_text or active_previous.raw_text,
                     "new_raw_text": text,
                 }
             state = TaskIntentState(
@@ -488,7 +701,16 @@ class TaskIntentManager:
                 completion_state={"last_verdict": "unknown"},
                 machine_preserved_messages=[],
                 raw_messages=[
-                    RawTaskMessage.create(text, source="user", relationship_to_active_task=relationship)
+                    RawTaskMessage.create(
+                        text,
+                        source="user",
+                        relationship_to_active_task=relationship,
+                        source_kind=source_kind,
+                        message_id=message_id,
+                        state_effect=effect,
+                        relationship_confidence=decision.confidence,
+                        judge_result=judge_result,
+                    )
                 ],
                 last_relevance_check=relevance,
             )
@@ -510,7 +732,13 @@ class TaskIntentManager:
         item = PreservedMachineMessage.create(raw_text, origin=origin, status=status)
         self._state.machine_preserved_messages.append(item)
         self._state.raw_messages.append(
-            RawTaskMessage.create(raw_text, source="machine", relationship_to_active_task=origin)
+            RawTaskMessage.create(
+                raw_text,
+                source="machine",
+                relationship_to_active_task=origin,
+                source_kind="machine",
+                state_effect="no_change",
+            )
         )
         self._state.updated_at = _now()
         save_task_intent(self.session_id, self._state)
@@ -581,6 +809,7 @@ class TaskIntentManager:
 __all__ = [
     "TaskContract",
     "PreservedMachineMessage",
+    "TaskRelationshipDecision",
     "RawTaskMessage",
     "TaskIntentState",
     "TaskIntentManager",

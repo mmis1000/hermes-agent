@@ -188,35 +188,6 @@ _PATH_MENTION_RE = re.compile(r"(?:/|~/?|[A-Za-z]:\\)[^\s`'\")\]}<>]+")
 _MEDIA_DIRECTIVE_RE = re.compile(r"MEDIA:\S+")
 
 
-_EXPLICIT_TASK_REPLACEMENT_PREFIXES = (
-    "ignore the earlier task",
-    "ignore the previous task",
-    "forget the earlier task",
-    "forget the previous task",
-    "instead, ",
-    "instead ",
-    "only do ",
-    "just do ",
-    "switch to ",
-)
-
-_TASK_SUPPLEMENT_PREFIXES = (
-    "also ",
-    "and ",
-    "but ",
-    "use ",
-    "keep ",
-    "make sure ",
-    "low ",
-    "high ",
-    "no need ",
-    "don't need ",
-    "do not need ",
-    "you can ",
-    "for the first pass",
-)
-
-
 def _dedupe_append(items: list[str], value: str, *, limit: int) -> None:
     value = value.strip()
     if value and value not in items and len(items) < limit:
@@ -2028,16 +1999,14 @@ This compaction should PRIORITISE preserving all information related to the focu
                 contract["primary_request"] = text
                 continue
 
-            if cls._is_explicit_task_replacement(text):
-                contract["primary_request"] = text
-                contract["supplements"] = []
-                continue
-
             if text == contract["primary_request"] or text in contract["supplements"]:
                 continue
 
-            if cls._looks_like_task_supplement(text) or contract["primary_request"]:
-                contract["supplements"].append(text)
+            # Transcript fallback is append-only. Natural-language messages are
+            # preserved as supplements/reference constraints; replacement/new
+            # task boundaries must come from structured task-intent state, not
+            # from phrase/prefix matching over raw prose.
+            contract["supplements"].append(text)
 
         if not contract["primary_request"]:
             return None

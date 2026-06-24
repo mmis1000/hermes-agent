@@ -223,6 +223,28 @@ def test_extract_latest_real_user_goal_uses_preserved_contract_and_later_supplem
     assert "Low resolution is okay for the first pass." in real_goal
 
 
+def test_extract_latest_real_user_goal_appends_raw_phrase_without_replacing_primary():
+    runner, _adapter = _make_runner()
+
+    messages = [
+        {
+            "role": "user",
+            "content": (
+                "[PRESERVED UNRESOLVED TASK CONTRACT]\n"
+                "Primary task:\n"
+                "add more styles\n"
+                "[END PRESERVED UNRESOLVED TASK CONTRACT]"
+            ),
+        },
+        {"role": "user", "content": "instead just add one style"},
+    ]
+
+    real_goal = runner._extract_latest_real_user_goal(messages)
+
+    assert "Primary unresolved task:\nadd more styles" in real_goal
+    assert "- instead just add one style" in real_goal
+
+
 @pytest.mark.asyncio
 async def test_request_iteration_continuation_approval_then_approve():
     runner, adapter = _make_runner()

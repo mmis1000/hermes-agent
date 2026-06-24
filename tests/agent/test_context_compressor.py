@@ -1,5 +1,6 @@
 """Tests for agent/context_compressor.py — compression logic, thresholds, truncation fallback."""
 
+import ast
 import pytest
 from unittest.mock import patch, MagicMock
 
@@ -8,6 +9,18 @@ from agent.context_compressor import (
     HISTORICAL_TASK_HEADING,
     SUMMARY_PREFIX,
 )
+
+
+@pytest.fixture(autouse=True)
+def forbid_unmocked_summary_llm():
+    """Prevent compression tests from discovering real provider credentials.
+
+    Individual tests that need summary generation patch call_llm explicitly.
+    Everything else should exercise deterministic fallback behavior without
+    network/model calls.
+    """
+    with patch("agent.context_compressor.call_llm", side_effect=RuntimeError("unmocked call_llm in test")):
+        yield
 
 
 @pytest.fixture()
@@ -2093,6 +2106,59 @@ class TestSummaryTargetRatio:
             "primary_request": "Do the full job: produce a multi-scene video with recurring characters and subtitle burn-in.",
             "supplements": ["Low resolution is okay for the first pass."],
         }
+
+    def test_derive_preserved_task_contract_does_not_replace_on_raw_phrase(self):
+        contract = ContextCompressor._derive_preserved_task_contract_from_messages(
+            [
+                {"role": "user", "content": "add more styles"},
+                {"role": "assistant", "content": "Working."},
+                {"role": "user", "content": "instead just add one style"},
+            ]
+        )
+
+        assert contract == {
+            "primary_request": "add more styles",
+            "supplements": ["instead just add one style"],
+        }
+
+    def test_task_intent_phrase_helpers_are_not_reintroduced(self):
+        import agent.context_compressor as context_compressor
+        import gateway.run as gateway_run
+        import hermes_cli.task_intents as task_intents
+
+        def defined_names(module):
+            source = open(module.__file__, encoding="utf-8").read()
+            tree = ast.parse(source)
+            names = set()
+            for node in ast.walk(tree):
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    names.add(node.name)
+                elif isinstance(node, ast.Assign):
+                    for target in node.targets:
+                        if isinstance(target, ast.Name):
+                            names.add(target.id)
+                elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+                    names.add(node.target.id)
+            return names
+
+        all_defined_names = (
+            defined_names(task_intents)
+            | defined_names(context_compressor)
+            | defined_names(gateway_run)
+        )
+
+        forbidden = [
+            "_SCOPE_REDUCTION_PREFIXES",
+            "_SUPPLEMENT_PREFIXES",
+            "_is_scope_reduction",
+            "_looks_like_supplement",
+            "_EXPLICIT_TASK_REPLACEMENT_PREFIXES",
+            "_TASK_SUPPLEMENT_PREFIXES",
+            "_is_explicit_task_replacement",
+            "_looks_like_task_supplement",
+        ]
+        for marker in forbidden:
+            assert marker not in all_defined_names
 
     def test_compress_appends_preserved_task_contract_block(self):
         mock_response = MagicMock()

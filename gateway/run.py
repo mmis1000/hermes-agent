@@ -9663,7 +9663,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 from hermes_cli.task_intents import TaskIntentManager
 
                 _task_intent_mgr = TaskIntentManager(session_entry.session_id)
-                _task_intent_mgr.record_direct_message(_raw_inbound_user_text)
+                _task_intent_mgr.record_direct_message(
+                    _raw_inbound_user_text,
+                    source_kind="direct_user",
+                    message_id=str(getattr(event, "message_id", "") or ""),
+                )
             except Exception as _task_exc:
                 logger.debug("direct task-intent record failed for %s: %s", session_key, _task_exc)
 
@@ -12421,6 +12425,85 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return text
         return text[: max(0, limit - 3)] + "..."
 
+    @staticmethod
+    def _is_synthetic_iteration_control_message(text: Any) -> bool:
+        """Return True for Hermes-injected max-iteration control prompts.
+
+        These messages are not the user's actual task requirements. Treating them
+        as the "latest user goal" causes continuation review and follow-up
+        prompts to anchor on Hermes' synthetic summarize/continue instructions
+        instead of the user's real objective.
+        """
+        content = str(text or "").strip()
+        if not content:
+            return False
+        if content.startswith("You've reached the maximum number of tool-calling iterations allowed."):
+            return True
+        return content.startswith("[System note: The previous turn hit the iteration budget.")
+
+    def _extract_latest_real_user_goal(self, messages: List[Dict[str, Any]], limit: int = 1200) -> str:
+        """Return the latest non-synthetic user instruction from a transcript.
+
+        If a compaction handoff preserved a structured unresolved task contract,
+        prefer that as the primary goal anchor and merge any later live user
+        supplement into it.
+        """
+        latest_live_user = ""
+        latest_live_user_idx = -1
+        for idx in range(len(messages or []) - 1, -1, -1):
+            msg = (messages or [])[idx]
+            if msg.get("role") != "user":
+                continue
+            content = msg.get("content")
+            if not content or self._is_synthetic_iteration_control_message(content):
+                continue
+            latest_live_user = self._trim_iteration_review_text(content, limit=limit)
+            latest_live_user_idx = idx
+            break
+
+        try:
+            from agent.context_compressor import ContextCompressor
+
+            latest_contract = None
+            latest_contract_idx = -1
+            for idx, msg in enumerate(messages or []):
+                parsed = ContextCompressor._parse_preserved_task_contract_from_text(msg.get("content"))
+                if parsed:
+                    latest_contract = parsed
+                    latest_contract_idx = idx
+
+            if latest_contract:
+                primary = str(latest_contract.get("primary_request") or "").strip()
+                supplements = [
+                    str(item).strip()
+                    for item in (latest_contract.get("supplements") or [])
+                    if str(item).strip()
+                ]
+                if (
+                    latest_live_user
+                    and latest_live_user_idx > latest_contract_idx
+                    and latest_live_user != primary
+                    and latest_live_user not in supplements
+                ):
+                    # Preserve later live user text additively. Do not infer
+                    # replacement from natural-language prefixes here; task
+                    # relationship changes must come from structured task-intent
+                    # state or explicit command/system events.
+                    supplements.append(latest_live_user)
+
+                lines = []
+                if primary:
+                    lines.extend(["Primary unresolved task:", primary])
+                if supplements:
+                    lines.extend(["", "Supplements / constraints:"])
+                    lines.extend(f"- {item}" for item in supplements)
+                combined = "\n".join(lines).strip()
+                if combined:
+                    return self._trim_iteration_review_text(combined, limit=limit)
+        except Exception:
+            pass
+
+        return latest_live_user
     def _build_iteration_review_excerpt(self, messages: List[Dict[str, Any]], limit: int = 14) -> str:
         """Return a compact transcript excerpt for the continuation judge."""
         excerpt_lines: List[str] = []
