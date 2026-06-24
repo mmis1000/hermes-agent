@@ -28,6 +28,7 @@ actionable guidance the model can relay to the user.
 import json
 import logging
 import os
+import re
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -88,6 +89,43 @@ def _discord_request(
             if resp.status == 204:
                 return None
             return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        error_body = ""
+        try:
+            error_body = e.read().decode("utf-8", errors="replace")
+        except Exception:
+            pass
+        raise DiscordAPIError(e.code, error_body) from e
+
+
+def _download_attachment_url(
+    url: str,
+    token: str,
+    *,
+    max_bytes: int = 32 * 1024 * 1024,
+    timeout: int = 30,
+) -> bytes:
+    """Download Discord attachment bytes with bot auth and a byte cap."""
+    req = urllib.request.Request(
+        url,
+        headers={
+            "Authorization": f"Bot {token}",
+            "User-Agent": "Hermes-Agent (https://github.com/NousResearch/hermes-agent)",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            chunks: List[bytes] = []
+            total = 0
+            while True:
+                chunk = resp.read(1024 * 1024)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if max_bytes and total > max_bytes:
+                    raise ValueError(f"Attachment download exceeded max_bytes ({max_bytes})")
+                chunks.append(chunk)
+            return b"".join(chunks)
     except urllib.error.HTTPError as e:
         error_body = ""
         try:
@@ -348,6 +386,139 @@ def _search_members(token: str, guild_id: str, query: str, limit: int = 20, **_k
     return json.dumps({"members": result, "count": len(result)})
 
 
+def _parse_skipped_attachment_marker(marker: str) -> Dict[str, Any]:
+    """Extract the JSON payload from a DISCORD_ATTACHMENT_SKIPPED marker."""
+    text = (marker or "").strip()
+    if not text:
+        return {}
+
+    block = re.search(
+        r"\[DISCORD_ATTACHMENT_SKIPPED\]\s*(\{.*?\})\s*\[/DISCORD_ATTACHMENT_SKIPPED\]",
+        text,
+        flags=re.DOTALL,
+    )
+    candidate = block.group(1) if block else text
+    try:
+        payload = json.loads(candidate)
+    except json.JSONDecodeError:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _coerce_max_bytes(value: Any, default: int = 32 * 1024 * 1024) -> int:
+    if value in (None, ""):
+        return default
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return default
+
+
+def _download_attachment(
+    token: str,
+    channel_id: str = "",
+    message_id: str = "",
+    attachment_id: str = "",
+    filename: str = "",
+    marker: str = "",
+    max_bytes: int = 32 * 1024 * 1024,
+    **_kwargs: Any,
+) -> str:
+    """Download a Discord attachment referenced by a skipped-attachment marker."""
+    payload = _parse_skipped_attachment_marker(marker)
+    channel_id = str(channel_id or payload.get("channel_id") or "").strip()
+    message_id = str(message_id or payload.get("message_id") or "").strip()
+    attachment_id = str(attachment_id or payload.get("attachment_id") or "").strip()
+    filename = str(filename or payload.get("filename") or "").strip()
+    max_bytes = _coerce_max_bytes(max_bytes)
+
+    if not channel_id or not message_id:
+        return json.dumps({
+            "error": "download_attachment requires a marker or both channel_id and message_id.",
+        })
+    if not attachment_id and not filename:
+        return json.dumps({
+            "error": "download_attachment requires attachment_id or filename (or a marker containing one).",
+        })
+
+    msg = _discord_request("GET", f"/channels/{channel_id}/messages/{message_id}", token)
+    attachments = msg.get("attachments", []) if isinstance(msg, dict) else []
+    match = None
+    for att in attachments:
+        att_id = str(att.get("id") or "")
+        att_name = str(att.get("filename") or "")
+        if attachment_id and att_id == attachment_id:
+            match = att
+            break
+        if not attachment_id and filename and att_name == filename:
+            match = att
+            break
+    if match is None:
+        return json.dumps({
+            "error": "Attachment not found on Discord message.",
+            "message_id": message_id,
+            "attachment_id": attachment_id or None,
+            "filename": filename or None,
+        })
+
+    size = match.get("size")
+    if max_bytes and size is not None:
+        try:
+            if int(size) > max_bytes:
+                return json.dumps({
+                    "error": f"Attachment too large ({size} bytes > cap {max_bytes}).",
+                    "size": size,
+                    "max_bytes": max_bytes,
+                })
+        except (TypeError, ValueError):
+            pass
+
+    url = match.get("url") or match.get("proxy_url")
+    if not url:
+        return json.dumps({"error": "Attachment has no downloadable URL."})
+    parsed_url = urllib.parse.urlparse(str(url))
+    host = (parsed_url.hostname or "").lower()
+    allowed_host = (
+        parsed_url.scheme == "https"
+        and (
+            host == "discord.com"
+            or host.endswith(".discord.com")
+            or host == "discordapp.com"
+            or host.endswith(".discordapp.com")
+            or host == "discordapp.net"
+            or host.endswith(".discordapp.net")
+        )
+    )
+    if not allowed_host:
+        return json.dumps({"error": f"Attachment URL host is not a Discord CDN host: {host or '<missing>'}"})
+
+    raw = _download_attachment_url(str(url), token, max_bytes=max_bytes)
+    if max_bytes and len(raw) > max_bytes:
+        return json.dumps({
+            "error": f"Attachment too large after download ({len(raw)} bytes > cap {max_bytes}).",
+            "size": len(raw),
+            "max_bytes": max_bytes,
+        })
+
+    safe_filename = match.get("filename") or filename or f"discord_attachment_{attachment_id or message_id}"
+    from gateway.platforms.base import cache_document_from_bytes
+    from tools.credential_files import to_agent_visible_cache_path
+
+    cached_path = cache_document_from_bytes(raw, safe_filename)
+    visible_path = to_agent_visible_cache_path(cached_path)
+    return json.dumps({
+        "success": True,
+        "path": visible_path,
+        "filename": safe_filename,
+        "content_type": match.get("content_type") or payload.get("content_type"),
+        "size": len(raw),
+        "declared_size": size,
+        "channel_id": channel_id,
+        "message_id": message_id,
+        "attachment_id": str(match.get("id") or attachment_id or ""),
+    })
+
+
 def _fetch_messages(
     token: str, channel_id: str, limit: int = 50,
     before: Optional[str] = None, after: Optional[str] = None,
@@ -379,7 +550,13 @@ def _fetch_messages(
             "timestamp": msg.get("timestamp"),
             "edited_timestamp": msg.get("edited_timestamp"),
             "attachments": [
-                {"filename": a.get("filename"), "url": a.get("url"), "size": a.get("size")}
+                {
+                    "id": a.get("id"),
+                    "filename": a.get("filename"),
+                    "url": a.get("url"),
+                    "size": a.get("size"),
+                    "content_type": a.get("content_type"),
+                }
                 for a in msg.get("attachments", [])
             ],
             "reactions": [
@@ -478,6 +655,7 @@ _ACTIONS = {
     "list_roles": _list_roles,
     "member_info": _member_info,
     "search_members": _search_members,
+    "download_attachment": _download_attachment,
     "fetch_messages": _fetch_messages,
     "list_pins": _list_pins,
     "pin_message": _pin_message,
@@ -488,7 +666,7 @@ _ACTIONS = {
     "remove_role": _remove_role,
 }
 
-_CORE_ACTION_NAMES = frozenset({"fetch_messages", "search_members", "create_thread"})
+_CORE_ACTION_NAMES = frozenset({"fetch_messages", "search_members", "create_thread", "download_attachment"})
 _ADMIN_ACTION_NAMES = frozenset(_ACTIONS.keys()) - _CORE_ACTION_NAMES
 
 _CORE_ACTIONS = {k: v for k, v in _ACTIONS.items() if k in _CORE_ACTION_NAMES}
@@ -505,6 +683,7 @@ _ACTION_MANIFEST: List[Tuple[str, str, str]] = [
     ("list_roles", "(guild_id)", "roles sorted by position"),
     ("member_info", "(guild_id, user_id)", "lookup a specific member"),
     ("search_members", "(guild_id, query)", "find members by name prefix"),
+    ("download_attachment", "(marker | channel_id, message_id, attachment_id|filename)", "download a skipped Discord attachment marker to a local cache path"),
     ("fetch_messages", "(channel_id)", "recent messages; optional before/after snowflakes"),
     ("list_pins", "(channel_id)", "pinned messages in a channel"),
     ("pin_message", "(channel_id, message_id)", "pin a message"),
@@ -656,7 +835,8 @@ def _build_schema(
             "Available actions:\n"
             f"{manifest_block}\n\n"
             "Use the channel_id from the current conversation context. "
-            "Use search_members to look up user IDs by name prefix."
+            "Use search_members to look up user IDs by name prefix. "
+            "When a message contains [DISCORD_ATTACHMENT_SKIPPED], pass the full marker to download_attachment."
             f"{content_note}"
         )
 
@@ -684,6 +864,23 @@ def _build_schema(
         "message_id": {
             "type": "string",
             "description": "Discord message ID.",
+        },
+        "attachment_id": {
+            "type": "string",
+            "description": "Discord attachment ID (download_attachment).",
+        },
+        "filename": {
+            "type": "string",
+            "description": "Attachment filename, used as a fallback selector for download_attachment.",
+        },
+        "marker": {
+            "type": "string",
+            "description": "Full [DISCORD_ATTACHMENT_SKIPPED] marker from a Discord message (download_attachment).",
+        },
+        "max_bytes": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Maximum attachment bytes to download; 0 disables the cap (download_attachment, default 33554432).",
         },
         "query": {
             "type": "string",
@@ -839,6 +1036,10 @@ def _run_discord_action(
     before: str = "",
     after: str = "",
     auto_archive_duration: int = 1440,
+    attachment_id: str = "",
+    filename: str = "",
+    marker: str = "",
+    max_bytes: int = 32 * 1024 * 1024,
 ) -> str:
     """Shared handler logic for both discord tools."""
     token = _get_bot_token()
@@ -872,6 +1073,9 @@ def _run_discord_action(
         "message_id": message_id,
         "query": query,
         "name": name,
+        "attachment_id": attachment_id,
+        "filename": filename,
+        "marker": marker,
     }
 
     missing = [p for p in _REQUIRED_PARAMS.get(action, []) if not local_vars.get(p)]
@@ -894,6 +1098,10 @@ def _run_discord_action(
             before=before,
             after=after,
             auto_archive_duration=auto_archive_duration,
+            attachment_id=attachment_id,
+            filename=filename,
+            marker=marker,
+            max_bytes=max_bytes,
         )
     except DiscordAPIError as e:
         logger.warning("Discord API error in %s action '%s': %s", tool_label, action, e)
@@ -923,6 +1131,7 @@ _HANDLER_DEFAULTS = {
     "action": "", "guild_id": "", "channel_id": "", "user_id": "",
     "role_id": "", "message_id": "", "query": "", "name": "",
     "limit": 50, "before": "", "after": "", "auto_archive_duration": 1440,
+    "attachment_id": "", "filename": "", "marker": "", "max_bytes": 32 * 1024 * 1024,
 }
 
 

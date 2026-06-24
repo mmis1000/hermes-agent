@@ -5,6 +5,7 @@ the `else` clause of the attachment content-type loop that was added
 to download, cache, and optionally inject text from non-image/audio files.
 """
 
+import json
 import os
 import sys
 from datetime import datetime, timezone
@@ -115,8 +116,10 @@ def make_attachment(
     content_type: Optional[str],
     size: int = 1024,
     url: str = "https://cdn.discordapp.com/attachments/fake/file",
+    attachment_id: int = 777,
 ) -> SimpleNamespace:
     return SimpleNamespace(
+        id=attachment_id,
         filename=filename,
         content_type=content_type,
         size=size,
@@ -389,16 +392,53 @@ class TestIncomingDocumentHandling:
 class TestAllowAnyAttachment:
     """Cover accept-any-file-type inbound handling.
 
-    Authorization to message the agent is the gate, not the file extension.
-    Unknown file types are cached and surfaced to the agent as DOCUMENT events
-    with the source content_type (or application/octet-stream) so gateway/run.py
-    emits a path-pointing context note. The legacy ``allow_any_attachment``
-    config flag is now a no-op — acceptance is unconditional.
+    By default, unknown file types are not downloaded, but the agent sees a
+    structured skipped-attachment marker it can pass to the Discord download
+    tool on demand. When ``allow_any_attachment`` is explicitly enabled,
+    unknown file types are cached and surfaced as DOCUMENT events with the
+    source content_type (or application/octet-stream) so gateway/run.py emits a
+    path-pointing context note.
     """
 
     @pytest.mark.asyncio
-    async def test_unknown_type_cached_by_default(self, adapter):
-        """Default: unknown extension is cached, not dropped."""
+    async def test_unknown_type_skipped_by_default(self, adapter):
+        """Default (flag off): unknown extension is not cached but a marker is surfaced."""
+        with _mock_aiohttp_download(b"should not be cached"):
+            msg = make_message([
+                make_attachment(
+                    filename="weird.xyz",
+                    content_type="application/x-custom",
+                    size=1234,
+                    attachment_id=888,
+                )
+            ], content="please inspect")
+            await adapter._handle_message(msg)
+
+        adapter.handle_message.assert_called_once()
+        event = adapter.handle_message.call_args[0][0]
+        assert event.media_urls == []
+        assert "please inspect" in event.text
+        assert "[DISCORD_ATTACHMENT_SKIPPED]" in event.text
+        assert "[/DISCORD_ATTACHMENT_SKIPPED]" in event.text
+        marker_json = event.text.split("[DISCORD_ATTACHMENT_SKIPPED]", 1)[1].split(
+            "[/DISCORD_ATTACHMENT_SKIPPED]", 1
+        )[0].strip()
+        marker = json.loads(marker_json)
+        assert marker["platform"] == "discord"
+        assert marker["channel_id"] == "1"
+        assert marker["message_id"] == "123"
+        assert marker["attachment_id"] == "888"
+        assert marker["filename"] == "weird.xyz"
+        assert marker["content_type"] == "application/x-custom"
+        assert marker["size"] == 1234
+        assert marker["reason"] == "unsupported_by_default_allowlist"
+        assert "download_attachment" in marker["download_hint"]
+
+    @pytest.mark.asyncio
+    async def test_unknown_type_cached_when_flag_on(self, adapter):
+        """Flag on: unknown extension is cached as application/octet-stream."""
+        adapter.config.extra["allow_any_attachment"] = True
+
         with _mock_aiohttp_download(b"\x00\x01\x02 binary payload"):
             msg = make_message([
                 make_attachment(filename="weird.xyz", content_type="application/x-custom")
@@ -414,6 +454,7 @@ class TestAllowAnyAttachment:
         # We deliberately do NOT inline arbitrary (non-UTF-8) bytes — run.py
         # emits the path-pointing note based on DOCUMENT + octet-stream MIME.
         assert "[Content of" not in (event.text or "")
+        assert "[DISCORD_ATTACHMENT_SKIPPED]" not in (event.text or "")
 
     @pytest.mark.asyncio
     async def test_html_cached_and_inlined(self, adapter):
@@ -433,6 +474,7 @@ class TestAllowAnyAttachment:
     @pytest.mark.asyncio
     async def test_unknown_type_no_content_type_becomes_octet_stream(self, adapter):
         """No content_type from discord: MIME falls back to octet-stream."""
+        adapter.config.extra["allow_any_attachment"] = True
         with _mock_aiohttp_download(b"\x00raw bytes\x01"):
             msg = make_message([
                 make_attachment(filename="mystery.bin", content_type=None)
@@ -446,6 +488,7 @@ class TestAllowAnyAttachment:
     @pytest.mark.asyncio
     async def test_max_attachment_bytes_caps_uploads(self, adapter):
         """discord.max_attachment_bytes overrides the historical 32 MiB cap."""
+        adapter.config.extra["allow_any_attachment"] = True
         adapter.config.extra["max_attachment_bytes"] = 1024  # 1 KiB
 
         msg = make_message([
@@ -463,6 +506,7 @@ class TestAllowAnyAttachment:
     @pytest.mark.asyncio
     async def test_max_attachment_bytes_zero_means_unlimited(self, adapter):
         """max_attachment_bytes=0 disables the size cap entirely."""
+        adapter.config.extra["allow_any_attachment"] = True
         adapter.config.extra["max_attachment_bytes"] = 0
 
         # 64 MiB — would normally exceed the historical 32 MiB hardcoded cap.

@@ -395,6 +395,117 @@ class TestFetchMessages:
 
 
 # ---------------------------------------------------------------------------
+# Action: download_attachment
+# ---------------------------------------------------------------------------
+
+class TestDownloadAttachment:
+    def _marker(self):
+        payload = {
+            "platform": "discord",
+            "channel_id": "11",
+            "message_id": "1001",
+            "attachment_id": "att-1",
+            "filename": "clip.mp4",
+            "content_type": "video/mp4",
+            "size": 12,
+            "reason": "unsupported_by_default_allowlist",
+        }
+        return "[DISCORD_ATTACHMENT_SKIPPED]\n" + json.dumps(payload) + "\n[/DISCORD_ATTACHMENT_SKIPPED]"
+
+    @patch("tools.discord_tool._download_attachment_url")
+    @patch("tools.discord_tool._discord_request")
+    def test_download_attachment_from_marker(self, mock_req, mock_download, monkeypatch, tmp_path):
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+        import gateway.platforms.base as base
+        monkeypatch.setattr(base, "DOCUMENT_CACHE_DIR", tmp_path / "docs")
+        mock_req.return_value = {
+            "id": "1001",
+            "attachments": [
+                {
+                    "id": "att-1",
+                    "filename": "clip.mp4",
+                    "content_type": "video/mp4",
+                    "size": 12,
+                    "url": "https://cdn.discordapp.com/attachments/clip.mp4",
+                }
+            ],
+        }
+        mock_download.return_value = b"fake mp4 data"
+
+        result = json.loads(discord_core(action="download_attachment", marker=self._marker()))
+
+        assert result["success"] is True
+        assert result["filename"] == "clip.mp4"
+        assert result["content_type"] == "video/mp4"
+        assert result["channel_id"] == "11"
+        assert result["message_id"] == "1001"
+        assert result["attachment_id"] == "att-1"
+        assert result["size"] == len(b"fake mp4 data")
+        assert result["path"].endswith("clip.mp4")
+        with open(result["path"], "rb") as f:
+            assert f.read() == b"fake mp4 data"
+        mock_req.assert_called_once_with("GET", "/channels/11/messages/1001", "test-token")
+        mock_download.assert_called_once_with(
+            "https://cdn.discordapp.com/attachments/clip.mp4",
+            "test-token",
+            max_bytes=32 * 1024 * 1024,
+        )
+
+    @patch("tools.discord_tool._download_attachment_url")
+    @patch("tools.discord_tool._discord_request")
+    def test_download_attachment_by_filename(self, mock_req, mock_download, monkeypatch, tmp_path):
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+        import gateway.platforms.base as base
+        monkeypatch.setattr(base, "DOCUMENT_CACHE_DIR", tmp_path / "docs")
+        mock_req.return_value = {
+            "attachments": [
+                {"id": "other", "filename": "other.bin", "size": 1, "url": "https://cdn.discordapp.com/attachments/other"},
+                {"id": "target", "filename": "data.bin", "size": 4, "url": "https://cdn.discordapp.com/attachments/data"},
+            ],
+        }
+        mock_download.return_value = b"data"
+
+        result = json.loads(discord_core(
+            action="download_attachment",
+            channel_id="11",
+            message_id="1001",
+            filename="data.bin",
+        ))
+
+        assert result["success"] is True
+        assert result["attachment_id"] == "target"
+        assert result["filename"] == "data.bin"
+
+    @patch("tools.discord_tool._download_attachment_url")
+    @patch("tools.discord_tool._discord_request")
+    def test_download_attachment_rejects_declared_size_over_cap(self, mock_req, mock_download, monkeypatch):
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+        mock_req.return_value = {
+            "attachments": [
+                {"id": "att-1", "filename": "huge.mp4", "size": 2048, "url": "https://cdn.discordapp.com/attachments/huge"},
+            ],
+        }
+
+        result = json.loads(discord_core(
+            action="download_attachment",
+            channel_id="11",
+            message_id="1001",
+            attachment_id="att-1",
+            max_bytes=1024,
+        ))
+
+        assert "error" in result
+        assert "too large" in result["error"]
+        mock_download.assert_not_called()
+
+    def test_download_attachment_requires_identifiers(self, monkeypatch):
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+        result = json.loads(discord_core(action="download_attachment"))
+        assert "error" in result
+        assert "channel_id" in result["error"]
+
+
+# ---------------------------------------------------------------------------
 # Action: list_pins
 # ---------------------------------------------------------------------------
 
@@ -558,14 +669,14 @@ class TestRegistration:
         from tools.registry import registry
         entry = registry._tools["discord"]
         actions = set(entry.schema["parameters"]["properties"]["action"]["enum"])
-        assert actions == {"fetch_messages", "search_members", "create_thread"}
+        assert actions == {"fetch_messages", "search_members", "create_thread", "download_attachment"}
 
     def test_admin_schema_actions(self):
         """Admin static schema should list only admin actions."""
         from tools.registry import registry
         entry = registry._tools["discord_admin"]
         actions = set(entry.schema["parameters"]["properties"]["action"]["enum"])
-        expected_admin = set(_ACTIONS.keys()) - {"fetch_messages", "search_members", "create_thread"}
+        expected_admin = set(_ACTIONS.keys()) - {"fetch_messages", "search_members", "create_thread", "download_attachment"}
         assert actions == expected_admin
 
     def test_all_actions_covered(self):
@@ -589,6 +700,8 @@ class TestRegistration:
         assert "fetch_messages(channel_id)" in desc
         assert "search_members(guild_id, query)" in desc
         assert "create_thread(channel_id, name)" in desc
+        assert "download_attachment(marker | channel_id, message_id, attachment_id|filename)" in desc
+        assert "[DISCORD_ATTACHMENT_SKIPPED]" in desc
         # Admin actions should NOT be in core description
         assert "list_guilds()" not in desc
         assert "add_role(" not in desc
@@ -604,6 +717,7 @@ class TestRegistration:
         # Core actions should NOT be in admin description
         assert "fetch_messages(" not in desc
         assert "create_thread(" not in desc
+        assert "download_attachment(" not in desc
 
     def test_handler_callable(self):
         from tools.registry import registry
