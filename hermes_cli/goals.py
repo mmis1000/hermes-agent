@@ -1510,7 +1510,7 @@ class GoalManager:
             if refreshed_contract and refreshed_contract != (state.task_contract or ""):
                 state.task_contract = refreshed_contract
 
-        verdict, reason, parse_failed, wait_directive = judge_goal(
+        judge_result = judge_goal(
             state.goal,
             last_response,
             subgoals=state.subgoals or None,
@@ -1518,6 +1518,11 @@ class GoalManager:
             contract=state.contract if state.has_contract() else None,
             task_contract=state.task_contract or "",
         )
+        if len(judge_result) == 3:
+            verdict, reason, parse_failed = judge_result
+            wait_directive = None
+        else:
+            verdict, reason, parse_failed, wait_directive = judge_result
         state.last_verdict = verdict
         state.last_reason = reason
 

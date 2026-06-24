@@ -12624,6 +12624,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         excerpt_lines: List[str] = []
         for msg in messages[-limit:]:
             role = msg.get("role") or "unknown"
+            if role == "user" and self._is_synthetic_iteration_control_message(msg.get("content", "")):
+                continue
             if role == "assistant" and msg.get("tool_calls"):
                 tool_names = []
                 for tc in msg.get("tool_calls") or []:
@@ -12690,11 +12692,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         excerpt = self._build_iteration_review_excerpt(messages)
         turn_exit_reason = result.get("turn_exit_reason", "")
         api_calls = int(result.get("api_calls", 0) or 0)
-        user_goal = ""
-        for msg in reversed(messages):
-            if msg.get("role") == "user" and msg.get("content"):
-                user_goal = self._trim_iteration_review_text(msg.get("content"), limit=1200)
-                break
+        user_goal = self._extract_latest_real_user_goal(messages)
 
         user_config = _load_gateway_config()
         model, runtime_kwargs = self._resolve_session_agent_runtime(
@@ -12773,19 +12771,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 except Exception:
                     pass
 
-    def _build_iteration_continue_prompt(self, *, user_approved: bool = False) -> str:
+    def _build_iteration_continue_prompt(self, *, user_approved: bool = False, user_goal: str = "") -> str:
+        preserved = self._trim_iteration_review_text(user_goal, limit=1600)
+        suffix = (
+            f" Preserve the user's original goal and all explicit requirements: [{preserved}]"
+            if preserved else ""
+        )
         if user_approved:
             return (
                 "[System note: The previous turn hit the iteration budget. The user approved "
                 "continuing from the current transcript. Continue exactly from where you left off. "
                 "Do not repeat the forced summary you already gave. Resume the unfinished work and "
-                "only stop when the task is actually complete or you need fresh user input.]"
+                f"only stop when the task is actually complete or you need fresh user input.{suffix}]"
             )
         return (
             "[System note: The previous turn hit the iteration budget. A standalone review judged "
             "that the task is still progressing normally. Continue exactly from where you left off. "
             "Do not repeat the forced summary you already gave. Resume the unfinished work and only "
-            "stop when the task is actually complete or you need fresh user input.]"
+            f"stop when the task is actually complete or you need fresh user input.{suffix}]"
         )
 
     async def _request_iteration_continuation_approval(
@@ -15174,7 +15177,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return await self._run_agent_inner(
                 message, context_prompt, history, source, session_id,
                 session_key=session_key, run_generation=run_generation,
-                _interrupt_depth=_interrupt_depth, event_message_id=event_message_id,
+                _interrupt_depth=_interrupt_depth, _continuation_depth=_continuation_depth,
+                _notify_started_at=_notify_started_at, event_message_id=event_message_id,
                 channel_prompt=channel_prompt, persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
             )
@@ -15184,7 +15188,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return await self._run_agent_inner(
                 message, context_prompt, history, source, session_id,
                 session_key=session_key, run_generation=run_generation,
-                _interrupt_depth=_interrupt_depth, event_message_id=event_message_id,
+                _interrupt_depth=_interrupt_depth, _continuation_depth=_continuation_depth,
+                _notify_started_at=_notify_started_at, event_message_id=event_message_id,
                 channel_prompt=channel_prompt, persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
             )
@@ -15214,6 +15219,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         session_key: str = None,
         run_generation: Optional[int] = None,
         _interrupt_depth: int = 0,
+        _continuation_depth: int = 0,
+        _notify_started_at: Optional[float] = None,
         event_message_id: Optional[str] = None,
         channel_prompt: Optional[str] = None,
         persist_user_message: Optional[str] = None,
@@ -17612,8 +17619,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
                     _review_decision = (_review_result or {}).get("decision") or "ask_user"
                     _review_reason = (_review_result or {}).get("reason") or ""
+                    _continuation_goal = self._extract_latest_real_user_goal(
+                        list(result.get("messages") or [])
+                    )
                     if _review_decision == "auto_continue":
-                        pending = self._build_iteration_continue_prompt(user_approved=False)
+                        pending = self._build_iteration_continue_prompt(
+                            user_approved=False,
+                            user_goal=_continuation_goal,
+                        )
                         logger.info(
                             "Auto-continuing iteration-exhausted task for session %s (%s)",
                             session_key or "?",
@@ -17627,7 +17640,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             metadata=_status_thread_metadata,
                         )
                         if _approved:
-                            pending = self._build_iteration_continue_prompt(user_approved=True)
+                            pending = self._build_iteration_continue_prompt(
+                                user_approved=True,
+                                user_goal=_continuation_goal,
+                            )
                             logger.info(
                                 "User approved continuation after iteration review for session %s",
                                 session_key or "?",
@@ -17809,7 +17825,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     session_key=session_key,
                     run_generation=run_generation,
                     _interrupt_depth=_interrupt_depth + 1,
-                    _continuation_depth=_continuation_depth + (1 if pending == self._build_iteration_continue_prompt(user_approved=False) or pending == self._build_iteration_continue_prompt(user_approved=True) else 0),
+                    _continuation_depth=_continuation_depth + 1 if pending and pending.startswith("[System note: The previous turn hit the iteration budget.") else _continuation_depth,
                     _notify_started_at=_notify_start,
                     event_message_id=next_message_id,
                     channel_prompt=next_channel_prompt,

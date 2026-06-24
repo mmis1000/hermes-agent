@@ -5431,6 +5431,7 @@ class DiscordAdapter(BasePlatformAdapter):
         media_types = []
         pending_text_injection: Optional[str] = None
         skipped_attachment_markers: List[str] = []
+        allow_any_attachment = self._discord_allow_any_attachment()
         for att in all_attachments:
             content_type = att.content_type or "unknown"
             if content_type.startswith("image/"):
@@ -5471,7 +5472,8 @@ class DiscordAdapter(BasePlatformAdapter):
                     mime_to_ext = {v: k for k, v in SUPPORTED_DOCUMENT_TYPES.items()}
                     ext = mime_to_ext.get(content_type, "")
                 in_allowlist = ext in SUPPORTED_DOCUMENT_TYPES
-                if not in_allowlist and not allow_any_attachment:
+                is_text_like_document = ext in _TEXT_INJECT_EXTENSIONS or (content_type or "").startswith("text/")
+                if not in_allowlist and not allow_any_attachment and not is_text_like_document:
                     marker_channel_id = str(getattr(message.channel, "id", "") or getattr(effective_channel, "id", ""))
                     skipped_attachment_markers.append(
                         self._build_skipped_attachment_marker(

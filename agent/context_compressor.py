@@ -1864,23 +1864,6 @@ This compaction should PRIORITISE preserving all information related to the focu
             return True
         return any(text.startswith(p) for p in _HISTORICAL_SUMMARY_PREFIXES)
 
-    @staticmethod
-    def _is_explicit_task_replacement(text: str) -> bool:
-        normalized = str(text or "").strip().lower()
-        return any(normalized.startswith(prefix) for prefix in _EXPLICIT_TASK_REPLACEMENT_PREFIXES)
-
-    @staticmethod
-    def _looks_like_task_supplement(text: str) -> bool:
-        normalized = str(text or "").strip().lower()
-        if not normalized:
-            return False
-        if any(normalized.startswith(prefix) for prefix in _TASK_SUPPLEMENT_PREFIXES):
-            return True
-        return len(normalized) <= 140 and any(
-            marker in normalized
-            for marker in (" okay", " ok", " no need", " don't need", " do not need")
-        )
-
     @classmethod
     def _parse_preserved_task_contract_from_text(cls, text: Any) -> Optional[Dict[str, Any]]:
         content = _content_text_for_contains(text)
