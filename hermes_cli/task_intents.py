@@ -192,11 +192,25 @@ def validate_judge_payload_no_rewrite(
 
     cleaned: Dict[str, Any] = {}
     rejected: List[str] = []
+    dropped: List[str] = []
+    allowed_keys = {
+        "relationship",
+        "state_effect",
+        "confidence",
+        "reason_codes",
+        "evidence_quotes",
+        "_rejected_rewrite_keys",
+        "_dropped_judge_keys",
+    }
     for key, value in payload.items():
-        if str(key).lower() in _FORBIDDEN_JUDGE_REWRITE_KEYS:
-            rejected.append(str(key))
+        key_str = str(key)
+        if key_str.lower() in _FORBIDDEN_JUDGE_REWRITE_KEYS:
+            rejected.append(key_str)
             continue
-        cleaned[key] = value
+        if key_str not in allowed_keys:
+            dropped.append(key_str)
+            continue
+        cleaned[key_str] = value
 
     raw_haystack = "\n".join(str(t or "") for t in (raw_texts or []))
     quotes = _string_list(cleaned.get("evidence_quotes"))
@@ -209,6 +223,8 @@ def validate_judge_payload_no_rewrite(
 
     if rejected:
         cleaned["_rejected_rewrite_keys"] = rejected
+    if dropped:
+        cleaned["_dropped_judge_keys"] = dropped
     return cleaned
 
 

@@ -15,7 +15,7 @@ Direct-message task-intent tracking previously used natural-language raw-text ph
 
 ## Hot-path classifier shape
 
-The gateway hot path must not run a full agent turn just to classify intent. If a model judge is later added, it must be a tiny cached micro-classifier:
+The gateway hot path must not run a full agent turn just to classify intent. The live model judge is a tiny cached micro-classifier:
 
 - no tool schemas,
 - no full transcript,
@@ -25,9 +25,10 @@ The gateway hot path must not run a full agent turn just to classify intent. If 
 - strict JSON only,
 - short timeout,
 - bounded input/output,
-- cache keyed by message id, raw hash, active task id/version, schema/policy/prompt version, and clamp config.
+- cache keyed by message id, raw current-message/primary/supplement hashes, task-state metadata, schema/policy/prompt version, and clamp config.
 
-For this implementation pass, the runtime accepts an optional structured `relationship_decision` object and otherwise falls back conservatively.
+The runtime accepts an optional structured `relationship_decision` object from
+that micro-judge and otherwise falls back conservatively.
 
 ## Structured relationship decision
 
@@ -64,9 +65,29 @@ High-impact state effects (`pause_and_start`, `supersede`) require high confiden
 8. Add static regression tests so heuristic helper names/prefix tables do not return.
 9. Run focused tests and review the diff.
 
-## Follow-up work
+## Live micro-judge implementation
 
-- Add the actual bounded/cached micro-judge provider behind a feature flag.
+The gateway now has a real hot-path micro-judge integration using
+`hermes_cli.task_intent_micro_judge.TaskIntentMicroJudge`.
+
+It builds a tiny no-tools classifier request from only:
+
+- active task state metadata,
+- exact ellipsis-clamped primary task text,
+- a few exact ellipsis-clamped recent supplements,
+- the latest exact ellipsis-clamped direct user message,
+- allowed relationship/effect labels.
+
+The gateway calls it only for direct user messages when an active task already
+exists. The result is cached by message id/text, raw current-message/primary/
+supplement hashes, task-state metadata, and policy/schema/clamp config, then
+passed into
+`TaskIntentManager.record_direct_message(..., relationship_decision=...)`.
+Failures, timeouts, invalid JSON, and low-confidence high-impact decisions fall
+back to `unclear/no_change`, never to phrase matching.
+
+## Remaining follow-up work
+
 - Move task-intent state to an append-only versioned event log or lineage-aware key so compression child sessions cannot lose state.
 - Add a separate completion verifier that checks raw contract + supplements + evidence rather than assistant/todo self-report.
 - Expand gateway tests around slash-command metadata boundaries and `/undo`/`/goal` transitions.

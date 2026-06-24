@@ -1524,7 +1524,7 @@ if _config_path.exists():
             # Built-in tasks that previously had explicit env-var bridging.
             # Kept here as the canonical bridged set; plugin tasks are added
             # below via the plugin auxiliary registry.
-            _aux_bridged_keys = {"vision", "web_extract", "approval"}
+            _aux_bridged_keys = {"vision", "web_extract", "approval", "task_intent"}
             try:
                 from hermes_cli.plugins import get_plugin_auxiliary_tasks
                 for _entry in get_plugin_auxiliary_tasks():
@@ -2672,6 +2672,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         import threading as _threading
         self._agent_cache: "OrderedDict[str, tuple]" = OrderedDict()
         self._agent_cache_lock = _threading.Lock()
+        self._task_intent_judge_cache: "OrderedDict[str, Any]" = OrderedDict()
+        self._task_intent_judge_signature: str = ""
+        self._task_intent_judge_cache_lock = _threading.Lock()
 
         # Per-session model overrides from /model command.
         # Key: session_key, Value: dict with model/provider/api_key/base_url/api_mode
@@ -7324,6 +7327,110 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         await adapter.send(source.chat_id, content, metadata=metadata)
 
+    def _load_task_intent_micro_judge_config(self):
+        try:
+            from hermes_cli.config import load_config as _load_config
+            from hermes_cli.task_intent_micro_judge import TaskIntentMicroJudgeConfig
+        except Exception:
+            from hermes_cli.task_intent_micro_judge import TaskIntentMicroJudgeConfig
+            return TaskIntentMicroJudgeConfig(enabled=False)
+        try:
+            cfg = _load_config()
+        except Exception:
+            return TaskIntentMicroJudgeConfig(enabled=False)
+        task_cfg = cfg_get(cfg, "task_intents", "relationship_judge", default=None)
+        if task_cfg is None:
+            task_cfg = cfg_get(cfg, "task_intent", "relationship_judge", default=None)
+        if task_cfg is None:
+            task_cfg = cfg_get(cfg, "auxiliary", "task_intent", default=None)
+        if task_cfg is None:
+            return TaskIntentMicroJudgeConfig(enabled=False)
+        return TaskIntentMicroJudgeConfig.from_mapping(task_cfg)
+
+    async def _judge_direct_task_relationship(
+        self,
+        *,
+        manager: Any,
+        raw_text: str,
+        message_id: str,
+        session_key: str,
+    ):
+        """Run the bounded relationship micro-judge for an active direct task.
+
+        This is intentionally fail-open: if config/model/provider work fails or
+        the judge times out, recording continues with TaskIntentManager's
+        conservative `unclear/no_change` fallback.
+        """
+        try:
+            from hermes_cli.task_intent_micro_judge import TaskIntentMicroJudge
+            cfg = self._load_task_intent_micro_judge_config()
+        except Exception as exc:
+            logger.debug("task-intent micro-judge unavailable for %s: %s", session_key, exc)
+            return None
+        if cfg is None or not cfg.enabled:
+            return None
+        state = getattr(manager, "state", None)
+        if state is None or getattr(state, "status", "") != "active":
+            return None
+
+        signature = cfg.signature()
+        if signature != getattr(self, "_task_intent_judge_signature", ""):
+            self._task_intent_judge_cache = OrderedDict()
+            self._task_intent_judge_signature = signature
+        cache = getattr(self, "_task_intent_judge_cache", None)
+        if cache is None:
+            cache = OrderedDict()
+            self._task_intent_judge_cache = cache
+
+        def _llm_call(**kwargs):
+            from agent.auxiliary_client import call_llm
+            _model, runtime = self._resolve_session_agent_runtime(session_key=session_key)
+            return call_llm(
+                task="task_intent",
+                model=_model,
+                messages=kwargs["messages"],
+                timeout=kwargs.get("timeout"),
+                max_tokens=kwargs.get("max_tokens"),
+                temperature=0,
+                tools=None,
+                main_runtime=runtime,
+            )
+
+        judge = TaskIntentMicroJudge(
+            config=cfg,
+            llm_call=_llm_call,
+            cache=cache,
+            cache_lock=getattr(self, "_task_intent_judge_cache_lock", None),
+        )
+        try:
+            cache_key = judge.cache_key(
+                state=state,
+                current_message=raw_text,
+                message_id=message_id,
+                source_kind="direct_user",
+            )
+            cached_decision = judge.get_cached_decision(cache_key)
+            if cached_decision is not None:
+                return cached_decision
+            worker_judge = TaskIntentMicroJudge(config=cfg, llm_call=_llm_call)
+            decision = await asyncio.wait_for(
+                asyncio.to_thread(
+                    worker_judge.judge,
+                    state=state,
+                    current_message=raw_text,
+                    message_id=message_id,
+                    source_kind="direct_user",
+                    use_cache=False,
+                ),
+                timeout=max(0.1, float(cfg.timeout_seconds) + 0.5),
+            )
+            if decision is not None:
+                judge.store_cached_decision(cache_key, decision)
+            return decision
+        except Exception as exc:
+            logger.debug("task-intent micro-judge failed for %s: %s", session_key, exc)
+            return None
+
     async def _handle_message(self, event: MessageEvent) -> Optional[str]:
         """
         Handle an incoming message from any platform.
@@ -9663,10 +9770,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 from hermes_cli.task_intents import TaskIntentManager
 
                 _task_intent_mgr = TaskIntentManager(session_entry.session_id)
+                _task_message_id = str(getattr(event, "message_id", "") or "")
+                _relationship_decision = await self._judge_direct_task_relationship(
+                    manager=_task_intent_mgr,
+                    raw_text=_raw_inbound_user_text,
+                    message_id=_task_message_id,
+                    session_key=session_key,
+                )
                 _task_intent_mgr.record_direct_message(
                     _raw_inbound_user_text,
                     source_kind="direct_user",
-                    message_id=str(getattr(event, "message_id", "") or ""),
+                    message_id=_task_message_id,
+                    relationship_decision=_relationship_decision,
                 )
             except Exception as _task_exc:
                 logger.debug("direct task-intent record failed for %s: %s", session_key, _task_exc)

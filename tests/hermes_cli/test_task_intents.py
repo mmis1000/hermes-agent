@@ -401,3 +401,180 @@ def test_machine_preserved_plural_contract_can_veto_one_slice_done(hermes_home):
 
     assert decision["verdict"] == "continue"
     assert decision["guard_vetoed_done"] is True
+
+
+def test_micro_judge_builds_bounded_payload_and_caches(hermes_home):
+    from hermes_cli.task_intents import TaskIntentManager
+    from hermes_cli.task_intent_micro_judge import TaskIntentMicroJudge, TaskIntentMicroJudgeConfig
+
+    mgr = TaskIntentManager("sid-micro-cache")
+    mgr.record_direct_message("Build a dashboard with charts and filters")
+
+    calls = []
+
+    def fake_llm(**kwargs):
+        calls.append(kwargs)
+        return '{"relationship":"supplement","state_effect":"append_contract","confidence":0.72,"reason_codes":["adds_constraint"],"evidence_quotes":["mobile"]}'
+
+    judge = TaskIntentMicroJudge(
+        config=TaskIntentMicroJudgeConfig(max_primary_chars=16, max_message_chars=20),
+        llm_call=fake_llm,
+    )
+    first = judge.judge(state=mgr.state, current_message="also make it work on mobile", message_id="m2")
+    second = judge.judge(state=mgr.state, current_message="also make it work on mobile", message_id="m2")
+
+    assert first is not None
+    assert first.relationship == "supplement"
+    assert first.state_effect == "append_contract"
+    assert first.evidence_quotes == ["mobile"]
+    assert second is not first
+    assert second.relationship == first.relationship
+    assert second.raw_payload["cache"] == "hit"
+    assert first.raw_payload["cache"] == "miss"
+    assert len(calls) == 1
+    sent = calls[0]["messages"][1]["content"]
+    assert "Build a" in sent
+    assert "also make" in sent
+    assert "on mobile" in sent
+    assert calls[0]["timeout"] == 1.5
+    assert calls[0]["max_tokens"] == 160
+
+
+def test_micro_judge_invalid_json_falls_back_unclear(hermes_home):
+    from hermes_cli.task_intents import TaskIntentManager
+    from hermes_cli.task_intent_micro_judge import TaskIntentMicroJudge
+
+    mgr = TaskIntentManager("sid-micro-invalid")
+    mgr.record_direct_message("Build a dashboard")
+    judge = TaskIntentMicroJudge(llm_call=lambda **_: "not json")
+
+    decision = judge.judge(state=mgr.state, current_message="maybe another request", message_id="m2")
+
+    assert decision is not None
+    assert decision.relationship == "unclear"
+    assert decision.state_effect == "no_change"
+    assert "invalid_judge_json" in decision.reason_codes
+
+
+def test_micro_judge_does_not_run_without_active_task(hermes_home):
+    from hermes_cli.task_intent_micro_judge import TaskIntentMicroJudge
+
+    calls = []
+    judge = TaskIntentMicroJudge(llm_call=lambda **kwargs: calls.append(kwargs))
+
+    assert judge.judge(state=None, current_message="hello", message_id="m1") is None
+    assert calls == []
+
+
+def test_micro_judge_strips_rewrite_fields_and_bad_evidence(hermes_home):
+    from hermes_cli.task_intents import TaskIntentManager
+    from hermes_cli.task_intent_micro_judge import TaskIntentMicroJudge
+
+    mgr = TaskIntentManager("sid-micro-rewrite")
+    mgr.record_direct_message("Build a dashboard")
+
+    def fake_llm(**_):
+        return (
+            '{"relationship":"replacement","state_effect":"supersede","confidence":0.9,'
+            '"rewritten_task":"do something else","evidence_quotes":["not in raw"]}'
+        )
+
+    judge = TaskIntentMicroJudge(llm_call=fake_llm)
+    decision = judge.judge(state=mgr.state, current_message="please change direction", message_id="m2")
+
+    assert decision is not None
+    assert decision.relationship == "replacement"
+    assert decision.evidence_quotes == []
+    assert "rewritten_task" in decision.raw_payload["_rejected_rewrite_keys"]
+
+
+def test_micro_judge_cache_uses_raw_message_hash_beyond_clamped_text(hermes_home):
+    from hermes_cli.task_intents import TaskIntentManager
+    from hermes_cli.task_intent_micro_judge import TaskIntentMicroJudge, TaskIntentMicroJudgeConfig
+
+    mgr = TaskIntentManager("sid-micro-cache-raw-hash")
+    mgr.record_direct_message("Build a dashboard")
+    calls = []
+
+    def fake_llm(**_):
+        calls.append(1)
+        return '{"relationship":"related_question","state_effect":"related_only","confidence":0.7}'
+
+    judge = TaskIntentMicroJudge(
+        config=TaskIntentMicroJudgeConfig(max_message_chars=9),
+        llm_call=fake_llm,
+    )
+    one = "ABCD middle one EFGH"
+    two = "ABCD middle two EFGH"
+
+    assert judge.cache_key(state=mgr.state, current_message=one) != judge.cache_key(state=mgr.state, current_message=two)
+    judge.judge(state=mgr.state, current_message=one)
+    judge.judge(state=mgr.state, current_message=two)
+    assert len(calls) == 2
+
+
+def test_micro_judge_zero_recent_supplements_means_none(hermes_home):
+    from hermes_cli.task_intents import TaskIntentManager
+    from hermes_cli.task_intent_micro_judge import TaskIntentMicroJudgeConfig, build_relationship_judge_payload
+
+    mgr = TaskIntentManager("sid-micro-zero-supps")
+    mgr.record_direct_message("Build a dashboard")
+    for idx in range(3):
+        mgr.record_direct_message(
+            f"constraint {idx}",
+            relationship_decision={"relationship": "supplement", "state_effect": "append_contract", "confidence": 0.7},
+        )
+
+    payload = build_relationship_judge_payload(
+        state=mgr.state,
+        current_message="another detail",
+        config=TaskIntentMicroJudgeConfig(max_recent_supplements=0),
+    )
+
+    assert payload["active_task"]["recent_supplements"] == []
+
+
+def test_micro_judge_exception_is_not_cached_and_is_sanitized(hermes_home):
+    from hermes_cli.task_intents import TaskIntentManager
+    from hermes_cli.task_intent_micro_judge import TaskIntentMicroJudge
+
+    mgr = TaskIntentManager("sid-micro-error-uncached")
+    mgr.record_direct_message("Build a dashboard")
+    calls = []
+
+    def flaky(**_):
+        calls.append(1)
+        if len(calls) == 1:
+            raise RuntimeError("secret-token-should-not-persist")
+        return '{"relationship":"related_question","state_effect":"related_only","confidence":0.7}'
+
+    judge = TaskIntentMicroJudge(llm_call=flaky)
+    first = judge.judge(state=mgr.state, current_message="what next?", message_id="m1")
+    second = judge.judge(state=mgr.state, current_message="what next?", message_id="m1")
+
+    assert first.reason_codes == ["judge_error"]
+    assert first.fallback_reason == "relationship judge failed"
+    assert first.raw_payload["cache"] == "uncached_error"
+    assert second.relationship == "related_question"
+    assert len(calls) == 2
+
+
+def test_micro_judge_config_mapping_and_output_whitelist(hermes_home):
+    from hermes_cli.task_intents import TaskIntentManager
+    from hermes_cli.task_intent_micro_judge import TaskIntentMicroJudge, TaskIntentMicroJudgeConfig
+
+    assert TaskIntentMicroJudgeConfig.from_mapping(["bad"]).enabled is False
+
+    mgr = TaskIntentManager("sid-micro-whitelist")
+    mgr.record_direct_message("Build a dashboard")
+    judge = TaskIntentMicroJudge(
+        llm_call=lambda **_: (
+            '{"relationship":"supplement","state_effect":"append_contract","confidence":0.7,'
+            '"task_text":"rewritten task","evidence_quotes":["dashboard"]}'
+        )
+    )
+
+    decision = judge.judge(state=mgr.state, current_message="with dashboard export", message_id="m2")
+
+    assert "task_text" not in decision.raw_payload
+    assert "task_text" in decision.raw_payload["_dropped_judge_keys"]
