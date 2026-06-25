@@ -928,7 +928,10 @@ class TurnRunner:
             scfg = StreamingConfig()
         # display.platforms.<plat>.streaming may disable streaming per platform; None = follow global.
         plat_streaming = ctx.resolve_display_setting(ctx.user_config, platform_key, "streaming")
-        want_stream_deltas = not ctx.scheduled_heartbeat and scfg.enabled_for(plat_streaming)
+        allow_final_streaming = self._runner._pre_send_status_guard_allows_final_streaming()
+        if not allow_final_streaming:
+            stts = None
+        want_stream_deltas = allow_final_streaming and not ctx.scheduled_heartbeat and scfg.enabled_for(plat_streaming)
         want_interim_messages = bool(ctx.interim_assistant_messages_enabled) and not ctx.scheduled_heartbeat
         if want_stream_deltas or want_interim_messages:
             try:
@@ -1697,6 +1700,8 @@ class TurnRunner:
             agent._pending_persist_user_metadata = getattr(ctx, "persist_user_metadata", None)
             api_message = _wrap_current_message_with_observed_context(self._native_image_run_message(), observed_group_context)
             kwargs = {"conversation_history": agent_history, "task_id": ctx.session_id}
+            if _accepts_keyword(agent.run_conversation, "persist_user_metadata") and getattr(ctx, "persist_user_metadata", None) is not None:
+                kwargs["persist_user_metadata"] = ctx.persist_user_metadata
             if _accepts_keyword(agent.run_conversation, "turn_author"):
                 # Sent on every transport: a provider gating durable writes needs the bot flag in a DM too.
                 kwargs["turn_author"] = {"id": ctx.source.user_id or None, "name": ctx.source.user_name or None,
@@ -1743,6 +1748,9 @@ class TurnRunner:
             )
         ctx.result_holder[0] = result
         if stream_consumer is None:
+            return
+        if not self._runner._pre_send_status_guard_allows_final_streaming():
+            stream_consumer.finish()
             return
         # Pass final_response as the authoritative finalize payload: it includes post-stream
         # augmentation (verifier footer, explainer) the accumulator never saw. Adopt ONLY a genuinely
