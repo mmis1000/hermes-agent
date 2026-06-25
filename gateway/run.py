@@ -6868,6 +6868,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         import threading as _threading
         self._agent_cache: "OrderedDict[str, tuple]" = OrderedDict()
         self._agent_cache_lock = _threading.Lock()
+        self._pre_send_status_guard_cache: "OrderedDict[str, Any]" = OrderedDict()
+        self._pre_send_status_guard_signature: str = ""
+        self._pre_send_status_guard_cache_lock = _threading.Lock()
 
         # Conversation-scoped per-session state (/model, /model --once,
         # /reasoning, /fast overrides; per-turn sidecar notes; ephemeral
@@ -20292,6 +20295,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     agent_result, response, history_len=len(history),
                 )
                 response = _sanitize_gateway_final_response(source.platform, response)
+
+            if response and not agent_result.get("already_sent") and not _intentional_silence:
+                try:
+                    _status_decision = await self._judge_pre_send_status(
+                        response=response,
+                        agent_messages=agent_messages,
+                        session_id=session_entry.session_id,
+                        session_key=session_key,
+                        platform=_platform_name,
+                        task_intent_mgr=_task_intent_mgr,
+                    )
+                    if _status_decision is not None and not getattr(_status_decision, "allowed", True):
+                        logger.info(
+                            "pre-send status guard rejected response for %s: %s",
+                            session_key,
+                            getattr(_status_decision, "reason", ""),
+                        )
+                        response = self._pre_send_status_guard_replacement(_status_decision)
+                except Exception as _status_guard_exc:
+                    logger.debug("pre-send status guard evaluation failed for %s: %s", session_key, _status_guard_exc)
 
             # Ordering contract: the agent thread already updated the contextvar
             # in conversation_compression.py; propagate to SessionEntry + _save().
