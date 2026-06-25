@@ -4453,6 +4453,156 @@ class GatewayRunner(
             return False
         return str(response or "").strip().casefold() == "continue"
 
+    def _load_pre_send_status_guard_config(self):
+        from hermes_cli.pre_send_status_guard import PreSendStatusGuardConfig
+
+        try:
+            from hermes_cli.config import load_config
+
+            config = load_config()
+        except Exception:
+            return PreSendStatusGuardConfig(enabled=False)
+        guard_config = cfg_get(
+            config, "task_intents", "status_guard", default=None
+        )
+        return PreSendStatusGuardConfig.from_mapping(guard_config)
+
+    def _active_task_for_pre_send_status_guard(
+        self, session_id: str, task_intent_mgr: Any = None, cfg: Any = None
+    ):
+        from hermes_cli.pre_send_status_guard import (
+            active_task_payload_from_goal,
+            active_task_payload_from_task_intent,
+        )
+
+        try:
+            state = (
+                getattr(task_intent_mgr, "state", None)
+                if task_intent_mgr is not None
+                else None
+            )
+            if state is None:
+                from hermes_cli.task_intents import TaskIntentManager
+
+                db = getattr(getattr(self, "_session_db", None), "_db", None)
+                state = TaskIntentManager(session_id, db=db).state
+            payload = active_task_payload_from_task_intent(state, config=cfg)
+            if payload:
+                return payload
+        except Exception:
+            logger.debug(
+                "pre-send status guard: task-intent payload failed", exc_info=True
+            )
+        try:
+            from hermes_cli.goals import load_goal
+
+            db = getattr(getattr(self, "_session_db", None), "_db", None)
+            return active_task_payload_from_goal(
+                load_goal(session_id, db=db), config=cfg
+            )
+        except Exception:
+            logger.debug(
+                "pre-send status guard: goal payload failed", exc_info=True
+            )
+            return None
+
+    async def _judge_pre_send_status(
+        self,
+        *,
+        response: str,
+        agent_messages: Any,
+        session_id: str,
+        session_key: str,
+        platform: str,
+        task_intent_mgr: Any = None,
+    ):
+        try:
+            from hermes_cli.pre_send_status_guard import PreSendStatusGuard
+
+            config = self._load_pre_send_status_guard_config()
+        except Exception as exc:
+            logger.debug(
+                "pre-send status guard unavailable for %s: %s", session_key, exc
+            )
+            return None
+        if not config.enabled:
+            return None
+
+        active_task = self._active_task_for_pre_send_status_guard(
+            session_id, task_intent_mgr=task_intent_mgr, cfg=config
+        )
+        signature = config.signature()
+        if signature != getattr(self, "_pre_send_status_guard_signature", ""):
+            self._pre_send_status_guard_cache = OrderedDict()
+            self._pre_send_status_guard_signature = signature
+        cache = getattr(self, "_pre_send_status_guard_cache", None)
+        if cache is None:
+            cache = OrderedDict()
+            self._pre_send_status_guard_cache = cache
+
+        def _llm_call(**kwargs):
+            from agent.auxiliary_client import call_llm
+
+            model, runtime = self._resolve_session_agent_runtime(
+                session_key=session_key
+            )
+            return call_llm(
+                task="task_intent",
+                model=model,
+                messages=kwargs["messages"],
+                timeout=float(kwargs.get("timeout") or config.timeout_seconds),
+                max_tokens=int(
+                    kwargs.get("max_tokens") or config.max_output_tokens
+                ),
+                temperature=0,
+                tools=None,
+                main_runtime=runtime,
+            )
+
+        guard = PreSendStatusGuard(
+            config=config,
+            llm_call=_llm_call,
+            cache=cache,
+            cache_lock=getattr(self, "_pre_send_status_guard_cache_lock", None),
+        )
+        try:
+            return await asyncio.wait_for(
+                asyncio.to_thread(
+                    guard.judge,
+                    candidate_response=response,
+                    active_task=active_task,
+                    messages=list(agent_messages or []),
+                    source="gateway",
+                    platform=platform,
+                ),
+                timeout=max(0.1, float(config.timeout_seconds) + 0.5),
+            )
+        except Exception as exc:
+            logger.debug(
+                "pre-send status guard failed for %s: %s", session_key, exc
+            )
+            return None
+
+    @staticmethod
+    def _pre_send_status_guard_replacement(decision: Any) -> str:
+        reason = str(
+            getattr(decision, "reason", "")
+            or "status claim is not supported by recent operations"
+        )
+        steer = str(
+            getattr(decision, "steer_prompt", "")
+            or "Continue with verification/review, ask the user for a waiver, "
+            "or send a non-final progress status."
+        )
+        claims = getattr(decision, "unsupported_claims", None) or []
+        claim_text = ", ".join(str(item) for item in claims if str(item))
+        claim_line = f"\nUnsupported claim(s): {claim_text}" if claim_text else ""
+        return (
+            "⚠️ Pre-send status guard blocked the drafted final response because "
+            "its status claims were not supported by the active task and recent "
+            f"operations.{claim_line}\nReason: {reason}\nNext step: {steer}"
+        )
+
     @dataclasses.dataclass
     class _HygieneSettings:
         """Resolved session-hygiene configuration for one inbound turn."""

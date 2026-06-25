@@ -8,7 +8,7 @@ import threading
 
 import pytest
 
-from gateway.config import GatewayConfig, Platform, SessionResetPolicy
+from gateway.config import GatewayConfig, Platform
 from gateway.platforms.base import MessageEvent
 from gateway.session import SessionEntry, SessionSource, SessionStore
 from hermes_state import SessionDB
@@ -253,19 +253,17 @@ def test_active_goal_blocks_idle_reset_and_expiry(tmp_path):
     from hermes_cli.goals import GoalManager
 
     config = GatewayConfig()
-    config.default_reset_policy = SessionResetPolicy(mode="idle", idle_minutes=1)
     store = SessionStore(tmp_path / "sessions", config)
     store._db = SessionDB(db_path=tmp_path / "state.db")
     GoalManager("sid-active-goal", db=store._db).set("Ship without losing context")
     entry = _expired_entry()
 
-    assert store._should_reset(entry, _source()) is None
-    assert store._is_session_expired(entry) is False
+    assert store._route_reset_reason(entry) is None
+    assert not entry.suspended
 
 
 def test_goal_lookup_failure_blocks_idle_reset_and_expiry(tmp_path, monkeypatch):
     config = GatewayConfig()
-    config.default_reset_policy = SessionResetPolicy(mode="idle", idle_minutes=1)
     store = SessionStore(tmp_path / "sessions", config)
     entry = _expired_entry()
 
@@ -275,5 +273,14 @@ def test_goal_lookup_failure_blocks_idle_reset_and_expiry(tmp_path, monkeypatch)
 
     monkeypatch.setattr("hermes_cli.goals.GoalManager", BrokenGoalManager)
 
-    assert store._should_reset(entry, _source()) is None
-    assert store._is_session_expired(entry) is False
+    assert store._route_reset_reason(entry) is None
+    assert not entry.suspended
+
+
+def test_pre_send_guard_buffers_final_streaming_and_fails_open():
+    from hermes_cli.pre_send_status_guard import final_streaming_allowed
+
+    assert final_streaming_allowed({"task_intents": {"status_guard": {"enabled": True}}}) is False
+    assert final_streaming_allowed({"task_intents": {"status_guard": {"enabled": False}}}) is True
+    assert final_streaming_allowed({"task_intents": "malformed"}) is True
+    assert final_streaming_allowed(None) is True
