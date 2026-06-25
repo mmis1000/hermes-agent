@@ -276,3 +276,11 @@ def test_goal_lookup_failure_blocks_idle_reset_and_expiry(tmp_path, monkeypatch)
     assert store._route_reset_reason(entry) is None
     assert not entry.suspended
 
+
+def test_pre_send_guard_buffers_final_streaming_and_fails_open():
+    from hermes_cli.pre_send_status_guard import final_streaming_allowed
+
+    assert final_streaming_allowed({"task_intents": {"status_guard": {"enabled": True}}}) is False
+    assert final_streaming_allowed({"task_intents": {"status_guard": {"enabled": False}}}) is True
+    assert final_streaming_allowed({"task_intents": "malformed"}) is True
+    assert final_streaming_allowed(None) is True

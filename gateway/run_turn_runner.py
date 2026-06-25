@@ -928,7 +928,12 @@ class TurnRunner:
             scfg = StreamingConfig()
         # display.platforms.<plat>.streaming may disable streaming per platform; None = follow global.
         plat_streaming = ctx.resolve_display_setting(ctx.user_config, platform_key, "streaming")
-        want_stream_deltas = not ctx.scheduled_heartbeat and scfg.enabled_for(plat_streaming)
+        from hermes_cli.pre_send_status_guard import final_streaming_allowed
+
+        allow_final_streaming = final_streaming_allowed(ctx.user_config)
+        if not allow_final_streaming:
+            stts = None
+        want_stream_deltas = allow_final_streaming and not ctx.scheduled_heartbeat and scfg.enabled_for(plat_streaming)
         want_interim_messages = bool(ctx.interim_assistant_messages_enabled) and not ctx.scheduled_heartbeat
         if want_stream_deltas or want_interim_messages:
             try:
@@ -1745,6 +1750,11 @@ class TurnRunner:
             )
         ctx.result_holder[0] = result
         if stream_consumer is None:
+            return
+        from hermes_cli.pre_send_status_guard import final_streaming_allowed
+
+        if not final_streaming_allowed(ctx.user_config):
+            stream_consumer.finish()
             return
         # Pass final_response as the authoritative finalize payload: it includes post-stream
         # augmentation (verifier footer, explainer) the accumulator never saw. Adopt ONLY a genuinely

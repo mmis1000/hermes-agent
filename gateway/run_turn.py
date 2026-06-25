@@ -4291,7 +4291,9 @@ class GatewayTurnMixin:
             turn_ctx, turn_runner, source, event_message_id, disp._native_slack_task_cards,
         )
         # Two independent quiet reasons: a muted diagnostic wake (ours) and a scheduled heartbeat.
-        if not (scheduled_heartbeat or turn_ctx.mute_notification_reply):
+        from hermes_cli.pre_send_status_guard import final_streaming_allowed
+
+        if final_streaming_allowed(turn_ctx.user_config) and not (scheduled_heartbeat or turn_ctx.mute_notification_reply):
             self._run_agent_start_streaming_tts(
                 source, message_type, _status_thread_metadata, turn_ctx.streaming_tts_consumer_holder,
             )
@@ -4317,6 +4319,10 @@ class GatewayTurnMixin:
             worker = self._run_agent_start_turn_worker(turn_ctx, turn_runner.run_sync)
             _executor_task_holder[0] = worker.executor_task  # read late by _notify_long_running
             response = await self._run_agent_await_turn_worker(worker, turn_ctx, _interrupt_detected, interrupt_monitor)
+            if isinstance(response, dict) and response.get("final_response") and not response.get("already_sent"):
+                decision = await self._judge_pre_send_status(response=response["final_response"], agent_messages=response.get("messages", []), session_id=response.get("session_id") or session_id, session_key=session_key or "", platform=str(getattr(source.platform, "value", source.platform)))
+                if decision is not None and not getattr(decision, "allowed", True):
+                    response["final_response"] = self._pre_send_status_guard_replacement(decision)
             if isinstance(response, dict):
                 response["_notification_reply_muted"] = turn_ctx.mute_notification_reply
             self._run_agent_evict_on_fallback(turn_ctx)
