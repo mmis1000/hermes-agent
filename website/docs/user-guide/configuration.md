@@ -190,6 +190,42 @@ continuation messages are marked so they cannot replace that goal.
 This behavior applies to gateway sessions. A direct CLI invocation still ends when
 its own iteration budget is exhausted.
 
+## Task Intent and Pre-send Status Guards
+
+Gateway ingress records the user's exact wording before platform wrappers or
+channel context are added. Follow-up task state keeps this raw source text rather
+than an LLM-generated rewrite.
+
+Two optional, tool-free micro-judges can add stricter behavior. Both are disabled
+by default, have short timeouts, and fail safely without blocking normal operation:
+
+```yaml
+task_intents:
+  relationship_judge:
+    enabled: false
+    timeout_seconds: 1.5
+  status_guard:
+    enabled: false
+    timeout_seconds: 2.0
+    max_operations: 30
+```
+
+- **`relationship_judge`** classifies an authoritative direct-user message as a
+  new task, same-task follow-up, supplement, replacement, cancellation, or
+  unclear. It never rewrites the text. Ambiguous or malformed decisions preserve
+  the active task with no destructive state change.
+- **`status_guard`** checks a completed gateway draft against the active task and
+  a bounded, secret-redacted synopsis of recent tool operations. It can block
+  unsupported claims such as “verified”, “deployed”, or “sent”, and drafts that
+  omit requested material merely because of uncertainty. When enabled, Hermes
+  buffers the final response until the check finishes; interim progress messages
+  are unaffected. A rejected draft is replaced by an explicit warning and next
+  step rather than silently edited.
+
+Enabling either judge adds a small auxiliary model call on relevant messages. Tune
+advanced bounds only when you have a measured latency or context-size reason; the
+default limits are deliberately conservative.
+
 ## Linux Child-process OOM Priority
 
 On Linux, Hermes gives supported tool, terminal/background-process, and browser
