@@ -3304,6 +3304,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         import threading as _threading
         self._agent_cache: "OrderedDict[str, tuple]" = OrderedDict()
         self._agent_cache_lock = _threading.Lock()
+        self._pre_send_status_guard_cache: "OrderedDict[str, Any]" = OrderedDict()
+        self._pre_send_status_guard_signature: str = ""
+        self._pre_send_status_guard_cache_lock = _threading.Lock()
 
         # Per-session model overrides from /model command.
         # Key: session_key, Value: dict with model/provider/api_key/base_url/api_mode
@@ -10246,6 +10249,142 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         await adapter.send(source.chat_id, content, metadata=metadata)
 
+    def _load_pre_send_status_guard_config(self):
+        try:
+            from hermes_cli.config import load_config as _load_config
+            from hermes_cli.pre_send_status_guard import PreSendStatusGuardConfig
+        except Exception:
+            from hermes_cli.pre_send_status_guard import PreSendStatusGuardConfig
+            return PreSendStatusGuardConfig(enabled=False)
+        try:
+            cfg = _load_config()
+        except Exception:
+            return PreSendStatusGuardConfig(enabled=False)
+        guard_cfg = cfg_get(cfg, "task_intents", "status_guard", default=None)
+        legacy_guard_cfg = cfg_get(cfg, "pre_send_status_guard", default=None)
+        # Preserve legacy opt-in even though DEFAULT_CONFIG now contains the
+        # canonical disabled key.
+        if not getattr(PreSendStatusGuardConfig.from_mapping(guard_cfg), "enabled", False):
+            if legacy_guard_cfg is not None:
+                guard_cfg = legacy_guard_cfg
+        if guard_cfg is None:
+            return PreSendStatusGuardConfig(enabled=False)
+        return PreSendStatusGuardConfig.from_mapping(guard_cfg)
+
+    def _active_task_for_pre_send_status_guard(self, session_id: str, task_intent_mgr: Any = None, cfg: Any = None):
+        try:
+            from hermes_cli.pre_send_status_guard import (
+                active_task_payload_from_goal,
+                active_task_payload_from_task_intent,
+            )
+        except Exception:
+            return None
+        try:
+            state = getattr(task_intent_mgr, "state", None) if task_intent_mgr is not None else None
+            if state is None:
+                try:
+                    from hermes_cli.task_intents import TaskIntentManager
+                    state = getattr(TaskIntentManager(session_id), "state", None)
+                except Exception:
+                    state = None
+            payload = active_task_payload_from_task_intent(state, config=cfg)
+            if payload:
+                return payload
+        except Exception:
+            logger.debug("pre-send status guard: task-intent payload failed", exc_info=True)
+        try:
+            from hermes_cli.goals import load_goal
+            return active_task_payload_from_goal(load_goal(session_id), config=cfg)
+        except Exception:
+            logger.debug("pre-send status guard: goal payload failed", exc_info=True)
+            return None
+
+    async def _judge_pre_send_status(
+        self,
+        *,
+        response: str,
+        agent_messages: Any,
+        session_id: str,
+        session_key: str,
+        platform: str,
+        task_intent_mgr: Any = None,
+    ):
+        """Run the optional neutral-operation pre-send status guard.
+
+        The guard is fail-open and opt-in.  It sees raw-ish recent operations;
+        Hermes does not pre-classify terminal commands as delivery/mutation.
+        """
+        try:
+            from hermes_cli.pre_send_status_guard import PreSendStatusGuard
+            cfg = self._load_pre_send_status_guard_config()
+        except Exception as exc:
+            logger.debug("pre-send status guard unavailable for %s: %s", session_key, exc)
+            return None
+        if cfg is None or not cfg.enabled:
+            return None
+
+        active_task = self._active_task_for_pre_send_status_guard(
+            session_id,
+            task_intent_mgr=task_intent_mgr,
+            cfg=cfg,
+        )
+        signature = cfg.signature()
+        if signature != getattr(self, "_pre_send_status_guard_signature", ""):
+            self._pre_send_status_guard_cache = OrderedDict()
+            self._pre_send_status_guard_signature = signature
+        cache = getattr(self, "_pre_send_status_guard_cache", None)
+        if cache is None:
+            cache = OrderedDict()
+            self._pre_send_status_guard_cache = cache
+
+        def _llm_call(**kwargs):
+            from agent.auxiliary_client import call_llm
+            _model, runtime = self._resolve_session_agent_runtime(session_key=session_key)
+            return call_llm(
+                task="task_intent",
+                model=_model,
+                messages=kwargs["messages"],
+                timeout=float(kwargs.get("timeout") or cfg.timeout_seconds),
+                max_tokens=int(kwargs.get("max_tokens") or cfg.max_output_tokens),
+                temperature=0,
+                tools=None,  # type: ignore[arg-type]
+                main_runtime=runtime,
+            )
+
+        guard = PreSendStatusGuard(
+            config=cfg,
+            llm_call=_llm_call,
+            cache=cache,
+            cache_lock=getattr(self, "_pre_send_status_guard_cache_lock", None),
+        )
+        try:
+            return await asyncio.wait_for(
+                asyncio.to_thread(
+                    guard.judge,
+                    candidate_response=response,
+                    active_task=active_task,
+                    messages=list(agent_messages or []),
+                    source="gateway",
+                    platform=platform,
+                ),
+                timeout=max(0.1, float(cfg.timeout_seconds) + 0.5),
+            )
+        except Exception as exc:
+            logger.debug("pre-send status guard failed for %s: %s", session_key, exc)
+            return None
+
+    def _pre_send_status_guard_replacement(self, decision: Any) -> str:
+        reason = str(getattr(decision, "reason", "") or "status claim is not supported by recent operations")
+        steer = str(getattr(decision, "steer_prompt", "") or "Continue with verification/review, ask the user for a waiver, or send a non-final progress status.")
+        claims = getattr(decision, "unsupported_claims", None) or []
+        claim_text = ", ".join(str(item) for item in claims if str(item))
+        claim_line = f"\nUnsupported claim(s): {claim_text}" if claim_text else ""
+        return (
+            "⚠️ Pre-send status guard blocked the drafted final response because "
+            "its status claims were not supported by the active task and recent operations."
+            f"{claim_line}\nReason: {reason}\nNext step: {steer}"
+        )
+
     async def _handle_message(self, event: MessageEvent) -> Optional[str]:
         """
         Handle an incoming message from any platform.
@@ -13351,6 +13490,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     agent_result, response, history_len=len(history),
                 )
                 response = _sanitize_gateway_final_response(source.platform, response)
+
+            if response and not agent_result.get("already_sent") and not _intentional_silence:
+                try:
+                    _status_decision = await self._judge_pre_send_status(
+                        response=response,
+                        agent_messages=agent_messages,
+                        session_id=session_entry.session_id,
+                        session_key=session_key,
+                        platform=_platform_name,
+                        task_intent_mgr=_task_intent_mgr,
+                    )
+                    if _status_decision is not None and not getattr(_status_decision, "allowed", True):
+                        logger.info(
+                            "pre-send status guard rejected response for %s: %s",
+                            session_key,
+                            getattr(_status_decision, "reason", ""),
+                        )
+                        response = self._pre_send_status_guard_replacement(_status_decision)
+                except Exception as _status_guard_exc:
+                    logger.debug("pre-send status guard evaluation failed for %s: %s", session_key, _status_guard_exc)
 
             # Ordering contract: the agent thread already updated the contextvar
             # in conversation_compression.py; propagate to SessionEntry + _save().

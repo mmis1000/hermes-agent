@@ -1200,6 +1200,32 @@ DEFAULT_CONFIG = {
         "reasoning_overrides": {},
     },
 
+    # Task intent / completion-status guards.  These are optional hot-path
+    # micro-judges; absent/disabled config preserves legacy behavior.
+    "task_intents": {
+        "relationship_judge": {
+            "enabled": False,
+            "timeout_seconds": 1.5,
+            "max_output_tokens": 160,
+            "max_primary_chars": 800,
+            "max_supplement_chars": 320,
+            "max_message_chars": 800,
+            "max_recent_supplements": 3,
+            "cache_size": 512,
+        },
+        "status_guard": {
+            "enabled": False,
+            "timeout_seconds": 2.0,
+            "max_output_tokens": 220,
+            "max_operations": 30,
+            "terminal_command_chars": 320,
+            "tool_arguments_chars": 400,
+            "tool_result_chars": 600,
+            "user_event_chars": 600,
+            "cache_size": 256,
+        },
+    },
+
     "terminal": {
         "backend": "local",
         "modal_mode": "auto",
