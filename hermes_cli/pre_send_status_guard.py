@@ -1,10 +1,11 @@
-"""Optional pre-send status sanity guard for gateway responses.
+"""Optional pre-send task-status and answer-coverage sanity guard.
 
-The guard is deliberately not a release/delivery classifier.  It builds a
+The guard is deliberately not a release/delivery classifier. It builds a
 neutral synopsis of recent operations -- tool calls, terminal commands, tool
 results, skill reads, and notable user/system events -- and asks a tiny judge
-whether the candidate visible response makes status claims unsupported by that
-synopsis and the active task contract.
+whether the candidate visible response makes unsupported task-status claims or
+uses uncertainty as a reason to omit requested material without an explicit
+caveat.
 """
 
 from __future__ import annotations
@@ -22,6 +23,16 @@ from hermes_cli.task_intents import TaskIntentState, clamp_raw_text
 
 STATUS_GUARD_SCHEMA_VERSION = "pre-send-status-guard-v1"
 DEFAULT_POLICY_VERSION = "neutral-operation-synopsis-v1"
+DEFAULT_STATUS_GUARD_JUDGE_PROMPT = (
+    "You are a tiny optional pre-send status-sanity judge for Hermes Agent. "
+    "Return one JSON object only; no markdown. You are not a task planner and do not use tools. "
+    "Given an active task, a candidate visible assistant response, and a neutral recent-operation synopsis, "
+    "decide whether the candidate response makes status claims that are unsupported or contradicted by the shown operations. "
+    "Do not classify commands in advance; reason from the exact tool names, command excerpts, skill reads, user events, and results shown. "
+    "Reject when the draft claims completion, verification, review approval, upload/send/delivery, deployment, commit/push, or other task status that the operations do not support. "
+    "Also reject drafts that use uncertainty or non-100%-confidence as a reason to ignore, omit, skip, exclude, drop, or silently leave out user-requested material instead of answering with explicit uncertainty/caveats. "
+    "Allow honest progress/blocker/partial-status messages and answers that state uncertainty while still addressing the requested material. If uncertain about whether a draft violates this policy, allow."
+)
 
 _DECISIONS = {"allow", "reject_and_steer"}
 
@@ -120,6 +131,7 @@ class PreSendStatusGuardConfig:
     cache_size: int = 256
     policy_version: str = DEFAULT_POLICY_VERSION
     prompt_version: str = STATUS_GUARD_SCHEMA_VERSION
+    judge_prompt: str = DEFAULT_STATUS_GUARD_JUDGE_PROMPT
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "enabled", _coerce_bool(self.enabled, False))
@@ -137,6 +149,7 @@ class PreSendStatusGuardConfig:
         object.__setattr__(self, "cache_size", _clamp_int(self.cache_size, 256, 0, 10000))
         object.__setattr__(self, "policy_version", str(self.policy_version or DEFAULT_POLICY_VERSION))
         object.__setattr__(self, "prompt_version", str(self.prompt_version or STATUS_GUARD_SCHEMA_VERSION))
+        object.__setattr__(self, "judge_prompt", str(self.judge_prompt or DEFAULT_STATUS_GUARD_JUDGE_PROMPT))
 
     @classmethod
     def from_mapping(cls, data: Optional[Any]) -> "PreSendStatusGuardConfig":
@@ -161,6 +174,7 @@ class PreSendStatusGuardConfig:
             cache_size=_clamp_int(cfg.get("cache_size", 256), 256, 0, 10000),
             policy_version=str(cfg.get("policy_version") or DEFAULT_POLICY_VERSION),
             prompt_version=str(cfg.get("prompt_version") or STATUS_GUARD_SCHEMA_VERSION),
+            judge_prompt=str(cfg.get("judge_prompt") or cfg.get("prompt") or DEFAULT_STATUS_GUARD_JUDGE_PROMPT),
         )
 
     def signature(self) -> str:
@@ -297,7 +311,7 @@ def active_task_payload_from_task_intent(
         supplements = []
     return {
         "id": state.id,
-        "kind": state.kind or "direct_message",
+        "kind": getattr(state, "kind", "") or "direct_message",
         "status": state.status,
         "raw_primary_text": _clamp_redacted(state.task_contract.raw_primary_text, cfg.max_primary_chars),
         "raw_supplements": [
@@ -318,6 +332,10 @@ def active_task_payload_from_goal(goal_state: Any, *, config: Optional[PreSendSt
         supplements = [str(item) for item in (getattr(goal_state, "subgoals", None) or [])]
     except Exception:
         supplements = []
+    if cfg.max_recent_supplements > 0:
+        supplements = supplements[-cfg.max_recent_supplements :]
+    else:
+        supplements = []
     return {
         "id": f"goal:{hashlib.sha256(raw.encode('utf-8')).hexdigest()[:12]}",
         "kind": "goal",
@@ -325,7 +343,7 @@ def active_task_payload_from_goal(goal_state: Any, *, config: Optional[PreSendSt
         "raw_primary_text": _clamp_redacted(raw, cfg.max_primary_chars),
         "raw_supplements": [
             _clamp_redacted(item, cfg.max_supplement_chars)
-            for item in supplements[-cfg.max_recent_supplements :]
+            for item in supplements
             if str(item or "")
         ],
     }
@@ -350,29 +368,35 @@ def build_status_guard_payload(
         "candidate_response": _clamp_redacted(candidate_response, cfg.max_candidate_chars),
         "recent_operations": build_recent_operation_synopsis(messages, config=cfg),
         "instructions": {
-            "core_question": "Does the candidate response make status claims unsupported by the active task and recent operations?",
+            "core_question": (
+                "Does the candidate response make task-status claims unsupported by the active task "
+                "and recent operations, or omit user-requested material solely because of uncertainty "
+                "instead of answering with an explicit uncertainty or caveat?"
+            ),
             "do_not_preclassify_actions": True,
             "operation_synopsis_is_neutral": True,
         },
     }
 
 
-def build_status_guard_messages(payload: Dict[str, Any]) -> List[Dict[str, str]]:
-    system = (
-        "You are a tiny optional pre-send status-sanity judge for Hermes Agent. "
-        "Return one JSON object only; no markdown. You are not a task planner and do not use tools. "
-        "Given an active task, a candidate visible assistant response, and a neutral recent-operation synopsis, "
-        "decide whether the candidate response makes status claims that are unsupported or contradicted by the shown operations. "
-        "Do not classify commands in advance; reason from the exact tool names, command excerpts, skill reads, user events, and results shown. "
-        "Reject only when the draft claims completion, verification, review approval, upload/send/delivery, deployment, commit/push, or other task status that the operations do not support. "
-        "Allow honest progress/blocker/partial-status messages. If uncertain, allow."
-    )
+def build_status_guard_messages(
+    payload: Dict[str, Any],
+    *,
+    config: Optional[PreSendStatusGuardConfig] = None,
+) -> List[Dict[str, str]]:
+    cfg = config or PreSendStatusGuardConfig()
+    system = str(cfg.judge_prompt or DEFAULT_STATUS_GUARD_JUDGE_PROMPT)
     user = {
         "output_schema": {
             "decision": "allow | reject_and_steer",
-            "unsupported_claims": ["short claim labels"],
-            "reason": "short reason grounded in operation numbers",
-            "steer_prompt": "if rejected, concise instruction for the agent to continue or weaken the status claim",
+            "unsupported_claims": [
+                "short labels for unsupported status claims or requested omissions"
+            ],
+            "reason": "short reason grounded in operation numbers or the explicit omission",
+            "steer_prompt": (
+                "if rejected, concise instruction to continue verification, weaken the unsupported "
+                "status claim, or address omitted requested material with an uncertainty caveat"
+            ),
         },
         "input": payload,
     }
@@ -430,7 +454,7 @@ class PreSendStatusGuard:
         cached = self._get_cached(key) if use_cache else None
         if cached is not None:
             return _clone_decision(cached, cache_status="hit")
-        messages_payload = build_status_guard_messages(payload)
+        messages_payload = build_status_guard_messages(payload, config=self.config)
         started = time.monotonic()
         try:
             response = self._llm_call(
@@ -516,4 +540,5 @@ __all__ = [
     "build_recent_operation_synopsis",
     "build_status_guard_messages",
     "build_status_guard_payload",
+    "DEFAULT_STATUS_GUARD_JUDGE_PROMPT",
 ]

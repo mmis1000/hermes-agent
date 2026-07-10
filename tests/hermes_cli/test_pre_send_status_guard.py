@@ -126,6 +126,116 @@ def test_status_guard_judge_rejects_unsupported_status_claim():
     assert calls[0]["timeout"] == 2.0
 
 
+def test_status_guard_messages_use_configured_judge_prompt():
+    from hermes_cli.pre_send_status_guard import (
+        PreSendStatusGuard,
+        PreSendStatusGuardConfig,
+        build_status_guard_messages,
+    )
+
+    cfg = PreSendStatusGuardConfig.from_mapping({
+        "enabled": True,
+        "judge_prompt": "Custom configured judge prompt.",
+    })
+    messages = build_status_guard_messages({"candidate_response": "Done."}, config=cfg)
+    assert messages[0]["role"] == "system"
+    assert messages[0]["content"] == "Custom configured judge prompt."
+
+    calls = []
+
+    def fake_llm(**kwargs):
+        calls.append(kwargs)
+        return '{"decision":"allow","unsupported_claims":[],"reason":"custom prompt used"}'
+
+    guard = PreSendStatusGuard(config=cfg, llm_call=fake_llm)
+    decision = guard.judge(
+        candidate_response="Done.",
+        active_task={"id": "task-1", "kind": "direct_message", "raw_primary_text": "do work"},
+        messages=[],
+    )
+
+    assert decision is not None
+    assert decision.allowed is True
+    assert calls[0]["messages"][0]["content"] == "Custom configured judge prompt."
+
+
+def test_status_guard_loader_default_preserves_legacy_prompt_alias():
+    from copy import deepcopy
+
+    from hermes_cli.config import DEFAULT_CONFIG, _deep_merge
+    from hermes_cli.pre_send_status_guard import PreSendStatusGuardConfig
+
+    merged = _deep_merge(
+        deepcopy(DEFAULT_CONFIG),
+        {"task_intents": {"status_guard": {"prompt": "Legacy configured prompt."}}},
+    )
+    cfg = PreSendStatusGuardConfig.from_mapping(
+        merged["task_intents"]["status_guard"]
+    )
+
+    assert DEFAULT_CONFIG["task_intents"]["status_guard"]["judge_prompt"] == ""
+    assert cfg.judge_prompt == "Legacy configured prompt."
+
+
+def test_status_guard_signature_changes_with_judge_prompt():
+    from hermes_cli.pre_send_status_guard import PreSendStatusGuardConfig
+
+    first = PreSendStatusGuardConfig.from_mapping({"judge_prompt": "First prompt."})
+    second = PreSendStatusGuardConfig.from_mapping({"judge_prompt": "Second prompt."})
+
+    assert first.signature() != second.signature()
+
+
+def test_status_guard_payload_describes_status_and_uncertainty_omission_policy():
+    from hermes_cli.pre_send_status_guard import build_status_guard_payload
+
+    payload = build_status_guard_payload(
+        candidate_response="I omitted the uncertain requested item.",
+        active_task={"raw_primary_text": "include every requested item"},
+        messages=[],
+    )
+
+    question = payload["instructions"]["core_question"]
+    assert "task-status claims" in question
+    assert "omit user-requested material" in question
+    assert "explicit uncertainty or caveat" in question
+
+
+def test_goal_payload_honors_zero_recent_supplements():
+    from types import SimpleNamespace
+
+    from hermes_cli.pre_send_status_guard import (
+        PreSendStatusGuardConfig,
+        active_task_payload_from_goal,
+    )
+
+    goal = SimpleNamespace(
+        status="active",
+        task_contract="Build the report",
+        subgoals=["first", "second"],
+    )
+    payload = active_task_payload_from_goal(
+        goal,
+        config=PreSendStatusGuardConfig(max_recent_supplements=0),
+    )
+
+    assert payload is not None
+    assert payload["raw_supplements"] == []
+
+
+def test_status_guard_output_schema_covers_claims_and_omissions():
+    import json
+
+    from hermes_cli.pre_send_status_guard import build_status_guard_messages
+
+    messages = build_status_guard_messages({"candidate_response": "draft"})
+    schema = json.loads(messages[1]["content"])["output_schema"]
+
+    assert "requested omissions" in schema["unsupported_claims"][0]
+    assert "omitted requested material" in schema["steer_prompt"]
+    assert "uncertainty caveat" in schema["steer_prompt"]
+
+
 def test_status_guard_judge_allows_honest_partial_progress():
     from hermes_cli.pre_send_status_guard import PreSendStatusGuard, PreSendStatusGuardConfig
 
