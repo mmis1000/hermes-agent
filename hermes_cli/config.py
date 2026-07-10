@@ -1215,6 +1215,10 @@ DEFAULT_CONFIG = {
         },
         "status_guard": {
             "enabled": False,
+            # Empty uses DEFAULT_STATUS_GUARD_JUDGE_PROMPT at runtime. Keeping
+            # the loader default empty also lets the legacy `prompt` alias win
+            # when an older user config supplies it.
+            "judge_prompt": "",
             "timeout_seconds": 2.0,
             "max_output_tokens": 220,
             "max_operations": 30,

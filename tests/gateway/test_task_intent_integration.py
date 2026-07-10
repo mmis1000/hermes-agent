@@ -295,3 +295,24 @@ def test_goal_lookup_failure_blocks_idle_reset_and_expiry(tmp_path, monkeypatch)
 
     assert store._should_reset(entry, _source()) is None
     assert store._is_session_expired(entry) is False
+
+
+def test_legacy_pre_send_guard_opt_in_survives_disabled_merged_default(monkeypatch):
+    runner = _runner(MagicMock())
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {
+            "task_intents": {"status_guard": {"enabled": False}},
+            "pre_send_status_guard": {
+                "enabled": True,
+                "max_operations": 17,
+                "prompt": "legacy guard prompt",
+            },
+        },
+    )
+
+    config = runner._load_pre_send_status_guard_config()
+
+    assert config.enabled is True
+    assert config.max_operations == 17
+    assert config.judge_prompt == "legacy guard prompt"

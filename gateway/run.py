@@ -10374,14 +10374,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return None
 
     def _pre_send_status_guard_replacement(self, decision: Any) -> str:
-        reason = str(getattr(decision, "reason", "") or "status claim is not supported by recent operations")
-        steer = str(getattr(decision, "steer_prompt", "") or "Continue with verification/review, ask the user for a waiver, or send a non-final progress status.")
+        reason = str(
+            getattr(decision, "reason", "")
+            or "task status or answer coverage is not supported by the available evidence"
+        )
+        steer = str(
+            getattr(decision, "steer_prompt", "")
+            or (
+                "Continue with verification/review, send a non-final progress status, or address "
+                "the requested material with an explicit uncertainty caveat."
+            )
+        )
         claims = getattr(decision, "unsupported_claims", None) or []
         claim_text = ", ".join(str(item) for item in claims if str(item))
-        claim_line = f"\nUnsupported claim(s): {claim_text}" if claim_text else ""
+        claim_line = f"\nUnsupported claim or omission: {claim_text}" if claim_text else ""
         return (
-            "⚠️ Pre-send status guard blocked the drafted final response because "
-            "its status claims were not supported by the active task and recent operations."
+            "⚠️ Pre-send status guard blocked the drafted response because it contained "
+            "unsupported task-status claims or omitted requested material without an explicit "
+            "uncertainty caveat."
             f"{claim_line}\nReason: {reason}\nNext step: {steer}"
         )
 
