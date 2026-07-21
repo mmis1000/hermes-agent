@@ -9,6 +9,7 @@ import tools.skills_tool as skills_tool_module
 from agent.skill_commands import (
     build_preloaded_skills_prompt,
     build_skill_invocation_message,
+    build_stacked_skill_invocation_message,
     resolve_skill_command_key,
     scan_skill_commands,
 )
@@ -628,6 +629,199 @@ class TestBuildSkillInvocationMessage:
 
         assert msg is not None
         assert "local cli" in msg.lower()
+
+
+class TestConfiguredSkillCommandPreloads:
+    @staticmethod
+    def _config(mapping):
+        return patch(
+            "agent.skill_commands._load_skills_config",
+            return_value={"command_preloads": mapping},
+        )
+
+    def test_default_does_not_force_plan_brainstorming(self, tmp_path):
+        with (
+            patch("tools.skills_tool.SKILLS_DIR", tmp_path),
+            self._config({}),
+        ):
+            _make_skill(tmp_path, "brainstorming", body="BRAINSTORM BODY")
+            _make_skill(tmp_path, "custom-plan", body="PLAN BODY")
+            scan_skill_commands()
+            msg = build_skill_invocation_message("/custom-plan", "design the feature")
+
+        assert msg is not None
+        assert "PLAN BODY" in msg
+        assert "BRAINSTORM BODY" not in msg
+
+    def test_mapping_change_applies_without_skill_rescan(self, tmp_path):
+        skills_config = {"command_preloads": {}}
+        with (
+            patch("tools.skills_tool.SKILLS_DIR", tmp_path),
+            patch(
+                "agent.skill_commands._load_skills_config",
+                side_effect=lambda: skills_config,
+            ),
+        ):
+            _make_skill(tmp_path, "brainstorming", body="BRAINSTORM BODY")
+            _make_skill(tmp_path, "custom-plan", body="PLAN BODY")
+            scan_skill_commands()
+            before = build_skill_invocation_message("/custom-plan", "before")
+            skills_config["command_preloads"] = {"custom-plan": "brainstorming"}
+            after = build_skill_invocation_message("/custom-plan", "after")
+
+        assert before is not None and "BRAINSTORM BODY" not in before
+        assert after is not None and after.index("BRAINSTORM BODY") < after.index(
+            "PLAN BODY"
+        )
+
+    def test_simple_configured_preload_runs_before_target(self, tmp_path):
+        with (
+            patch("tools.skills_tool.SKILLS_DIR", tmp_path),
+            self._config({"custom-plan": ["brainstorming"]}),
+        ):
+            _make_skill(tmp_path, "brainstorming", body="BRAINSTORM BODY")
+            _make_skill(tmp_path, "custom-plan", body="PLAN BODY")
+            scan_skill_commands()
+            msg = build_skill_invocation_message(
+                "/custom-plan",
+                "design the feature",
+                runtime_note="keep this note",
+            )
+
+        from agent.skill_commands import extract_user_instruction_from_skill_message
+
+        assert msg is not None
+        assert msg.index("BRAINSTORM BODY") < msg.index("PLAN BODY")
+        assert msg.count("BRAINSTORM BODY") == 1
+        assert 'invoked the "/custom-plan" stacked skill bundle' in msg
+        assert "User instruction: design the feature" in msg
+        assert "[Runtime note: keep this note]" in msg
+        assert extract_user_instruction_from_skill_message(msg) == "design the feature"
+
+    def test_generic_string_mapping_and_normalized_names(self, tmp_path):
+        with (
+            patch("tools.skills_tool.SKILLS_DIR", tmp_path),
+            self._config({"/release_plan": "Risk Review"}),
+        ):
+            _make_skill(tmp_path, "risk-review", body="RISK BODY")
+            _make_skill(tmp_path, "release-plan", body="RELEASE BODY")
+            scan_skill_commands()
+            msg = build_skill_invocation_message("/release-plan", "ship it")
+
+        assert msg is not None
+        assert msg.index("RISK BODY") < msg.index("RELEASE BODY")
+
+    def test_stacked_invocation_preserves_explicit_order(self, tmp_path):
+        with (
+            patch("tools.skills_tool.SKILLS_DIR", tmp_path),
+            self._config({"custom-plan": ["brainstorming"]}),
+        ):
+            _make_skill(tmp_path, "skill-a", body="BODY A")
+            _make_skill(tmp_path, "brainstorming", body="BRAINSTORM BODY")
+            _make_skill(tmp_path, "custom-plan", body="PLAN BODY")
+            _make_skill(tmp_path, "skill-b", body="BODY B")
+            scan_skill_commands()
+            result = build_stacked_skill_invocation_message(
+                ["/skill-a", "/custom-plan", "/skill-b"], "design it"
+            )
+
+        assert result is not None
+        msg, loaded, missing = result
+        assert loaded == ["skill-a", "brainstorming", "custom-plan", "skill-b"]
+        assert missing == []
+        assert msg.index("BODY A") < msg.index("BRAINSTORM BODY")
+        assert msg.index("BRAINSTORM BODY") < msg.index("PLAN BODY")
+        assert msg.index("PLAN BODY") < msg.index("BODY B")
+
+    def test_explicit_preload_is_not_duplicated_or_reordered(self, tmp_path):
+        with (
+            patch("tools.skills_tool.SKILLS_DIR", tmp_path),
+            self._config({"custom-plan": ["brainstorming"]}),
+        ):
+            _make_skill(tmp_path, "custom-plan", body="PLAN BODY")
+            _make_skill(tmp_path, "brainstorming", body="BRAINSTORM BODY")
+            _make_skill(tmp_path, "skill-b", body="BODY B")
+            scan_skill_commands()
+            result = build_stacked_skill_invocation_message(
+                ["/custom-plan", "/brainstorming", "/skill-b"], "design it"
+            )
+
+        assert result is not None
+        msg, loaded, missing = result
+        assert loaded == ["custom-plan", "brainstorming", "skill-b"]
+        assert missing == []
+        assert msg.count("BRAINSTORM BODY") == 1
+        assert msg.index("PLAN BODY") < msg.index("BRAINSTORM BODY")
+
+    def test_disabled_preload_is_ignored(self, tmp_path, monkeypatch):
+        with (
+            patch("tools.skills_tool.SKILLS_DIR", tmp_path),
+            self._config({"custom-plan": ["brainstorming"]}),
+        ):
+            _make_skill(tmp_path, "brainstorming", body="BRAINSTORM BODY")
+            _make_skill(tmp_path, "custom-plan", body="PLAN BODY")
+            scan_skill_commands()
+            import agent.skill_utils as skill_utils
+
+            monkeypatch.setattr(
+                skill_utils,
+                "get_disabled_skill_names",
+                lambda platform=None: {"brainstorming"},
+            )
+            msg = build_skill_invocation_message("/custom-plan", "design it")
+
+        assert msg is not None
+        assert "PLAN BODY" in msg
+        assert "BRAINSTORM BODY" not in msg
+
+    def test_unavailable_preload_does_not_block_target(self, tmp_path):
+        with (
+            patch("tools.skills_tool.SKILLS_DIR", tmp_path),
+            self._config({"custom-plan": ["not-installed"]}),
+        ):
+            _make_skill(tmp_path, "custom-plan", body="PLAN BODY")
+            scan_skill_commands()
+            result = build_stacked_skill_invocation_message(["/custom-plan"], "design it")
+
+        assert result is not None
+        msg, loaded, missing = result
+        assert loaded == ["custom-plan"]
+        assert missing == []
+        assert "PLAN BODY" in msg
+
+    def test_direct_mapping_is_non_recursive_and_cycle_safe(self, tmp_path):
+        with (
+            patch("tools.skills_tool.SKILLS_DIR", tmp_path),
+            self._config({"skill-a": ["skill-b"], "skill-b": ["skill-a"]}),
+        ):
+            _make_skill(tmp_path, "skill-a", body="BODY A")
+            _make_skill(tmp_path, "skill-b", body="BODY B")
+            scan_skill_commands()
+            result = build_stacked_skill_invocation_message(["/skill-a"], "go")
+
+        assert result is not None
+        msg, loaded, missing = result
+        assert loaded == ["skill-b", "skill-a"]
+        assert missing == []
+        assert msg.count("BODY A") == 1
+        assert msg.count("BODY B") == 1
+
+    def test_configured_preloads_respect_stacked_skill_cap(self, tmp_path):
+        preload_names = [f"preload-{index}" for index in range(5)]
+        with (
+            patch("tools.skills_tool.SKILLS_DIR", tmp_path),
+            self._config({"custom-plan": preload_names}),
+        ):
+            for name in preload_names:
+                _make_skill(tmp_path, name, body=f"BODY {name}")
+            _make_skill(tmp_path, "custom-plan", body="PLAN BODY")
+            scan_skill_commands()
+            result = build_stacked_skill_invocation_message(["/custom-plan"], "go")
+
+        assert result is not None
+        _msg, loaded, missing = result
+        assert loaded == [*preload_names[:4], "custom-plan"]
+        assert missing == []
 
 
 class TestSkillDirectoryHeader:
