@@ -668,6 +668,11 @@ def _stage_turn_user_message(
     task_intent_metadata = getattr(agent, "_pending_task_intent_metadata", None)
     if isinstance(task_intent_metadata, dict) and task_intent_metadata:
         user_msg["_task_intent"] = dict(task_intent_metadata)
+    persist_user_metadata = getattr(agent, "_pending_persist_user_metadata", None)
+    if isinstance(persist_user_metadata, dict):
+        for key, value in persist_user_metadata.items():
+            if key not in {"role", "content", "api_content"}:
+                user_msg[key] = value
     return user_msg, pending_cli_message
 
 

@@ -4238,6 +4238,10 @@ class GatewayTurnMixin:
         scheduled_heartbeat: bool = False,
         title_user_message: Optional[str] = None,
         task_intent_metadata: Optional[Dict[str, Any]] = None,
+        persist_user_metadata: Optional[Dict[str, Any]] = None,
+        _continuation_depth: int = 0,
+        _raw_task_goal: Optional[str] = None,
+        _notify_started_at: Optional[float] = None,
     ) -> Dict[str, Any]:
         """Run the agent; returns the full run_conversation result dict.
 
@@ -4279,6 +4283,8 @@ class GatewayTurnMixin:
             scheduled_heartbeat=scheduled_heartbeat,
         )
         turn_ctx.task_intent_metadata = task_intent_metadata
+        turn_ctx.persist_user_metadata = persist_user_metadata
+        raw_task_goal = _raw_task_goal if isinstance(_raw_task_goal, str) else str(message or "")
         _status_thread_metadata = self._run_agent_bind_turn_wiring(
             turn_ctx, turn_runner, source, event_message_id, disp._native_slack_task_cards,
         )
@@ -4322,6 +4328,110 @@ class GatewayTurnMixin:
                 return await self._run_agent_queued_followup(
                     turn_ctx, adapter, pending, pending_event, response, result, stream_task,
                 )
+            # A real queued follow-up always wins over a synthetic continuation.
+            # Only review a clean iteration-budget stop after the pending-message
+            # drain above has found nothing to process.
+            _turn_exit_reason = str((result or {}).get("turn_exit_reason") or "")
+            try:
+                from gateway.iteration_continuation import (
+                    DEFAULT_MAX_CONTINUATION_CHAIN,
+                    IterationContinuationVerdict,
+                    build_iteration_continuation,
+                )
+
+                _chain_limit = int(
+                    (disp.user_config or {}).get("agent", {}).get(
+                        "max_iteration_auto_continue_chain",
+                        DEFAULT_MAX_CONTINUATION_CHAIN,
+                    )
+                )
+            except (TypeError, ValueError):
+                _chain_limit = DEFAULT_MAX_CONTINUATION_CHAIN
+            _chain_limit = max(0, _chain_limit)
+
+            if (
+                result
+                and _turn_exit_reason.startswith("max_iterations_reached(")
+                and not result.get("failed")
+                and not result.get("interrupted")
+                and not self._draining
+                and _continuation_depth < _chain_limit
+            ):
+                _agent_for_review = turn_ctx.agent_holder[0]
+                _review_model = str(
+                    getattr(_agent_for_review, "model", None)
+                    or (response or {}).get("model")
+                    or ""
+                )
+                _review_runtime = {
+                    "model": getattr(_agent_for_review, "model", None),
+                    "provider": getattr(_agent_for_review, "provider", None),
+                    "base_url": getattr(_agent_for_review, "base_url", None),
+                    "api_key": getattr(_agent_for_review, "api_key", None),
+                    "api_mode": getattr(_agent_for_review, "api_mode", None),
+                }
+                try:
+                    verdict = await self._run_in_executor_with_context(
+                        lambda: self._judge_iteration_budget_exhaustion(
+                            result=result,
+                            raw_goal=raw_task_goal,
+                            model=_review_model,
+                            main_runtime=_review_runtime,
+                        )
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Iteration continuation review failed for session %s: %s",
+                        session_key or "?",
+                        exc,
+                    )
+                    verdict = IterationContinuationVerdict(
+                        "ask_user",
+                        f"continuation review failed: {type(exc).__name__}",
+                    )
+
+                user_approved = False
+                if getattr(verdict, "decision", None) == "ask_user":
+                    user_approved = await self._request_iteration_continuation_confirmation(
+                        source=source,
+                        session_key=session_key or "",
+                        reason=str(getattr(verdict, "reason", "review was inconclusive")),
+                        event_message_id=event_message_id,
+                    )
+                should_continue = (
+                    getattr(verdict, "decision", None) == "auto_continue"
+                    or user_approved
+                )
+                if should_continue:
+                    continuation = build_iteration_continuation(
+                        raw_goal=raw_task_goal,
+                        user_approved=user_approved,
+                    )
+                    updated_history = result.get("messages", history)
+                    await self._refresh_agent_cache_message_count(
+                        session_key,
+                        result.get("session_id") or session_id,
+                    )
+                    continuation_result = await self._run_agent(
+                        message=continuation.prompt,
+                        context_prompt=context_prompt,
+                        history=updated_history,
+                        source=source,
+                        session_id=result.get("session_id") or session_id,
+                        session_key=session_key,
+                        run_generation=run_generation,
+                        _interrupt_depth=_interrupt_depth,
+                        event_message_id=None,
+                        channel_prompt=channel_prompt,
+                        persist_user_metadata=continuation.persist_metadata,
+                        _continuation_depth=_continuation_depth + 1,
+                        _raw_task_goal=continuation.raw_goal,
+                        _notify_started_at=_notify_started_at,
+                    )
+                    return _preserve_queued_followup_history_offset(
+                        response,
+                        continuation_result,
+                    )
         finally:
             await self._run_agent_cleanup_turn_tasks(
                 turn_ctx, progress_task=progress_task, log_task=log_task, interrupt_monitor=interrupt_monitor,
