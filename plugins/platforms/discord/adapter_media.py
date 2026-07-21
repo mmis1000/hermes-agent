@@ -92,7 +92,7 @@ class DiscordMediaMixin:
             return SendResult(success=False, error="Not connected")
         if not os.path.isfile(file_path):
             return SendResult(success=False, error=f"File not found: {file_path}")
-        channel = await self._resolve_channel(_prompt_target_id(chat_id, metadata))
+        channel, target_id, thread_id = await self._resolve_delivery_target(chat_id, metadata)
         if not channel:
             return SendResult(success=False, error=f"Channel {chat_id} not found")
         filename = file_name or os.path.basename(file_path)
@@ -125,7 +125,7 @@ class DiscordMediaMixin:
                 error=f"Discord accepted the message but attached no files ({filename})",
                 message_id=str(getattr(msg, "id", "") or "") or None,
             )
-        return SendResult(success=True, message_id=str(msg.id))
+        return self._message_send_result(channel, msg, thread_id=thread_id)
 
 
     async def send_multiple_images(
@@ -147,7 +147,7 @@ class DiscordMediaMixin:
         except Exception:  # pragma: no cover
             return await super().send_multiple_images(chat_id, images, metadata, human_delay)
         try:
-            channel = await self._resolve_channel(_prompt_target_id(chat_id, metadata))
+            channel, target_id, thread_id = await self._resolve_delivery_target(chat_id, metadata)
             if not channel:
                 logger.warning("[%s] Channel %s not found for multi-image send", self.name, chat_id)
                 return SendResult(success=False, error=f"Channel {chat_id} not found")
@@ -157,6 +157,7 @@ class DiscordMediaMixin:
         CHUNK = 10
         chunks = [images[i:i + CHUNK] for i in range(0, len(images), CHUNK)]
         delivered = False
+        send_results = []
         for chunk_idx, chunk in enumerate(chunks):
             if human_delay > 0 and chunk_idx > 0:
                 await asyncio.sleep(human_delay)
@@ -252,12 +253,14 @@ class DiscordMediaMixin:
                     self.name, len(files), chunk_idx + 1, len(chunks),
                 )
                 if self._is_forum_parent(channel):
-                    await self._forum_post_file(
+                    result = await self._forum_post_file(
                         channel, content=(content or "").strip(), files=files,
                     )
                 else:
-                    await channel.send(content=content, files=files)
-                delivered = True
+                    msg = await channel.send(content=content, files=files)
+                    result = self._message_send_result(channel, msg, thread_id=thread_id)
+                send_results.append(result)
+                delivered = delivered or result.success
             except Exception as e:
                 logger.warning(
                     "[%s] Multi-image Discord send failed (chunk %d/%d), falling back to per-image: %s",
@@ -271,6 +274,12 @@ class DiscordMediaMixin:
                         await aiohttp_session.close()
                     except Exception:
                         pass
+        if send_results:
+            from plugins.platforms.discord.adapter import _serialize_discord_attachments
+            last = send_results[-1]
+            raw = dict(last.raw_response or {})
+            raw["attachments"] = _serialize_discord_attachments([a for result in send_results for a in (result.raw_response or {}).get("attachments", [])])
+            return SendResult(success=delivered, message_id=last.message_id, error=last.error, raw_response=raw)
         return SendResult(success=delivered, error=None if delivered else "all images failed to send")
 
 
@@ -283,7 +292,7 @@ class DiscordMediaMixin:
 
         try:
             import io
-            channel = await self._resolve_channel(_prompt_target_id(chat_id, metadata))
+            channel, target_id, thread_id = await self._resolve_delivery_target(chat_id, metadata)
             if not channel:
                 return SendResult(success=False, error=f"Channel {chat_id} not found")
             if not os.path.exists(audio_path):
@@ -329,7 +338,7 @@ class DiscordMediaMixin:
                     discord.http.Route("POST", "/channels/{channel_id}/messages", channel_id=channel.id),
                     form=form,
                 )
-                return SendResult(success=True, message_id=str(msg_data["id"]))
+                return self._message_send_result(channel, msg_data, thread_id=thread_id)
             except Exception as voice_err:
                 logger.debug("Voice message flag failed, falling back to file: %s", voice_err)
                 file = discord.File(io.BytesIO(file_data), filename=filename)
@@ -340,7 +349,7 @@ class DiscordMediaMixin:
                         msg = await channel.send(file=file, reference=None)
                     else:
                         raise
-                return SendResult(success=True, message_id=str(msg.id))
+                return self._message_send_result(channel, msg, thread_id=thread_id)
         except Exception as e:  # pragma: no cover - defensive logging
             logger.error("[%s] Failed to send audio: %s", self.name, e, exc_info=True)
             return SendResult(success=False, error=str(e))
@@ -383,7 +392,7 @@ class DiscordMediaMixin:
             return await fallback(metadata)
         try:
             import aiohttp
-            channel = await self._resolve_channel(_prompt_target_id(chat_id, metadata))
+            channel, target_id, thread_id = await self._resolve_delivery_target(chat_id, metadata)
             if not channel:
                 return SendResult(success=False, error=f"Channel {chat_id} not found")
             from gateway.platforms.base import resolve_proxy_url, proxy_kwargs_for_aiohttp
@@ -399,7 +408,7 @@ class DiscordMediaMixin:
                 if self._is_forum_parent(channel):
                     return await self._forum_post_file(channel, content=(caption or "").strip(), file=file)
                 msg = await channel.send(content=caption if caption else None, file=file)
-                return SendResult(success=True, message_id=str(msg.id))
+                return self._message_send_result(channel, msg, thread_id=thread_id)
         except ImportError:
             logger.warning("[%s] aiohttp not installed, falling back to URL. Run: pip install aiohttp", self.name, exc_info=True)
             return await fallback(error_metadata)
