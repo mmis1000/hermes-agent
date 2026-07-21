@@ -9572,7 +9572,13 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             claim = claim_event_delivery(event, consumer)
             if claim is None:
                 continue
-            self._pending_input.put(synthetic_message)
+            try:
+                self._pending_input.put(synthetic_message)
+            except Exception:
+                from tools.async_delegation import release_event_delivery
+
+                release_event_delivery(event, claim)
+                raise
             complete_event_delivery(event, claim)
 
     def _drain_interrupt_queue_to_pending_input(self) -> None:

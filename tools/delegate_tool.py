@@ -17,9 +17,11 @@ The parent's context only sees the delegation call and the summary result,
 never the child's intermediate tool calls or reasoning.
 """
 
+import copy
 import enum
 import json
 import logging
+import re
 
 logger = logging.getLogger(__name__)
 import os
@@ -148,6 +150,17 @@ _active_subagents_lock = threading.Lock()
 # subagent_id -> mutable record tracking the live child agent.  Stays only
 # for the lifetime of the run; _run_single_child is the owner.
 _active_subagents: Dict[str, Dict[str, Any]] = {}
+_LIVE_EVENT_LIMIT = 64
+_LIVE_TEXT_CHAR_LIMIT = 8192
+_LIVE_PREVIEW_CHAR_LIMIT = 1200
+_TERMINAL_SUBAGENT_STATUSES = {
+    "completed",
+    "success",
+    "error",
+    "failed",
+    "interrupted",
+    "timeout",
+}
 
 
 def set_spawn_paused(paused: bool) -> bool:
@@ -171,36 +184,96 @@ def _register_subagent(record: Dict[str, Any]) -> None:
     sid = record.get("subagent_id")
     if not sid:
         return
+    record.setdefault("events", [])
+    record.setdefault("assistant_text_tail", "")
+    record.setdefault("assistant_text_raw_tail", "")
     with _active_subagents_lock:
         _active_subagents[sid] = record
+    try:
+        from tools.async_delegation import (
+            register_subagent_lifecycle,
+            take_pending_subagent_interrupt,
+        )
+
+        register_subagent_lifecycle(record)
+        pending, reason = take_pending_subagent_interrupt(sid)
+        if pending:
+            outcome = interrupt_subagent_status(sid, reason=reason)
+            if outcome != "interrupt_requested":
+                logger.warning(
+                    "queued interrupt for starting subagent %s resolved as %s",
+                    sid,
+                    outcome,
+                )
+    except Exception:
+        logger.debug("subagent/delegation association failed", exc_info=True)
 
 
 def _unregister_subagent(subagent_id: str) -> None:
-    with _active_subagents_lock:
-        _active_subagents.pop(subagent_id, None)
-
-
-def interrupt_subagent(subagent_id: str) -> bool:
-    """Request that a single running subagent stop at its next iteration boundary.
-
-    Does not hard-kill the worker thread (Python can't); sets the child's
-    interrupt flag which propagates to in-flight tools and recurses into
-    grandchildren via AIAgent.interrupt().  Returns True if a matching
-    subagent was found.
-    """
+    # Archive before removal to close the live-to-durable observability gap.
     with _active_subagents_lock:
         record = _active_subagents.get(subagent_id)
-    if not record:
-        return False
-    agent = record.get("agent")
-    if agent is None:
-        return False
+    if record is None:
+        return
+    tail = {
+        "subagent_id": subagent_id,
+        "parent_id": record.get("parent_id"),
+        "depth": record.get("depth"),
+        "goal": record.get("goal"),
+        "model": record.get("model"),
+        "started_at": record.get("started_at"),
+        "status": record.get("status"),
+        "interrupt_reason": record.get("interrupt_reason"),
+        "tool_count": record.get("tool_count", 0),
+        "last_tool": record.get("last_tool", ""),
+        "events": copy.deepcopy(record.get("events") or []),
+        "assistant_text_tail": str(record.get("assistant_text_tail") or ""),
+        "last_activity_at": record.get("last_activity_at"),
+    }
     try:
-        agent.interrupt(f"Interrupted via TUI ({subagent_id})")
+        from tools.async_delegation import archive_subagent_tail
+
+        archive_subagent_tail(subagent_id, tail)
+    except Exception:
+        logger.debug("subagent tail archival failed", exc_info=True)
+    finally:
+        with _active_subagents_lock:
+            if _active_subagents.get(subagent_id) is record:
+                _active_subagents.pop(subagent_id, None)
+
+
+def interrupt_subagent_status(subagent_id: str, reason: str = "") -> str:
+    """Request a cooperative stop and return an honest lifecycle outcome."""
+    with _active_subagents_lock:
+        record = _active_subagents.get(subagent_id)
+        if not record:
+            return "not_live"
+        current_status = str(record.get("status") or "").lower()
+        if current_status in _TERMINAL_SUBAGENT_STATUSES:
+            return "already_terminal"
+        if current_status == "interrupt_requested":
+            return "interrupt_requested"
+        agent = record.get("agent")
+        if agent is None:
+            return "interrupt_failed"
+        record["status"] = "interrupt_requested"
+        if reason:
+            record["interrupt_reason"] = reason
+    try:
+        agent.interrupt(reason or f"Interrupted via TUI ({subagent_id})")
     except Exception as exc:
+        with _active_subagents_lock:
+            current = _active_subagents.get(subagent_id)
+            if current is not None and current.get("status") == "interrupt_requested":
+                current["status"] = "running"
         logger.debug("interrupt_subagent(%s) failed: %s", subagent_id, exc)
-        return False
-    return True
+        return "interrupt_failed"
+    return "interrupt_requested"
+
+
+def interrupt_subagent(subagent_id: str, reason: str = "") -> bool:
+    """Compatibility wrapper used by the existing TUI RPC."""
+    return interrupt_subagent_status(subagent_id, reason) == "interrupt_requested"
 
 
 def list_active_subagents() -> List[Dict[str, Any]]:
@@ -210,10 +283,31 @@ def list_active_subagents() -> List[Dict[str, Any]]:
     tool_count, status}.  Safe to call from any thread — returns a copy.
     """
     with _active_subagents_lock:
-        return [
-            {k: v for k, v in r.items() if k != "agent"}
-            for r in _active_subagents.values()
+        snapshots = [
+            (
+                copy.deepcopy(
+                    {
+                        key: value
+                        for key, value in record.items()
+                        if key not in {"agent", "assistant_text_raw_tail"}
+                    }
+                ),
+                record.get("agent"),
+            )
+            for record in _active_subagents.values()
         ]
+    output = []
+    for snapshot, agent in snapshots:
+        get_summary = getattr(agent, "get_activity_summary", None)
+        if callable(get_summary):
+            try:
+                summary = get_summary()
+                if isinstance(summary, dict):
+                    snapshot["activity"] = copy.deepcopy(summary)
+            except Exception:
+                logger.debug("subagent activity summary failed", exc_info=True)
+        output.append(snapshot)
+    return output
 
 
 def _extract_output_tail(
@@ -297,6 +391,93 @@ def _stringify_tool_content(content: Any) -> str:
     if isinstance(content, dict):
         return json.dumps(content, ensure_ascii=False, default=str)
     return str(content)
+
+
+_LIVE_SENSITIVE_KEY_RE = re.compile(
+    r"(?:authorization|proxy[-_]?authorization|api[-_]?key|access[-_]?token|"
+    r"refresh[-_]?token|id[-_]?token|token|secret|password|passwd|cookie|set[-_]?cookie)$",
+    re.IGNORECASE,
+)
+_LIVE_BEARER_TOKEN_RE = re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]+")
+
+
+def _sanitize_live_value(value: Any) -> Any:
+    """Redact secret-bearing fields before serializing live-tail previews."""
+    if isinstance(value, dict):
+        sanitized = {}
+        for key, item in value.items():
+            key_text = str(key)
+            sanitized[key_text] = (
+                "[REDACTED]"
+                if _LIVE_SENSITIVE_KEY_RE.search(key_text)
+                else _sanitize_live_value(item)
+            )
+        return sanitized
+    if isinstance(value, (list, tuple)):
+        return [_sanitize_live_value(item) for item in value]
+    return value
+
+
+def redact_observable_text(value: Any) -> str:
+    """Force-redact model-facing delegation observations, failing closed."""
+    text = _stringify_tool_content(value)
+    try:
+        from agent.redact import redact_sensitive_text
+
+        redacted = redact_sensitive_text(text, force=True)
+        return _LIVE_BEARER_TOKEN_RE.sub("Bearer [REDACTED]", redacted)
+    except Exception:
+        logger.debug("observable text secret redaction failed", exc_info=True)
+        return "[REDACTION UNAVAILABLE]"
+
+
+def _bounded_live_preview(value: Any) -> str:
+    text = redact_observable_text(_sanitize_live_value(value))
+    if len(text) <= _LIVE_PREVIEW_CHAR_LIMIT:
+        return text
+    return text[:_LIVE_PREVIEW_CHAR_LIMIT] + "…"
+
+
+def _append_live_event(subagent_id: Optional[str], event: Dict[str, Any]) -> None:
+    if not subagent_id:
+        return
+    with _active_subagents_lock:
+        record = _active_subagents.get(subagent_id)
+        if record is None:
+            return
+        events = record.setdefault("events", [])
+        events.append(event)
+        if len(events) > _LIVE_EVENT_LIMIT:
+            del events[:-_LIVE_EVENT_LIMIT]
+        record["last_activity_at"] = event.get("timestamp") or time.time()
+
+
+def _append_live_text(subagent_id: Optional[str], delta: Any) -> None:
+    if not subagent_id or not delta:
+        return
+    text = _stringify_tool_content(delta)
+    with _active_subagents_lock:
+        record = _active_subagents.get(subagent_id)
+        if record is None:
+            return
+        # Keep only a private bounded carry so split-delta credentials can be
+        # recognized. This field is excluded from snapshots and archives.
+        raw_combined = str(record.get("assistant_text_raw_tail") or "") + text
+        redacted = redact_observable_text(raw_combined)
+        record["assistant_text_tail"] = redacted[-_LIVE_TEXT_CHAR_LIMIT:]
+
+        carry_parts = []
+        carry_cursor = 0
+        for match in _LIVE_BEARER_TOKEN_RE.finditer(raw_combined):
+            carry_parts.append(raw_combined[carry_cursor : match.start()])
+            carry_parts.append(
+                "Bearer " if match.end() == len(raw_combined) else "Bearer [REDACTED]"
+            )
+            carry_cursor = match.end()
+        carry_parts.append(raw_combined[carry_cursor:])
+        safe_carry = "".join(carry_parts)
+        record["assistant_text_raw_tail"] = safe_carry[-_LIVE_TEXT_CHAR_LIMIT:]
+        record["last_activity_at"] = time.time()
 
 
 def _looks_like_error_output(content: Any) -> bool:
@@ -797,12 +978,18 @@ def _blocked_toolsets_for_role(role: str) -> List[str]:
     blocked_names = set(DELEGATE_BLOCKED_TOOLS)
     if role == "orchestrator":
         blocked_names.discard("delegate_task")
-    return sorted(
+    blocked_toolsets = {
         name
         for name, defn in TOOLSETS.items()
         if defn.get("tools")
         and set(defn.get("tools", ())).issubset(blocked_names)
-    )
+    }
+    # The delegation toolset is intentionally mixed now: leaf children must
+    # lose both delegate_task and the session-scoped lifecycle controller,
+    # while orchestrators retain the whole capability by role.
+    if role != "orchestrator":
+        blocked_toolsets.add("delegation")
+    return sorted(blocked_toolsets)
 
 
 def _emit_parent_console(parent_agent, line: str) -> None:
@@ -848,14 +1035,15 @@ def _build_child_progress_callback(
     pause) back by ``subagent_id``.  All are optional for backward compat —
     older callers that ignore them still produce a flat list on the TUI.
 
-    Returns None if no display mechanism is available, in which case the
-    child agent runs with no progress callback (identical to current behavior).
+    Returns None only when neither a display nor a lifecycle identity exists.
+    An identified background child always gets a callback so the model-facing
+    tail remains available even in a headless parent session.
     """
     spinner = getattr(parent_agent, "_delegate_spinner", None)
     parent_cb = getattr(parent_agent, "tool_progress_callback", None)
 
-    if not spinner and not parent_cb:
-        return None  # No display → no callback → zero behavior change
+    if not spinner and not parent_cb and not subagent_id:
+        return None
 
     # Show 1-indexed prefix only in batch mode (multiple tasks)
     prefix = f"[{task_index + 1}] " if task_count > 1 else ""
@@ -920,6 +1108,12 @@ def _build_child_progress_callback(
             return
 
         if event_type == "subagent.complete":
+            if subagent_id is not None:
+                with _active_subagents_lock:
+                    rec = _active_subagents.get(subagent_id)
+                    if rec is not None:
+                        rec["status"] = kwargs.get("status") or "completed"
+                        rec["last_activity_at"] = time.time()
             _relay("subagent.complete", preview=preview, **kwargs)
             return
 
@@ -929,6 +1123,7 @@ def _build_child_progress_callback(
             # No spinner echo — the CLI shows the child via the tree, and the
             # CLI/TUI progress handlers ignore non-tool event types, so this is
             # inert there; only a gateway watch window consumes it.
+            _append_live_text(subagent_id, preview)
             _relay("subagent.text", preview=preview)
             return
 
@@ -958,6 +1153,17 @@ def _build_child_progress_callback(
             return
 
         if event == DelegateEvent.TASK_TOOL_COMPLETED:
+            _append_live_event(
+                subagent_id,
+                {
+                    "type": "tool.completed",
+                    "tool": tool_name or "",
+                    "result_preview": _bounded_live_preview(kwargs.get("result")),
+                    "is_error": bool(kwargs.get("is_error", False)),
+                    "duration_seconds": float(kwargs.get("duration") or 0.0),
+                    "timestamp": time.time(),
+                },
+            )
             return
 
         if event == DelegateEvent.TASK_PROGRESS:
@@ -983,6 +1189,17 @@ def _build_child_progress_callback(
 
         # TASK_TOOL_STARTED — display and batch for parent relay
         _tool_count[0] += 1
+        _append_live_event(
+            subagent_id,
+            {
+                "type": "tool.started",
+                "tool": tool_name or "",
+                "arguments_preview": _bounded_live_preview(
+                    args if args is not None else preview
+                ),
+                "timestamp": time.time(),
+            },
+        )
         if subagent_id is not None:
             with _active_subagents_lock:
                 rec = _active_subagents.get(subagent_id)
@@ -3012,6 +3229,11 @@ def delegate_task(
             parent_session_id=_parent_session_id,
             runner=_batch_runner,
             interrupt_fn=_batch_interrupt,
+            root_subagent_ids=[
+                str(getattr(child, "_subagent_id"))
+                for child in _child_agents
+                if isinstance(getattr(child, "_subagent_id", None), str)
+            ],
             max_async_children=_get_max_async_children(),
             # Reuse the live-transcript directory's id (when created) so the
             # returned delegation_id matches cache/delegation/live/<id>/.
@@ -3021,16 +3243,17 @@ def delegate_task(
         if dispatch.get("status") == "dispatched":
             n = len(_goals)
             note = (
-                "Subagent is running in the background. You and the user can "
-                "keep working; its full result re-enters the conversation as a "
-                "new message when it finishes. Do not wait or poll — just "
-                "continue."
+                "Subagent is running in the background. Keep doing useful parent "
+                "work; its full result normally re-enters as a new message. Use "
+                "delegation(action='wait') once only when synchronization is "
+                "required, status/tail for explicit diagnosis, and abandon before "
+                "replacing obsolete work. Do not repeatedly poll."
                 if n == 1 else
-                f"{n} subagents are running in parallel in the background. You "
-                f"and the user can keep working; they wait on each other and "
-                f"their consolidated results re-enter the conversation as a "
-                f"single message once ALL of them finish. Do not wait or poll "
-                f"— just continue."
+                f"{n} subagents are running as one background delegation. Keep "
+                f"doing useful parent work; their consolidated result normally "
+                f"re-enters once all finish. Use one bounded delegation wait only "
+                f"for synchronization, status/tail for diagnosis, and abandon "
+                f"before replacing obsolete work. Do not repeatedly poll."
             )
             payload = {
                 "status": "dispatched",
@@ -3384,12 +3607,14 @@ def _build_top_level_description() -> str:
         f"2. Batch (parallel): provide 'tasks' array with up to {max_children} "
         f"items concurrently for this user (configured via "
         f"delegation.max_concurrent_children in config.yaml). {nesting_clause}\n\n"
-        "BOTH MODES RUN IN THE BACKGROUND. delegate_task returns immediately — "
-        "you and the user keep working, and the completed result re-enters "
-        "the conversation as a new message. A "
-        "batch returns one handle, runs N subagents concurrently, and delivers "
-        "one consolidated result after ALL of them finish. Do NOT wait or poll; "
-        "just continue with other work after dispatching.\n\n"
+        "BOTH MODES RUN IN THE BACKGROUND. delegate_task returns immediately. "
+        "A single task gets one handle; a batch runs as one background "
+        "delegation with one handle and one consolidated result after all children "
+        "finish. Normally continue useful parent work and let automatic delivery "
+        "re-enter. Use one bounded delegation(action='wait') only when "
+        "synchronization is required; use status/tail for explicit diagnosis, "
+        "not repeated polling; abandon obsolete work before dispatching a "
+        "corrected replacement.\n\n"
         "LIVE TRANSCRIPTS: the dispatch response includes 'live_transcripts' — "
         "one append-only human-readable log file per task (under "
         "cache/delegation/live/<delegation_id>/). Each child streams its "

@@ -76,6 +76,122 @@ WATCH_GLOBAL_MAX_PER_WINDOW = 15
 WATCH_GLOBAL_WINDOW_SECONDS = 10
 WATCH_GLOBAL_COOLDOWN_SECONDS = 30
 
+_ASYNC_DELIVERY_TOKEN_KEY = "_async_delivery_claim_token"
+_ASYNC_DELIVERY_ACCEPTED_KEY = "_async_delivery_accepted"
+
+
+def prepare_notification_delivery(event: Dict[str, Any]) -> str:
+    """Return ``deliver``, ``defer``, or ``drop`` for one queued event.
+
+    A managed async completion is claimed through SQLite before any formatting
+    or injection. Private token/acceptance fields stay only on the in-process
+    event and let an acknowledgement failure retry bookkeeping without a second
+    user-visible injection.
+    """
+    if event.get("type") != "async_delegation":
+        return "deliver"
+
+    token = event.get(_ASYNC_DELIVERY_TOKEN_KEY)
+    if token and event.get(_ASYNC_DELIVERY_ACCEPTED_KEY):
+        if finish_notification_delivery(event, delivered=True):
+            return "drop"
+        try:
+            from tools.async_delegation import inspect_async_delivery_claim
+
+            status = inspect_async_delivery_claim(
+                str(event.get("delegation_id") or ""), str(token)
+            )
+        except Exception:
+            logger.debug("accepted delivery claim inspection failed", exc_info=True)
+            return "defer"
+        if status == "current":
+            return "defer"
+        # Downstream already accepted this event. If this exact token is no
+        # longer current, another authority completed/pruned it; never inject it.
+        event.pop(_ASYNC_DELIVERY_TOKEN_KEY, None)
+        event.pop(_ASYNC_DELIVERY_ACCEPTED_KEY, None)
+        return "drop"
+
+    if token:
+        try:
+            from tools.async_delegation import inspect_async_delivery_claim
+
+            status = inspect_async_delivery_claim(
+                str(event.get("delegation_id") or ""), str(token)
+            )
+        except Exception:
+            logger.debug("retained async delivery claim inspection failed", exc_info=True)
+            return "defer"
+        if status == "current":
+            return "deliver"
+        event.pop(_ASYNC_DELIVERY_TOKEN_KEY, None)
+        if status in {"held_by_wait", "delivering"}:
+            return "defer"
+        if status != "pending":
+            return "drop"
+
+    try:
+        from tools.async_delegation import claim_async_delivery
+
+        claim = claim_async_delivery(
+            str(event.get("delegation_id") or ""),
+            managed=bool(event.get("delivery_managed", False)),
+        )
+    except Exception:
+        logger.debug("async delivery claim failed", exc_info=True)
+        return "defer"
+    status = claim.get("status")
+    if status == "claimed":
+        event[_ASYNC_DELIVERY_TOKEN_KEY] = claim["token"]
+        return "deliver"
+    if status == "legacy":
+        return "deliver"
+    if status in {"held", "not_ready"}:
+        return "defer"
+    return "drop"
+
+
+def finish_notification_delivery(event: Dict[str, Any], *, delivered: bool) -> bool:
+    """Commit/release the exact managed claim attached to ``event``."""
+    token = event.get(_ASYNC_DELIVERY_TOKEN_KEY)
+    if not token:
+        return False
+    if delivered:
+        # Set this before the fallible durable acknowledgement.
+        event[_ASYNC_DELIVERY_ACCEPTED_KEY] = True
+    effective_delivered = bool(delivered or event.get(_ASYNC_DELIVERY_ACCEPTED_KEY))
+    try:
+        from tools.async_delegation import finish_async_delivery
+
+        finished = finish_async_delivery(
+            str(event.get("delegation_id") or ""),
+            str(token),
+            delivered=effective_delivered,
+        )
+    except Exception:
+        logger.debug("async delivery finish failed", exc_info=True)
+        return False
+    if finished:
+        event.pop(_ASYNC_DELIVERY_TOKEN_KEY, None)
+        event.pop(_ASYNC_DELIVERY_ACCEPTED_KEY, None)
+    return finished
+
+
+def commit_notification_delivery(event: Dict[str, Any], completion_queue: Any) -> bool:
+    """Acknowledge accepted delivery or queue a bookkeeping-only retry."""
+    if not event.get(_ASYNC_DELIVERY_TOKEN_KEY):
+        return True
+    committed = finish_notification_delivery(event, delivered=True)
+    if not committed:
+        completion_queue.put(event)
+    return committed
+
+
+def requeue_notification_delivery(event: Dict[str, Any], completion_queue: Any) -> None:
+    """Release this event's claim and requeue it for a future injection attempt."""
+    finish_notification_delivery(event, delivered=False)
+    completion_queue.put(event)
+
 
 def format_uptime_short(seconds: int) -> str:
     s = max(0, int(seconds))
@@ -1247,10 +1363,22 @@ class ProcessRegistry:
                 _evt_sid, skip_poll_observed=skip_poll_observed
             ):
                 continue
-
-            text = format_process_notification(evt)
-            if text:
+            delivery_action = prepare_notification_delivery(evt)
+            if delivery_action == "drop":
+                continue
+            if delivery_action == "defer":
+                requeue.append(evt)
+                continue
+            try:
+                text = format_process_notification(evt)
+                if not text:
+                    raise ValueError("notification formatter returned no text")
                 results.append((evt, text))
+            except Exception:
+                logger.debug("notification formatting failed", exc_info=True)
+                if evt.get(_ASYNC_DELIVERY_TOKEN_KEY):
+                    finish_notification_delivery(evt, delivered=False)
+                    requeue.append(evt)
         for evt in requeue:
             self.completion_queue.put(evt)
         return results
