@@ -1979,8 +1979,22 @@ class ProcessRegistry(ProcessCheckpointMixin):
                         "type=%s session_id=%s task_id=%s",
                         evt.get("type", "completion"), _evt_sid, _evt_task_id)
                     continue
-            if text := format_process_notification(evt):
+            delivery_action = prepare_notification_delivery(evt)
+            if delivery_action == "drop":
+                continue
+            if delivery_action == "defer":
+                requeue.append(evt)
+                continue
+            try:
+                text = format_process_notification(evt)
+                if not text:
+                    raise ValueError("notification formatter returned no text")
                 results.append((evt, text))
+            except Exception:
+                logger.debug("notification formatting failed", exc_info=True)
+                if evt.get(_ASYNC_DELIVERY_TOKEN_KEY):
+                    finish_notification_delivery(evt, delivered=False)
+                    requeue.append(evt)
         for evt in requeue:
             self.completion_queue.put(evt)
         return results
@@ -2308,6 +2322,9 @@ class ProcessRegistry(ProcessCheckpointMixin):
         """Deliver the kill via PTY, local Popen tree, sandbox exec or recovered host
         PID. Returns a final result dict when the kill cannot proceed (recycled/dead
         recovered PID, or no runtime handle), else None."""
+        if callable(session.kill_callback):
+            session.kill_callback()
+            return None
         if session._pty:
             try:
                 session._pty.terminate(force=True)

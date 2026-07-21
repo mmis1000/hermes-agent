@@ -574,6 +574,69 @@ CREATE TABLE IF NOT EXISTS session_turn_leases (
     expires_at REAL NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS delegation_logical_subagents (
+    logical_id TEXT PRIMARY KEY,
+    delegation_id TEXT NOT NULL REFERENCES async_delegations(delegation_id) ON DELETE CASCADE,
+    parent_logical_id TEXT REFERENCES delegation_logical_subagents(logical_id),
+    root_ordinal INTEGER,
+    spec_json TEXT NOT NULL DEFAULT '{}',
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    UNIQUE (delegation_id, root_ordinal)
+);
+
+CREATE TABLE IF NOT EXISTS delegation_runs (
+    run_id TEXT PRIMARY KEY,
+    delegation_id TEXT NOT NULL REFERENCES async_delegations(delegation_id) ON DELETE CASCADE,
+    run_number INTEGER NOT NULL,
+    kind TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    completed_at REAL,
+    event_json TEXT,
+    result_json TEXT,
+    delivery_state TEXT NOT NULL DEFAULT 'pending',
+    delivery_claim TEXT,
+    delivery_claimed_at REAL,
+    delivery_attempts INTEGER NOT NULL DEFAULT 0,
+    delivered_at REAL,
+    UNIQUE (delegation_id, run_number)
+);
+
+CREATE TABLE IF NOT EXISTS delegation_attempts (
+    attempt_id TEXT PRIMARY KEY,
+    logical_id TEXT NOT NULL REFERENCES delegation_logical_subagents(logical_id) ON DELETE CASCADE,
+    run_id TEXT NOT NULL REFERENCES delegation_runs(run_id) ON DELETE CASCADE,
+    attempt_number INTEGER NOT NULL,
+    physical_worker_id TEXT,
+    state TEXT NOT NULL,
+    owner_pid INTEGER,
+    owner_started_at INTEGER,
+    created_at REAL NOT NULL,
+    started_at REAL,
+    completed_at REAL,
+    updated_at REAL NOT NULL,
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    interrupt_reason TEXT,
+    interrupt_requested_at REAL,
+    interrupt_taken_at REAL,
+    UNIQUE (logical_id, attempt_number)
+);
+
+CREATE TABLE IF NOT EXISTS delegation_steer_mailbox (
+    mailbox_id TEXT PRIMARY KEY,
+    delegation_id TEXT NOT NULL REFERENCES async_delegations(delegation_id) ON DELETE CASCADE,
+    logical_id TEXT NOT NULL REFERENCES delegation_logical_subagents(logical_id) ON DELETE CASCADE,
+    attempt_id TEXT NOT NULL REFERENCES delegation_attempts(attempt_id) ON DELETE CASCADE,
+    sequence_number INTEGER NOT NULL,
+    message TEXT NOT NULL,
+    force INTEGER NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'pending',
+    created_at REAL NOT NULL,
+    forwarded_at REAL,
+    resolved_at REAL,
+    UNIQUE (attempt_id, sequence_number)
+);
+
 CREATE TABLE IF NOT EXISTS async_delegations (
     delegation_id TEXT PRIMARY KEY,
     origin_session TEXT NOT NULL,
@@ -601,7 +664,13 @@ CREATE TABLE IF NOT EXISTS async_delegations (
     -- async_delegations shapes depending on whether the delegation tool had
     -- ever run, breaking rebuild/replay pipelines that reconstruct state.db
     -- from the canonical schema (#94691).
-    origin_session_id TEXT NOT NULL DEFAULT ''
+    origin_session_id TEXT NOT NULL DEFAULT '',
+    root_subagent_ids_json TEXT NOT NULL DEFAULT '[]',
+    children_json TEXT NOT NULL DEFAULT '{}',
+    interrupt_requests_json TEXT NOT NULL DEFAULT '{}',
+    interrupt_reason TEXT,
+    abandon_reason TEXT,
+    lifecycle_version INTEGER NOT NULL DEFAULT 1
 );
 
 CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);
