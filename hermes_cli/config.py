@@ -3222,6 +3222,13 @@ _DYNAMIC_TOP_LEVEL_KEYS = frozenset({
 # both top-level and under ``gateway``; anything below the name is accepted (open ``extra``).
 _PLATFORM_CONTAINER_KEYS = frozenset({"platforms"})
 
+# Nested dictionaries whose next segment is intentionally user-defined. Keep
+# these path-specific so sibling typos (for example ``skills.command_preload``)
+# still receive the unknown-key warning.
+_OPEN_NESTED_DICT_PATHS = frozenset({
+    ("skills", "command_preloads"),
+})
+
 
 # Top-level keys whose sub-keys are accepted without deep checking.
 _OPEN_SUBKEY_TOP_LEVEL_KEYS = _OPEN_DICT_TOP_LEVEL_KEYS | _DYNAMIC_TOP_LEVEL_KEYS | _SCHEMA_DEFINED_DICT_KEYS
@@ -3281,6 +3288,8 @@ def _validate_config_key(key: str) -> tuple[bool, Optional[str]]:
     node: Any = DEFAULT_CONFIG.get(top)
     consumed = [top]
     for seg in segments[1:]:
+        if tuple(consumed) in _OPEN_NESTED_DICT_PATHS:
+            return True, None
         if seg in _PLATFORM_CONTAINER_KEYS or not isinstance(node, dict) or not node:
             return True, None
         if seg not in node:

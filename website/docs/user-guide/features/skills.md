@@ -130,6 +130,39 @@ same effect under one short command.
 
 (Plan mode works the same way but is a built-in command now: `/plan [request]` tells Hermes to inspect context if needed, write a markdown implementation plan instead of executing the task, and save the result under `.hermes/plans/` relative to the active workspace/backend working directory.)
 
+### Configuring command preloads
+
+Hermes does not force one workflow onto a built-in skill command. By default,
+invoking `/plan` loads only `plan`. You can opt into additional guidance for
+any slash-skill command with `skills.command_preloads` in `config.yaml`:
+
+```yaml
+skills:
+  command_preloads:
+    plan:
+      - brainstorming
+```
+
+The equivalent CLI command is:
+
+```bash
+hermes config set skills.command_preloads.plan brainstorming
+```
+
+The mapping is read from config on each invocation, so changing it does not
+require a restart. If you install or remove one of the referenced skills, use
+`/reload-skills` in a long-running session so its slash-command catalog is
+rescanned.
+
+Keys and values are skill names; leading slashes, underscores, and a single
+string value are also accepted. Configured skills load in order immediately
+before the requested skill, but only when they are installed and enabled.
+Missing or disabled preloads are ignored and never block the requested command.
+Mappings are direct rather than recursive, explicit stacked commands retain
+their order, duplicate skills are skipped, and the normal five-skill stack
+limit still applies.
+
+
 You can also interact with skills through natural conversation:
 
 ```bash

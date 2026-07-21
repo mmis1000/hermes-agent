@@ -557,12 +557,151 @@ def resolve_slash_key(command: str, table: Dict[str, Any]) -> Optional[str]:
     return cmd_key if cmd_key in table else None
 
 
+def _normalize_skill_command_name(value: Any) -> str:
+    """Normalize a configured skill name or slash command for matching."""
+    slug = str(value or "").strip().lower().lstrip("/")
+    slug = slug.replace("_", "-").replace(" ", "-")
+    slug = _SKILL_INVALID_CHARS.sub("", slug)
+    return _SKILL_MULTI_HYPHEN.sub("-", slug).strip("-")
+
+
+def _configured_skill_command_preloads() -> Dict[str, list[str]]:
+    """Return validated direct skill-command preload mappings.
+
+    ``skills.command_preloads`` is intentionally empty by default. Operators
+    can map any invoked skill to one or more installed skills that should load
+    immediately before it, without encoding instance policy in runtime code.
+    Values may be a single skill name or an ordered list. Preloads are direct,
+    not recursive, so cyclic configuration cannot loop.
+    """
+    raw = _load_skills_config().get("command_preloads", {})
+    if not isinstance(raw, dict):
+        return {}
+
+    configured: Dict[str, list[str]] = {}
+    for target, values in raw.items():
+        target_name = _normalize_skill_command_name(target)
+        if not target_name:
+            continue
+        if isinstance(values, str):
+            values = [values]
+        if not isinstance(values, (list, tuple)):
+            continue
+        normalized = [
+            name
+            for value in values
+            if (name := _normalize_skill_command_name(value))
+        ]
+        if normalized:
+            configured[target_name] = normalized
+    return configured
+
+
+def _with_configured_skill_preloads(
+    cmd_keys: list[str], commands: Dict[str, Dict[str, Any]]
+) -> list[str]:
+    """Insert configured, available skill preloads before invoked skills.
+
+    Explicitly invoked skills retain their original order and are never
+    duplicated. Missing, disabled, malformed, or self-referential preloads are
+    ignored. The final list respects the normal stacked-skill cap.
+    """
+    keys = list(cmd_keys)
+    configured = _configured_skill_command_preloads()
+    if not keys or not configured:
+        return keys
+
+    aliases_to_key: Dict[str, str] = {}
+    key_aliases: Dict[str, tuple[str, str]] = {}
+    for key, info in commands.items():
+        command_name = _normalize_skill_command_name(key)
+        skill_name = _normalize_skill_command_name((info or {}).get("name"))
+        key_aliases[key] = (skill_name, command_name)
+        if command_name:
+            aliases_to_key.setdefault(command_name, key)
+        if skill_name:
+            aliases_to_key.setdefault(skill_name, key)
+
+    try:
+        from agent.skill_utils import get_disabled_skill_names
+
+        disabled_names = {
+            _normalize_skill_command_name(name)
+            for name in get_disabled_skill_names()
+        }
+    except Exception:
+        disabled_names = set()
+
+    present = set(keys)
+    inserted: set[str] = set()
+    result: list[str] = []
+    additions_remaining = max(0, _MAX_STACKED_SKILLS - len(present))
+
+    for key in keys:
+        skill_name, command_name = key_aliases.get(
+            key,
+            ("", _normalize_skill_command_name(key)),
+        )
+        preload_names = configured.get(skill_name) or configured.get(command_name) or []
+        for preload_name in preload_names:
+            if additions_remaining <= 0:
+                break
+            preload_key = aliases_to_key.get(preload_name)
+            if (
+                preload_key is None
+                or preload_key in present
+                or preload_key in inserted
+                or preload_name in disabled_names
+            ):
+                continue
+            preload_skill_name, preload_command_name = key_aliases.get(
+                preload_key, (preload_name, preload_name)
+            )
+            if (
+                preload_skill_name in disabled_names
+                or preload_command_name in disabled_names
+            ):
+                continue
+            result.append(preload_key)
+            inserted.add(preload_key)
+            additions_remaining -= 1
+        result.append(key)
+
+    return result
+
+
 def build_skill_invocation_message(
     cmd_key: str, user_instruction: str = "", task_id: str | None = None, runtime_note: str = "",
 ) -> Optional[str]:
-    """Build the user message for a skill slash command, or None if not found."""
-    skill_info = get_skill_commands().get(cmd_key)
-    loaded = _load_skill_payload(skill_info["skill_dir"], task_id=task_id) if skill_info else None
+    """Build the user message content for a skill slash command invocation.
+
+    Args:
+        cmd_key: The command key including leading slash (e.g., "/gif-search").
+        user_instruction: Optional text the user typed after the command.
+
+    Returns:
+        The formatted message string, or None if the skill wasn't found.
+    """
+    commands = get_skill_commands()
+    skill_info = commands.get(cmd_key)
+    if not skill_info:
+        return None
+
+    effective_cmd_keys = _with_configured_skill_preloads([cmd_key], commands)
+    if effective_cmd_keys != [cmd_key]:
+        stacked = build_stacked_skill_invocation_message(
+            [cmd_key],
+            user_instruction=user_instruction,
+            task_id=task_id,
+        )
+        if stacked is None:
+            return None
+        message = stacked[0]
+        if runtime_note:
+            message += f"\n\n[Runtime note: {runtime_note}]"
+        return message
+
+    loaded = _load_skill_payload(skill_info["skill_dir"], task_id=task_id)
     if not loaded:
         return None
     note = (f'[IMPORTANT: The user has invoked the "{loaded[2]}" skill, indicating they want '
@@ -601,7 +740,8 @@ def build_stacked_skill_invocation_message(
     """Build the user message for a stacked multi-skill slash invocation:
     ``(message, loaded_skill_names, missing_skill_names)``, or ``None`` when no skill loaded."""
     commands = get_skill_commands()
-    keys = [k for k in cmd_keys if k]
+    typed_cmd_keys = list(cmd_keys)
+    keys = [k for k in _with_configured_skill_preloads(cmd_keys, commands) if k]
     loaded_names, missing, _disabled, skill_blocks = _load_skill_blocks(
         keys,
         lambda cmd_key: _load_skill_payload(commands[cmd_key]["skill_dir"], task_id=task_id) if cmd_key in commands else None,
@@ -610,7 +750,7 @@ def build_stacked_skill_invocation_message(
     )
     if not skill_blocks:
         return None
-    typed = " ".join(keys)
+    typed = " ".join(k for k in typed_cmd_keys if k)
     header = _scaffold_header(f'"{typed}" stacked skill bundle', loaded_names, missing=missing, user_instruction=user_instruction)
     return ("\n\n".join([header, *skill_blocks]), loaded_names, missing)
 
