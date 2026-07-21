@@ -54,6 +54,10 @@ _DB_LOCK = threading.Lock()
 _STATE_CONDITION = threading.Condition()
 _ACTIVE_STATES = {"running", "finalizing", "interrupt_requested", "stalling"}
 _WAIT_POLL_SECONDS = 0.05
+# Public lifecycle waits are capped at 300 seconds. Keep the durable hold lease
+# longer than that bound so a live waiter cannot be pre-empted, while a process
+# that dies mid-wait cannot strand the result forever.
+_WAIT_HOLD_STALE_SECONDS = 360.0
 
 # ── Orphaned-completion sweep ────────────────────────────────────────────────
 # Startup replay runs once per process, so a completion whose owner died while THIS process was
@@ -312,7 +316,7 @@ def recover_abandoned_delegations() -> int:
             if hint := git_state_hint(task.get("owner_cwd")):
                 diagnostics["git_state_hint"] = hint
             event = {
-                "type": "async_delegation", "delegation_id": delegation_id, "session_key": session_key,
+                "type": "async_delegation", "delivery_managed": True, "delegation_id": delegation_id, "session_key": session_key,
                 "origin_ui_session_id": origin_ui, "origin_session_id": origin_sid or "",
                 "parent_session_id": parent_id, "goal": task.get("goal", ""), "goals": task.get("goals"),
                 "context": task.get("context"), "toolsets": task.get("toolsets"), "role": task.get("role"),
@@ -601,6 +605,62 @@ def _json_list(raw):
     except (TypeError, ValueError, json.JSONDecodeError):
         return []
     return value if isinstance(value, list) else []
+
+
+def restore_stale_wait_completions(
+    target_queue,
+    *,
+    session_key: str = "",
+    owns_event: Optional[Callable[[Dict[str, Any]], bool]] = None,
+) -> int:
+    """Requeue expired wait holds only for a consumer that can own them.
+
+    Foreign consumers leave the durable row untouched. An authorised consumer
+    atomically claims the expired hold before enqueueing it, so another process
+    cannot publish the same result and a busy local queue cannot grow duplicate
+    restored copies.
+    """
+    cutoff = time.time() - _WAIT_HOLD_STALE_SECONDS
+    with _DB_LOCK, _connect() as conn:
+        rows = conn.execute(
+            """SELECT delegation_id, event_json FROM async_delegations
+                WHERE state NOT IN ('running','finalizing','interrupt_requested')
+                  AND delivery_state='held_by_wait'
+                  AND (delivery_claimed_at IS NULL OR delivery_claimed_at < ?)
+                  AND event_json IS NOT NULL
+                ORDER BY completed_at, delegation_id""",
+            (cutoff,),
+        ).fetchall()
+
+    restored = 0
+    for delegation_id, payload in rows:
+        evt = json.loads(payload)
+        if not isinstance(evt, dict):
+            continue
+        if owns_event is not None:
+            try:
+                owned = bool(owns_event(evt))
+            except Exception:
+                owned = False
+        elif session_key:
+            owned = str(evt.get("session_key") or "") == session_key
+        else:
+            owned = False
+        if not owned:
+            continue
+        claim_id = f"stale-restore:{os.getpid()}:{uuid.uuid4().hex}"
+        if not claim_completion_delivery(str(delegation_id), claim_id):
+            continue
+        evt["restored"] = True
+        evt["delivery_managed"] = True
+        evt["_async_delivery_claim_token"] = claim_id
+        try:
+            target_queue.put(evt)
+        except Exception:
+            release_completion_delivery(str(delegation_id), claim_id)
+            raise
+        restored += 1
+    return restored
 
 
 _DURABLE_SELECT = """SELECT
@@ -912,6 +972,224 @@ def abandon_async_delegation(delegation_id: str, *, session_key: str, reason: st
     }
 
 
+_TERMINAL_CHILD_STATES = {
+    "completed",
+    "success",
+    "error",
+    "failed",
+    "interrupted",
+    "cancelled",
+    "timeout",
+    "budget_exhausted",
+}
+
+
+def _delegation_for_subagent_locked(conn: Any, subagent_id: str) -> Optional[tuple]:
+    """Find the durable delegation containing ``subagent_id``.
+
+    Child lookup is a control-plane operation rather than a hot delivery path.
+    SQLite's JSON extension is not guaranteed in every supported build, so use
+    the bounded retained records and parse ``children_json`` in Python.
+    """
+    rows = conn.execute(
+        """SELECT delegation_id, origin_session, state, children_json,
+                  interrupt_requests_json
+           FROM async_delegations ORDER BY updated_at DESC"""
+    ).fetchall()
+    for row in rows:
+        children = _json_object(row[3])
+        if subagent_id in children:
+            return row
+    return None
+
+
+def register_subagent_lifecycle(record: Dict[str, Any]) -> Optional[str]:
+    """Associate a live child with its durable delegation and refresh metadata.
+
+    Root IDs are written before executor submission. Descendants are associated
+    through their already-associated parent, so no process-local authority is
+    needed for model-facing authorization.
+    """
+    subagent_id = record.get("subagent_id")
+    if not isinstance(subagent_id, str) or not subagent_id:
+        return None
+    parent_id = record.get("parent_id")
+    now = time.time()
+    delegation_id: Optional[str] = None
+    with _DB_LOCK, _connect() as conn:
+        row = _delegation_for_subagent_locked(conn, subagent_id)
+        if row is None and isinstance(parent_id, str) and parent_id:
+            row = _delegation_for_subagent_locked(conn, parent_id)
+        if row is None:
+            return None
+
+        delegation_id = str(row[0])
+        children = _json_object(row[3])
+        interrupts = _json_object(row[4])
+        child = dict(children.get(subagent_id) or {})
+        for key in (
+            "subagent_id",
+            "parent_id",
+            "depth",
+            "goal",
+            "model",
+            "started_at",
+            "status",
+            "tool_count",
+            "last_tool",
+            "last_activity_at",
+            "assistant_text_tail",
+            "events",
+            "interrupt_reason",
+            "activity",
+        ):
+            if key in record:
+                child[key] = record.get(key)
+        child["subagent_id"] = subagent_id
+        if subagent_id in interrupts:
+            child["status"] = "interrupt_requested"
+            child["interrupt_reason"] = str(interrupts.get(subagent_id) or "")
+        children[subagent_id] = child
+        conn.execute(
+            """UPDATE async_delegations SET children_json=?, updated_at=?
+               WHERE delegation_id=?""",
+            (json.dumps(children), now, delegation_id),
+        )
+    _notify_state_change()
+    return delegation_id
+
+
+def delegation_contains_subagent(
+    delegation_id: str, subagent_id: str, *, session_key: str
+) -> bool:
+    """Return membership only when both delegation and session are authorized."""
+    with _DB_LOCK, _connect() as conn:
+        row = conn.execute(
+            """SELECT children_json FROM async_delegations
+               WHERE delegation_id=? AND origin_session=?""",
+            (delegation_id, session_key),
+        ).fetchone()
+    return bool(row is not None and subagent_id in _json_object(row[0]))
+
+
+def request_pending_subagent_interrupt(
+    delegation_id: str,
+    subagent_id: str,
+    *,
+    session_key: str,
+    reason: str = "",
+) -> str:
+    """Durably queue an interrupt for an authorized child still starting."""
+    now = time.time()
+    with _DB_LOCK, _connect() as conn:
+        row = conn.execute(
+            """SELECT state, children_json, interrupt_requests_json
+               FROM async_delegations
+               WHERE delegation_id=? AND origin_session=?""",
+            (delegation_id, session_key),
+        ).fetchone()
+        if row is None:
+            return "not_found"
+        children = _json_object(row[1])
+        child = dict(children.get(subagent_id) or {})
+        if subagent_id not in children:
+            return "not_found"
+        child_state = str(child.get("status") or "").lower()
+        if str(row[0] or "") not in _ACTIVE_STATES or child_state in _TERMINAL_CHILD_STATES:
+            return "already_terminal"
+        interrupts = _json_object(row[2])
+        interrupts[subagent_id] = reason
+        child["status"] = "interrupt_requested"
+        if reason:
+            child["interrupt_reason"] = reason
+        children[subagent_id] = child
+        conn.execute(
+            """UPDATE async_delegations
+               SET children_json=?, interrupt_requests_json=?, updated_at=?
+               WHERE delegation_id=? AND origin_session=?""",
+            (
+                json.dumps(children),
+                json.dumps(interrupts),
+                now,
+                delegation_id,
+                session_key,
+            ),
+        )
+    _notify_state_change()
+    return "interrupt_requested"
+
+
+def take_pending_subagent_interrupt(subagent_id: str) -> tuple[bool, str]:
+    """Consume a queued startup interrupt immediately after live registration."""
+    with _DB_LOCK, _connect() as conn:
+        row = _delegation_for_subagent_locked(conn, subagent_id)
+        if row is None:
+            return False, ""
+        interrupts = _json_object(row[4])
+        if subagent_id not in interrupts:
+            return False, ""
+        reason = str(interrupts.pop(subagent_id) or "")
+        conn.execute(
+            """UPDATE async_delegations SET interrupt_requests_json=?, updated_at=?
+               WHERE delegation_id=?""",
+            (json.dumps(interrupts), time.time(), row[0]),
+        )
+    _notify_state_change()
+    return True, reason
+
+
+def pending_subagent_interrupt_ids(
+    delegation_id: str, *, session_key: str
+) -> set[str]:
+    with _DB_LOCK, _connect() as conn:
+        row = conn.execute(
+            """SELECT interrupt_requests_json FROM async_delegations
+               WHERE delegation_id=? AND origin_session=?""",
+            (delegation_id, session_key),
+        ).fetchone()
+    return set(_json_object(row[0])) if row is not None else set()
+
+
+def archive_subagent_tail(subagent_id: str, tail: Dict[str, Any]) -> None:
+    """Persist a bounded, already-redacted child tail before live removal."""
+    archived = {
+        key: tail.get(key)
+        for key in (
+            "subagent_id",
+            "parent_id",
+            "depth",
+            "goal",
+            "model",
+            "started_at",
+            "status",
+            "interrupt_reason",
+            "tool_count",
+            "last_tool",
+            "events",
+            "assistant_text_tail",
+            "last_activity_at",
+            "activity",
+        )
+        if key in tail
+    }
+    archived["subagent_id"] = subagent_id
+    with _DB_LOCK, _connect() as conn:
+        row = _delegation_for_subagent_locked(conn, subagent_id)
+        if row is None:
+            return
+        children = _json_object(row[3])
+        child = dict(children.get(subagent_id) or {})
+        child.update(archived)
+        children[subagent_id] = child
+        interrupts = _json_object(row[4])
+        interrupts.pop(subagent_id, None)
+        conn.execute(
+            """UPDATE async_delegations
+               SET children_json=?, interrupt_requests_json=?, updated_at=?
+               WHERE delegation_id=?""",
+            (json.dumps(children), json.dumps(interrupts), time.time(), row[0]),
+        )
+    _notify_state_change()
 
 
 
@@ -1264,7 +1542,7 @@ def _push_completion_event(record: Dict[str, Any], result: Dict[str, Any], statu
             "summary": result.get("summary"), "error": result.get("error"), "api_calls": result.get("api_calls", 0),
             "duration_seconds": result.get("duration_seconds", round(completed_at - dispatched_at, 2))}
     evt = {
-        "type": "async_delegation", "delegation_id": record.get("delegation_id"),
+        "type": "async_delegation", "delivery_managed": True, "delegation_id": record.get("delegation_id"),
         # session_key routes back to the originating gateway session; "" => CLI.
         "session_key": record.get("session_key", ""),
         "origin_ui_session_id": record.get("origin_ui_session_id", ""),
