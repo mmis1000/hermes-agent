@@ -5989,6 +5989,15 @@ class BasePlatformAdapter(ABC):
         if not self._message_handler:
             return
 
+        # Preserve the adapter-normalized user bytes before any gateway control
+        # rewrite (notably plaintext restart coercion), plugin decoration, skill
+        # injection, timestamp rendering, or media/reply enrichment. The runner
+        # consumes this private sidecar only after authorization and final
+        # session routing; merely capturing it here has no persistence effect.
+        metadata = getattr(event, "metadata", None)
+        if isinstance(metadata, dict):
+            metadata.setdefault("_task_intent_raw_ingress", event.text)
+
         if event.allow_gateway_control:
             coerce_plaintext_gateway_command(event)
 

@@ -2298,6 +2298,7 @@ class AIAgent:
                         else msg.get("display_kind")
                     ),
                     "display_metadata": msg.get("display_metadata"),
+                    "task_intent_metadata": msg.get("_task_intent"),
                 })
                 _batch_msgs.append(msg)
             # One transaction for the whole turn's new rows (typically 3-8
