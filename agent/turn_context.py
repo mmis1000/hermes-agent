@@ -665,6 +665,11 @@ def _stage_turn_user_message(
     # recovery dedups via ``has_platform_message_id`` against this row.
     if persist_user_platform_id is not None:
         user_msg["platform_message_id"] = persist_user_platform_id
+    persist_user_metadata = getattr(agent, "_pending_persist_user_metadata", None)
+    if isinstance(persist_user_metadata, dict):
+        for key, value in persist_user_metadata.items():
+            if key not in {"role", "content", "api_content"}:
+                user_msg[key] = value
     return user_msg, pending_cli_message
 
 
