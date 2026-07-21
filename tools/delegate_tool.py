@@ -17,6 +17,7 @@ The parent's context only sees the delegation call and the summary result,
 never the child's intermediate tool calls or reasoning.
 """
 
+import copy
 import enum
 import contextvars
 import json
@@ -151,6 +152,17 @@ _active_subagents_lock = threading.Lock()
 # subagent_id -> mutable record tracking the live child agent.  Stays only
 # for the lifetime of the run; _run_single_child is the owner.
 _active_subagents: Dict[str, Dict[str, Any]] = {}
+_LIVE_EVENT_LIMIT = 64
+_LIVE_TEXT_CHAR_LIMIT = 8192
+_LIVE_PREVIEW_CHAR_LIMIT = 1200
+_TERMINAL_SUBAGENT_STATUSES = {
+    "completed",
+    "success",
+    "error",
+    "failed",
+    "interrupted",
+    "timeout",
+}
 
 
 def set_spawn_paused(paused: bool) -> bool:
@@ -175,8 +187,29 @@ def _register_subagent(record: Dict[str, Any]) -> None:
     if not sid:
         return
     record.setdefault("accepting_steer", True)
+    record.setdefault("events", [])
+    record.setdefault("assistant_text_tail", "")
+    record.setdefault("assistant_text_raw_tail", "")
     with _active_subagents_lock:
         _active_subagents[sid] = record
+    try:
+        from tools.async_delegation import (
+            register_subagent_lifecycle,
+            take_pending_subagent_interrupt,
+        )
+
+        register_subagent_lifecycle(record)
+        pending, reason = take_pending_subagent_interrupt(sid)
+        if pending:
+            outcome = interrupt_subagent_status(sid, reason=reason)
+            if outcome != "interrupt_requested":
+                logger.warning(
+                    "queued interrupt for starting subagent %s resolved as %s",
+                    sid,
+                    outcome,
+                )
+    except Exception:
+        logger.debug("subagent/delegation association failed", exc_info=True)
 
 
 def _unregister_subagent(subagent_id: str, *, agent: Any = None) -> None:
@@ -220,18 +253,39 @@ def interrupt_subagent(subagent_id: str) -> bool:
     """
     with _active_subagents_lock:
         record = _active_subagents.get(subagent_id)
-    if not record:
-        return False
-    agent = record.get("agent")
-    if agent is None:
-        return False
+    if record is None:
+        return
+    tail = {
+        "subagent_id": subagent_id,
+        "parent_id": record.get("parent_id"),
+        "depth": record.get("depth"),
+        "goal": record.get("goal"),
+        "model": record.get("model"),
+        "started_at": record.get("started_at"),
+        "status": record.get("status"),
+        "interrupt_reason": record.get("interrupt_reason"),
+        "tool_count": record.get("tool_count", 0),
+        "last_tool": record.get("last_tool", ""),
+        "events": copy.deepcopy(record.get("events") or []),
+        "assistant_text_tail": str(record.get("assistant_text_tail") or ""),
+        "last_activity_at": record.get("last_activity_at"),
+    }
     try:
         if not request_hard_interrupt(agent, f"Interrupted via TUI ({subagent_id})"):
             return False
     except Exception as exc:
+        with _active_subagents_lock:
+            current = _active_subagents.get(subagent_id)
+            if current is not None and current.get("status") == "interrupt_requested":
+                current["status"] = "running"
         logger.debug("interrupt_subagent(%s) failed: %s", subagent_id, exc)
-        return False
-    return True
+        return "interrupt_failed"
+    return "interrupt_requested"
+
+
+def interrupt_subagent(subagent_id: str, reason: str = "") -> bool:
+    """Compatibility wrapper used by the existing TUI RPC."""
+    return interrupt_subagent_status(subagent_id, reason) == "interrupt_requested"
 
 
 def steer_subagent(
@@ -322,6 +376,18 @@ def list_active_subagents() -> List[Dict[str, Any]]:
             }
             for r in _active_subagents.values()
         ]
+    output = []
+    for snapshot, agent in snapshots:
+        get_summary = getattr(agent, "get_activity_summary", None)
+        if callable(get_summary):
+            try:
+                summary = get_summary()
+                if isinstance(summary, dict):
+                    snapshot["activity"] = copy.deepcopy(summary)
+            except Exception:
+                logger.debug("subagent activity summary failed", exc_info=True)
+        output.append(snapshot)
+    return output
 
 
 def _is_descendant_of(child_agent: Any, parent_agent: Any, max_hops: int = 8) -> bool:
@@ -1197,12 +1263,18 @@ def _blocked_toolsets_for_role(role: str) -> List[str]:
     blocked_names = set(DELEGATE_BLOCKED_TOOLS)
     if role == "orchestrator":
         blocked_names.discard("delegate_task")
-    return sorted(
+    blocked_toolsets = {
         name
         for name, defn in TOOLSETS.items()
         if defn.get("tools")
         and set(defn.get("tools", ())).issubset(blocked_names)
-    )
+    }
+    # The delegation toolset is intentionally mixed now: leaf children must
+    # lose both delegate_task and the session-scoped lifecycle controller,
+    # while orchestrators retain the whole capability by role.
+    if role != "orchestrator":
+        blocked_toolsets.add("delegation")
+    return sorted(blocked_toolsets)
 
 
 def _emit_parent_console(parent_agent, line: str) -> None:
@@ -1248,14 +1320,15 @@ def _build_child_progress_callback(
     pause) back by ``subagent_id``.  All are optional for backward compat —
     older callers that ignore them still produce a flat list on the TUI.
 
-    Returns None if no display mechanism is available, in which case the
-    child agent runs with no progress callback (identical to current behavior).
+    Returns None only when neither a display nor a lifecycle identity exists.
+    An identified background child always gets a callback so the model-facing
+    tail remains available even in a headless parent session.
     """
     spinner = getattr(parent_agent, "_delegate_spinner", None)
     parent_cb = getattr(parent_agent, "tool_progress_callback", None)
 
-    if not spinner and not parent_cb:
-        return None  # No display → no callback → zero behavior change
+    if not spinner and not parent_cb and not subagent_id:
+        return None
 
     # Show 1-indexed prefix only in batch mode (multiple tasks)
     prefix = f"[{task_index + 1}] " if task_count > 1 else ""
@@ -1320,6 +1393,12 @@ def _build_child_progress_callback(
             return
 
         if event_type == "subagent.complete":
+            if subagent_id is not None:
+                with _active_subagents_lock:
+                    rec = _active_subagents.get(subagent_id)
+                    if rec is not None:
+                        rec["status"] = kwargs.get("status") or "completed"
+                        rec["last_activity_at"] = time.time()
             _relay("subagent.complete", preview=preview, **kwargs)
             return
 
@@ -1329,6 +1408,7 @@ def _build_child_progress_callback(
             # No spinner echo — the CLI shows the child via the tree, and the
             # CLI/TUI progress handlers ignore non-tool event types, so this is
             # inert there; only a gateway watch window consumes it.
+            _append_live_text(subagent_id, preview)
             _relay("subagent.text", preview=preview)
             return
 
@@ -1358,6 +1438,17 @@ def _build_child_progress_callback(
             return
 
         if event == DelegateEvent.TASK_TOOL_COMPLETED:
+            _append_live_event(
+                subagent_id,
+                {
+                    "type": "tool.completed",
+                    "tool": tool_name or "",
+                    "result_preview": _bounded_live_preview(kwargs.get("result")),
+                    "is_error": bool(kwargs.get("is_error", False)),
+                    "duration_seconds": float(kwargs.get("duration") or 0.0),
+                    "timestamp": time.time(),
+                },
+            )
             return
 
         if event == DelegateEvent.TASK_PROGRESS:
@@ -1383,6 +1474,17 @@ def _build_child_progress_callback(
 
         # TASK_TOOL_STARTED — display and batch for parent relay
         _tool_count[0] += 1
+        _append_live_event(
+            subagent_id,
+            {
+                "type": "tool.started",
+                "tool": tool_name or "",
+                "arguments_preview": _bounded_live_preview(
+                    args if args is not None else preview
+                ),
+                "timestamp": time.time(),
+            },
+        )
         if subagent_id is not None:
             with _active_subagents_lock:
                 rec = _active_subagents.get(subagent_id)
@@ -4122,6 +4224,11 @@ def delegate_task(
             parent_session_id=_parent_session_id,
             runner=_batch_runner,
             interrupt_fn=_batch_interrupt,
+            root_subagent_ids=[
+                str(getattr(child, "_subagent_id"))
+                for child in _child_agents
+                if isinstance(getattr(child, "_subagent_id", None), str)
+            ],
             max_async_children=_get_max_async_children(),
             # Reuse the live-transcript directory's id (when created) so the
             # returned delegation_id matches cache/delegation/live/<id>/.
@@ -4132,16 +4239,17 @@ def delegate_task(
         if dispatch.get("status") == "dispatched":
             n = len(_goals)
             note = (
-                "Subagent is running in the background. You and the user can "
-                "keep working; its full result re-enters the conversation as a "
-                "new message when it finishes. Do not wait or poll — just "
-                "continue."
+                "Subagent is running in the background. Keep doing useful parent "
+                "work; its full result normally re-enters as a new message. Use "
+                "delegation(action='wait') once only when synchronization is "
+                "required, status/tail for explicit diagnosis, and abandon before "
+                "replacing obsolete work. Do not repeatedly poll."
                 if n == 1 else
-                f"{n} subagents are running in parallel in the background. You "
-                f"and the user can keep working; they wait on each other and "
-                f"their consolidated results re-enter the conversation as a "
-                f"single message once ALL of them finish. Do not wait or poll "
-                f"— just continue."
+                f"{n} subagents are running as one background delegation. Keep "
+                f"doing useful parent work; their consolidated result normally "
+                f"re-enters once all finish. Use one bounded delegation wait only "
+                f"for synchronization, status/tail for diagnosis, and abandon "
+                f"before replacing obsolete work. Do not repeatedly poll."
             )
             payload = {
                 "status": "dispatched",
@@ -4479,44 +4587,70 @@ def _build_top_level_description() -> str:
     here, check it is not already stated in a parameter description.
     """
     return (
-        "Spawn subagents in isolated contexts; each gets its own conversation, "
-        "terminal session, and toolset, and only its final summary returns to "
-        "you. Provide 'goal' for a single task or 'tasks' for a parallel batch "
-        "(limits and nesting rules are in the parameter descriptions).\n\n"
-        "Runs in the background: dispatch returns immediately with live "
-        "transcript paths, and the completed result (one consolidated message "
-        "for a batch) re-enters the conversation on its own. Do NOT wait or "
-        "poll; continue other work.\n\n"
-        "LIVE ORCHESTRATION: while children run, this tool also controls "
-        "them — action='list' (live children + ids), action='steer' "
-        "(subagent_id + message, redirect without stopping), action='stop' "
-        "(subagent_id, end early; partial result still returns). Steer when "
-        "a live transcript shows a child drifting.\n\n"
-        "USE FOR: reasoning-heavy subtasks, work that would flood your context "
-        "with intermediate data, or independent parallel workstreams.\n"
-        "DO NOT USE FOR (use these instead):\n"
-        "- Mechanical multi-step work with no reasoning needed -> execute_code\n"
-        "- A single tool call -> call the tool directly\n"
-        "- Tasks needing user interaction -> subagents cannot ask questions\n"
-        "- Durable work that must survive this session -> cronjob or "
-        "terminal(background=True, notify_on_complete=True); /stop, /new, or "
-        "process exit discards running subagents.\n\n"
-        "RULES:\n"
-        "- Children know nothing of this conversation: pass everything needed "
-        "via 'context', including any required output language, tone, or "
-        "style (e.g. \"respond in Chinese\").\n"
-        "- Child summaries are SELF-REPORTS, not verified facts: a child "
-        "claiming \"uploaded successfully\" or \"file written\" may be wrong. "
-        "For external side effects (uploads, remote writes, publishing), "
-        "require a verifiable handle (URL, ID, absolute path) and verify it "
-        "yourself — fetch the URL, stat the file, read back the content — "
-        "before telling the user the operation succeeded.\n"
-        "- Leaf children (the default) cannot call delegate_task, clarify, "
-        "memory, send_message, or cronjob; orchestrators regain only "
-        "delegate_task.\n"
-        "- Children inherit the parent model and fallback chain unless pinned "
-        "globally via delegation.provider / delegation.model in config.yaml. "
-        "Results are returned as an array, one entry per task."
+        "Spawn one or more subagents to work on tasks in isolated contexts. "
+        "Each subagent gets its own conversation, terminal session, and toolset. "
+        "Only the final summary is returned -- intermediate tool results "
+        "never enter your context window.\n\n"
+        "TWO MODES (one of 'goal' or 'tasks' is required):\n"
+        "1. Single task: provide 'goal' (+ optional context and role).\n"
+        f"2. Batch (parallel): provide 'tasks' array with up to {max_children} "
+        f"items concurrently for this user (configured via "
+        f"delegation.max_concurrent_children in config.yaml). {nesting_clause}\n\n"
+        "BOTH MODES RUN IN THE BACKGROUND. delegate_task returns immediately. "
+        "A single task gets one handle; a batch runs as one background "
+        "delegation with one handle and one consolidated result after all children "
+        "finish. Normally continue useful parent work and let automatic delivery "
+        "re-enter. Use one bounded delegation(action='wait') only when "
+        "synchronization is required; use status/tail for explicit diagnosis, "
+        "not repeated polling; abandon obsolete work before dispatching a "
+        "corrected replacement.\n\n"
+        "LIVE TRANSCRIPTS: the dispatch response includes 'live_transcripts' — "
+        "one append-only human-readable log file per task (under "
+        "cache/delegation/live/<delegation_id>/). Each child streams its "
+        "assistant text, tool calls, and tool results there while it runs. "
+        "Read (or `tail -f` in a terminal) those paths any time you or the "
+        "user want to see what a subagent is actually doing instead of "
+        "waiting for the final summary.\n\n"
+        "WHEN TO USE delegate_task:\n"
+        "- Reasoning-heavy subtasks (debugging, code review, research synthesis)\n"
+        "- Tasks that would flood your context with intermediate data\n"
+        "- Parallel independent workstreams (research A and B simultaneously)\n\n"
+        "WHEN NOT TO USE (use these instead):\n"
+        "- Mechanical multi-step work with no reasoning needed -> use execute_code\n"
+        "- Single tool call -> just call the tool directly\n"
+        "- Tasks needing user interaction -> subagents cannot use clarify\n"
+        "- Durable long-running work that must outlive the current turn -> "
+        "use cronjob (action='create') or terminal(background=True, "
+        "notify_on_complete=True) instead. Background delegations are NOT "
+        "durable: if the parent session is closed (/new) or the process exits "
+        "before a subagent finishes, that subagent's work is discarded, and "
+        "/stop cancels every running background subagent.\n\n"
+        "IMPORTANT:\n"
+        "- Subagents have NO memory of your conversation. Pass all relevant "
+        "info (file paths, error messages, constraints) via the 'context' field.\n"
+        "- If the user is writing in a non-English language, or asked for "
+        "output in a specific language / tone / style, say so in 'context' "
+        "(e.g. \"respond in Chinese\", \"return output in Japanese\"). "
+        "Otherwise subagents default to English and their summaries will "
+        "contaminate your final reply with the wrong language.\n"
+        "- Subagent summaries are SELF-REPORTS, not verified facts. A subagent "
+        "that claims \"uploaded successfully\" or \"file written\" may be wrong. "
+        "For operations with external side-effects (HTTP POST/PUT, remote "
+        "writes, file creation at shared paths, publishing), require the "
+        "subagent to return a verifiable handle (URL, ID, absolute path, HTTP "
+        "status) and verify it yourself — fetch the URL, stat the file, read "
+        "back the content — before telling the user the operation succeeded.\n"
+        "- Leaf subagents (role='leaf', the default) CANNOT call: "
+        "delegate_task, clarify, memory, send_message, execute_code.\n"
+        "- Orchestrator subagents (role='orchestrator') retain "
+        "delegate_task so they can spawn their own workers, but still "
+        "cannot use clarify, memory, send_message, or execute_code. "
+        f"Orchestrators are bounded by max_spawn_depth={max_depth} for this "
+        f"user and can be disabled globally via "
+        "delegation.orchestrator_enabled=false.\n"
+        "- Subagent model is NOT selectable per call: children inherit the parent model (plus its fallback chain) unless you pin all subagents to a model via delegation.provider / delegation.model in config.yaml.\n"
+        "- Each subagent gets its own terminal session (separate working directory and state).\n"
+        "- Results are always returned as an array, one entry per task."
     )
 
 

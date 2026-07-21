@@ -25227,30 +25227,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """Deliver once per live gateway, or return False for a retry.
 
         ``True`` means this caller reached adapter acceptance, ``False`` means
-        injection failed and the claim was released for retry, and ``None``
-        means either another same-lifecycle caller owns/delivered the producer
-        event or the event has no gateway route. No cross-process exactly-once
-        guarantee is claimed.
+        injection or durable bookkeeping needs a retry, and ``None`` means
+        another same-lifecycle caller owns/delivered the producer event or the
+        event has no gateway route. Once injection is accepted, retries are
+        bookkeeping-only and never inject the same event again.
         """
         identity = self._completion_delivery_identity(evt)
-        durable_claim_id = ""
         durable_delegation_id = ""
+        durable_claim_id = str(evt.get("_gateway_async_delivery_claim") or "")
+
         if evt.get("type") == "async_delegation":
             durable_delegation_id = str(evt.get("delegation_id") or "")
-            if durable_delegation_id:
-                try:
-                    from tools.async_delegation import claim_completion_delivery
 
-                    durable_claim_id = f"gateway:{id(self)}:{__import__('uuid').uuid4().hex}"
-                    if not claim_completion_delivery(
-                        durable_delegation_id, durable_claim_id,
-                    ):
-                        return None
-                except Exception as exc:
-                    logger.warning(
-                        "Could not claim durable async completion %s: %s",
-                        durable_delegation_id, exc,
-                    )
+        # A previous call reached user-visible injection but failed to persist
+        # the acknowledgement. Retry only the SQLite commit.
+        if evt.get("_gateway_async_delivery_accepted") and durable_claim_id:
+            try:
+                from tools.async_delegation import complete_completion_delivery
+
+                if not complete_completion_delivery(
+                    durable_delegation_id, durable_claim_id,
+                ):
                     return False
             parent_session_id = str(evt.get("parent_session_id") or "").strip()
             if parent_session_id:
@@ -25328,14 +25325,30 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     or identity in self._completion_deliveries_delivered
                 ):
                     return None
-                self._completion_deliveries_inflight.add(identity)
+                evt["_gateway_async_delivery_claim"] = durable_claim_id
+            except Exception as exc:
+                logger.warning(
+                    "Could not claim durable async completion %s: %s",
+                    durable_delegation_id, exc,
+                )
+                return False
 
         accepted = False
         try:
+            if identity is not None:
+                with self._completion_delivery_lock:
+                    if (
+                        identity in self._completion_deliveries_inflight
+                        or identity in self._completion_deliveries_delivered
+                    ):
+                        return None
+                    self._completion_deliveries_inflight.add(identity)
+
             injection_result = await self._inject_watch_notification(synth_text, evt)
             if injection_result is not True:
                 return injection_result
             accepted = True
+            evt["_gateway_async_delivery_accepted"] = True
 
             if identity is not None:
                 with self._completion_delivery_lock:
@@ -25347,21 +25360,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     ):
                         self._completion_deliveries_delivered.popitem(last=False)
 
-            # If the durable async-delegation producer branch is present, its
-            # SQLite row remains the authoritative replay state. Acknowledge it
-            # after adapter acceptance; this gateway keeps no parallel ledger.
             if durable_claim_id:
-                try:
-                    from tools.async_delegation import complete_completion_delivery
+                from tools.async_delegation import complete_completion_delivery
 
-                    complete_completion_delivery(
-                        durable_delegation_id, durable_claim_id,
-                    )
-                except Exception as exc:
-                    logger.warning(
-                        "Could not acknowledge durable async completion %s: %s",
-                        durable_delegation_id, exc,
-                    )
+                if not complete_completion_delivery(
+                    durable_delegation_id, durable_claim_id,
+                ):
+                    return False
+                evt.pop("_gateway_async_delivery_claim", None)
+                evt.pop("_gateway_async_delivery_accepted", None)
             return True
         finally:
             if identity is not None and not accepted:
@@ -25371,9 +25378,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 try:
                     from tools.async_delegation import release_completion_delivery
 
-                    release_completion_delivery(
+                    if release_completion_delivery(
                         durable_delegation_id, durable_claim_id,
-                    )
+                    ):
+                        evt.pop("_gateway_async_delivery_claim", None)
                 except Exception:
                     logger.debug("Could not release durable completion claim", exc_info=True)
 
