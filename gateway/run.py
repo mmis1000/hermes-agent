@@ -21937,6 +21937,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
             )
 
+            def _warn_failed_delivery(kind: str, result) -> None:
+                if getattr(result, "success", None) is not False:
+                    return
+                logger.warning(
+                    "[%s] Post-stream %s delivery failed "
+                    "(chat=%s thread=%s): %s",
+                    adapter.name,
+                    kind,
+                    event.source.chat_id,
+                    getattr(event.source, "thread_id", None),
+                    getattr(result, "error", None) or "unknown adapter error",
+                )
+
             _VIDEO_EXTS = {'.mp4', '.mov', '.avi', '.mkv', '.webm', '.3gp'}
             _IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.webp', '.gif'}
 
@@ -21958,37 +21971,53 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if image_paths:
                 try:
                     images = [(f"file://{_quote(p)}", "") for p in image_paths]
-                    await adapter.send_multiple_images(
+                    result = await adapter.send_multiple_images(
                         chat_id=event.source.chat_id,
                         images=images,
                         metadata=_thread_meta,
                     )
+                    _warn_failed_delivery("image batch", result)
                 except Exception as e:
-                    logger.warning("[%s] Post-stream image batch delivery failed: %s", adapter.name, e)
+                    logger.warning(
+                        "[%s] Post-stream image batch delivery failed "
+                        "(chat=%s thread=%s): %s",
+                        adapter.name,
+                        event.source.chat_id,
+                        getattr(event.source, "thread_id", None),
+                        e,
+                    )
 
             for media_path, is_voice in non_image_media:
                 try:
                     ext = Path(media_path).suffix.lower()
                     if should_send_media_as_audio(event.source.platform, ext, is_voice=is_voice):
-                        await adapter.send_voice(
+                        result = await adapter.send_voice(
                             chat_id=event.source.chat_id,
                             audio_path=media_path,
                             metadata=_thread_meta,
                         )
                     elif ext in _VIDEO_EXTS:
-                        await adapter.send_video(
+                        result = await adapter.send_video(
                             chat_id=event.source.chat_id,
                             video_path=media_path,
                             metadata=_thread_meta,
                         )
                     else:
-                        await adapter.send_document(
+                        result = await adapter.send_document(
                             chat_id=event.source.chat_id,
                             file_path=media_path,
                             metadata=_thread_meta,
                         )
+                    _warn_failed_delivery("media", result)
                 except Exception as e:
-                    logger.warning("[%s] Post-stream media delivery failed: %s", adapter.name, e)
+                    logger.warning(
+                        "[%s] Post-stream media delivery failed "
+                        "(chat=%s thread=%s): %s",
+                        adapter.name,
+                        event.source.chat_id,
+                        getattr(event.source, "thread_id", None),
+                        e,
+                    )
 
         except Exception as e:
             logger.warning("Post-stream media extraction failed: %s", e)
