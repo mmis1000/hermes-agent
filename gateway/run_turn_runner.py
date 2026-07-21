@@ -1694,8 +1694,11 @@ class TurnRunner:
         register_gateway_notify(session_key, self._approval_notify_sync)
         try:
             agent._pending_task_intent_metadata = getattr(ctx, "task_intent_metadata", None)
+            agent._pending_persist_user_metadata = getattr(ctx, "persist_user_metadata", None)
             api_message = _wrap_current_message_with_observed_context(self._native_image_run_message(), observed_group_context)
             kwargs = {"conversation_history": agent_history, "task_id": ctx.session_id}
+            if _accepts_keyword(agent.run_conversation, "persist_user_metadata") and getattr(ctx, "persist_user_metadata", None) is not None:
+                kwargs["persist_user_metadata"] = ctx.persist_user_metadata
             if _accepts_keyword(agent.run_conversation, "turn_author"):
                 # Sent on every transport: a provider gating durable writes needs the bot flag in a DM too.
                 kwargs["turn_author"] = {"id": ctx.source.user_id or None, "name": ctx.source.user_name or None,
