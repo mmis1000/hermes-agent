@@ -10,6 +10,9 @@ from tools import delegate_tool
 from tools.registry import registry
 
 
+pytestmark = pytest.mark.usefixtures("admitted_delegate_route")
+
+
 @pytest.mark.parametrize("legacy_role", [None, "leaf", "orchestrator"])
 @pytest.mark.parametrize(
     "parent_depth,max_depth,enabled",

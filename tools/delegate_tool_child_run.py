@@ -51,6 +51,12 @@ def _close_child(child: Any, log_message: str) -> None:
         close = getattr(child, "close", None)
         if callable(close):
             close()
+    attempt_id = getattr(child, "_delegation_attempt_id", None)
+    if isinstance(attempt_id, str):
+        from tools.delegation_scope import attempt_scope_registry
+        authority = attempt_scope_registry.get(attempt_id)
+        if authority is not None and authority.state != "revoked":
+            attempt_scope_registry.cleanup(attempt_id)
 
 def _with_children_lock(parent_agent: Any, op: str, child: Any) -> None:
     """``parent_agent._active_children.<op>(child)`` under the parent's lock when it has one."""
@@ -719,6 +725,8 @@ class _ChildRun:
     parent_task_id: Optional[str] = None
     wall_start: float = 0.0
     parent_reads_snapshot: list = field(default_factory=list)
+    conversation_history: Optional[List[Dict[str, Any]]] = None
+    resume_message: Optional[str] = None
 
     def elapsed(self) -> float:
         return round(time.monotonic() - self.child_start, 2)
@@ -748,7 +756,8 @@ class _ChildRun:
         """Seed cwd/container aliases and optional worktree isolation for the child;
         ``goal`` is extended with the worktree contract note when isolation engaged."""
         import uuid as _uuid
-        self.child_task_id = self.subagent_id or f"subagent-{self.task_index}-{_uuid.uuid4().hex[:8]}"
+        physical_id = getattr(self.child, "_delegation_attempt_id", None)
+        self.child_task_id = physical_id if isinstance(physical_id, str) and physical_id else (self.subagent_id or f"subagent-{self.task_index}-{_uuid.uuid4().hex[:8]}")
         self.parent_task_id = getattr(self.parent_agent, "_current_task_id", None)
         # Seed the child's cwd record from the parent's: same starting directory,
         # but the child's later `cd`s stay in its own record. Per-session container
@@ -848,7 +857,14 @@ class _ChildRun:
         worker_thread_holder: Dict[str, Optional[threading.Thread]] = {"t": None}
         # Resolved after seed_workspace so a multimodal goal's text part carries the worktree note too.
         _images = list(getattr(child, "_delegate_images", None) or [])
-        user_message: Any = _build_child_goal_message(self.goal, _images, child) if _images else self.goal
+        user_message: Any = (
+            self.resume_message if self.resume_message is not None
+            else _build_child_goal_message(self.goal, _images, child) if _images else self.goal
+        )
+        history_kwargs = (
+            {"conversation_history": self.conversation_history}
+            if self.conversation_history is not None else {}
+        )
 
         def _run_with_thread_capture():
             worker_thread_holder["t"] = threading.current_thread()
@@ -856,6 +872,7 @@ class _ChildRun:
             with delegated_child_context(str(getattr(child, "session_id", "") or "")):
                 return child.run_conversation(
                     user_message=user_message, task_id=self.child_task_id, stream_callback=self.relay_text,
+                    **history_kwargs,
                 )
 
         future = executor.submit(contextvars.copy_context().run, _run_with_thread_capture)

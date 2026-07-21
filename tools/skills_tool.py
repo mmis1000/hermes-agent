@@ -181,47 +181,181 @@ def _skill_search_dirs() -> Tuple[list, list, Path]:
     return project_dirs, all_dirs, active_skills_dir
 
 
-def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
-    """All skills (name, description, category) across project/local/external dirs, first-wins
-    by name; cached per session. ``skip_disabled=True`` ignores disabled state (config UI)."""
-    from agent.skill_utils import iter_project_skill_files, iter_skill_index_files
-    cache_key = "with_disabled" if skip_disabled else "filtered"
-    disabled = set() if skip_disabled else _get_disabled_skill_names()
-    project_dirs, dirs_to_scan, _ = _skill_search_dirs()
+_SKILLS_CACHE_KEY_DISABLED = "with_disabled"
+_SKILLS_CACHE_KEY_FILTERED = "filtered"
+
+
+def _find_all_skills(
+    *,
+    skip_disabled: bool = False,
+    search_dirs: List[Path] | None = None,
+    task_id: str | None = None,
+) -> List[Dict[str, Any]]:
+    """Recursively find all skills in ~/.hermes/skills/ and external dirs.
+
+    Args:
+        skip_disabled: If True, return ALL skills regardless of disabled
+            state (used by ``hermes skills`` config UI). Default False
+            filters out disabled skills.
+
+    Returns:
+        List of skill metadata dicts (name, description, category).
+
+    Results are cached per-session; the cache is invalidated when the scan
+    signature changes (dir/category mtimes or the disabled-set) and expires
+    after a short TTL to bound staleness from in-place SKILL.md edits.
+    """
+    from agent.skill_utils import (
+        get_external_skills_dirs,
+        get_project_skills_dirs,
+        iter_project_skill_files,
+        iter_skill_index_files,
+    )
+
+    cache_key: Any = (
+        (_SKILLS_CACHE_KEY_DISABLED if skip_disabled else _SKILLS_CACHE_KEY_FILTERED)
+        if search_dirs is None
+        else (
+            "protected",
+            tuple(str(path) for path in search_dirs),
+            task_id,
+            bool(skip_disabled),
+        )
+    )
+
+    # Load disabled set once (not per-skill). Part of the cache signature:
+    # disabling a skill is a config change with no filesystem mtime bump.
+    disabled = (
+        set()
+        if skip_disabled or (search_dirs is not None and not task_id)
+        else _get_disabled_skill_names()
+    )
+
+    # Collect directories to scan — same resolution as the scan loop below
+    # (_skills_dir() resolves the LIVE profile HERMES_HOME; the module-level
+    # SKILLS_DIR can be stale in long-lived runtimes). Trusted project-local
+    # dirs come FIRST: first-wins dedup below gives them precedence over
+    # same-named local/external skills.
+    project_dirs = list(get_project_skills_dirs())
+    if search_dirs is None:
+        dirs_to_scan: list = list(project_dirs)
+        active_skills_dir = _skills_dir()
+        if active_skills_dir.exists():
+            dirs_to_scan.append(active_skills_dir)
+        dirs_to_scan.extend(get_external_skills_dirs())
+    else:
+        dirs_to_scan = list(search_dirs)
+    if task_id:
+        protected_dirs = _protected_skill_search_dirs(task_id, dirs_to_scan)
+        if protected_dirs is None:
+            return []
+        dirs_to_scan = protected_dirs
+
     signature = _skills_scan_signature(dirs_to_scan, disabled)
     now = time.monotonic()
+
     cached = _SKILLS_CACHE.get(cache_key)
-    if cached is not None and cached[0] == signature and (now - cached[1]) < _SKILLS_CACHE_TTL_SECONDS:
-        # Shallow copies: callers mutate the returned dicts (web_server annotates
-        # s["enabled"]/s["usage"]); handing out cached objects would poison the cache.
+    if (
+        cached is not None
+        and cached[0] == signature
+        and (now - cached[1]) < _SKILLS_CACHE_TTL_SECONDS
+    ):
+        # Per-call shallow copies: callers mutate the returned dicts
+        # (e.g. web_server annotates s["enabled"]/s["usage"]) — handing
+        # out the cached objects would poison the cache for everyone else.
         return [dict(s) for s in cached[2]]
+
     skills = []
     seen_names: set = set()
-    for scan_dir in dirs_to_scan:  # project dirs go through the quarantine chokepoint
-        _iter = iter_project_skill_files if scan_dir in project_dirs else lambda d: iter_skill_index_files(d, "SKILL.md")
-        for skill_md in _iter(scan_dir):
+
+    # Scan project dirs first, then local, then external (first-wins) —
+    # dirs_to_scan already resolved above for the signature. Project dirs
+    # iterate through the quarantine chokepoint (scan-time injection gate).
+    for scan_dir in dirs_to_scan:
+        _is_project = scan_dir in project_dirs
+        _iter = (
+            iter_project_skill_files(scan_dir)
+            if _is_project
+            else iter_skill_index_files(scan_dir, "SKILL.md")
+        )
+        for skill_md in _iter:
             if any(part in _EXCLUDED_SKILL_DIRS for part in skill_md.parts):
                 continue
+            if task_id and _protected_skill_path_allowed(task_id, skill_md) is not True:
+                continue
+
+            skill_dir = skill_md.parent
+
             try:
-                frontmatter, body = _parse_frontmatter(_read_skill_text(skill_md)[:4000])
-                if not skill_matches_platform(frontmatter) or not skill_matches_environment(frontmatter) or not skill_matches_apps(frontmatter):
+                content = skill_md.read_text(encoding="utf-8-sig", errors="replace")[:4000]
+                frontmatter, body = _parse_frontmatter(content)
+
+                if not skill_matches_platform(frontmatter):
                     continue
-                name = frontmatter.get("name", skill_md.parent.name)[:MAX_NAME_LENGTH]
-                if name in seen_names or name in disabled:
+
+                if not skill_matches_environment(frontmatter):
                     continue
+
+                name = frontmatter.get("name", skill_dir.name)[:MAX_NAME_LENGTH]
+                if name in seen_names:
+                    continue
+                if name in disabled:
+                    continue
+
                 description = frontmatter.get("description", "")
-                if not description:  # first non-heading body line (a null value stays null)
-                    description = next((ln for ln in map(str.strip, body.strip().split("\n"))
-                                        if ln and not ln.startswith("#")), description)
+                if not description:
+                    for line in body.strip().split("\n"):
+                        line = line.strip()
+                        if line and not line.startswith("#"):
+                            description = line
+                            break
+
+                if len(description) > MAX_DESCRIPTION_LENGTH:
+                    description = description[:MAX_DESCRIPTION_LENGTH - 3] + "..."
+
+                category = _get_category_from_path(skill_md)
+
                 seen_names.add(name)
-                skills.append({"name": name, "description": _truncate_description(description),
-                               "category": _get_category_from_path(skill_md)})
+                from agent.skill_utils import extract_skill_conditions
+
+                skills.append({
+                    "name": name,
+                    "description": description,
+                    "category": category,
+                    "conditions": extract_skill_conditions(frontmatter),
+                })
+
             except (UnicodeDecodeError, PermissionError) as e:
                 logger.debug("Failed to read skill file %s: %s", skill_md, e)
+                continue
             except Exception as e:
-                logger.debug("Skipping skill at %s: failed to parse: %s", skill_md, e, exc_info=True)
-    # Keyed by the signature computed BEFORE the scan: a write racing the scan changes the
-    # signature, so the next call re-scans instead of serving a torn result.
+                logger.debug(
+                    "Skipping skill at %s: failed to parse: %s", skill_md, e, exc_info=True
+                )
+                continue
+
+    if task_id:
+        viewable_skills = []
+        for skill in skills:
+            try:
+                probe = json.loads(
+                    skill_view(
+                        skill["name"],
+                        task_id=task_id,
+                        preprocess=False,
+                        _viewability_probe=True,
+                    )
+                )
+            except Exception:
+                probe = {"success": False}
+            if probe.get("success"):
+                viewable_skills.append(skill)
+        skills = viewable_skills
+
+    # Store in cache keyed by the scan signature computed BEFORE the scan
+    # (a write racing the scan changes the signature, so the next call
+    # re-scans rather than serving the torn result past the TTL). Same
+    # shallow-copy contract as the hit path — the caller may mutate.
     _SKILLS_CACHE[cache_key] = (signature, now, skills)
     return [dict(s) for s in skills]
 
@@ -232,31 +366,86 @@ def _sort_skills(skills: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 
 def skills_list(category: str = None, task_id: str = None) -> str:
-    """Tier 1 listing: name + description (+ category) only; ``task_id`` is handler parity."""
+    """
+    List all available skills (progressive disclosure tier 1 - minimal metadata).
+
+    Returns only name + description to minimize token usage. Use skill_view() to
+    load full content, tags, related files, etc.
+
+    Args:
+        category: Optional category filter (e.g., "mlops")
+        task_id: Optional task identifier used to probe the active backend
+
+    Returns:
+        JSON string with minimal skill info: name, description, category
+    """
     try:
-        _skills_dir().mkdir(parents=True, exist_ok=True)
-        all_skills = _find_all_skills()
-        try:
+        from agent.skill_utils import get_external_skills_dirs
+
+        active_skills_dir = _skills_dir()
+        candidate_dirs = []
+        if active_skills_dir.exists():
+            candidate_dirs.append(active_skills_dir)
+        candidate_dirs.extend(get_external_skills_dirs())
+        protected_dirs = _protected_skill_search_dirs(task_id, candidate_dirs)
+        if protected_dirs is None and not active_skills_dir.exists():
+            active_skills_dir.mkdir(parents=True, exist_ok=True)
+
+        # Use the same effective catalog as protected prompt construction.
+        all_skills = _effective_skills(
+            task_id=task_id,
+            candidate_dirs=candidate_dirs,
+        )
+        if not task_id:
             from hermes_cli.plugins import discover_plugins, get_plugin_manager
+
             discover_plugins()
-            for plugin_skill in get_plugin_manager().list_plugin_skill_metadata():
-                frontmatter = plugin_skill.pop("frontmatter", {})
-                if not skill_matches_platform(frontmatter) or _is_skill_disabled(plugin_skill["name"]):
-                    continue
-                all_skills.append(plugin_skill)
-        except Exception:
-            logger.debug("Plugin skill listing failed", exc_info=True)
+            seen_names = {skill["name"] for skill in all_skills}
+            all_skills.extend(
+                skill
+                for skill in get_plugin_manager().list_plugin_skill_metadata()
+                if skill["name"] not in seen_names
+            )
+
         if not all_skills:
-            return _json({"success": True, "skills": [], "categories": [],
-                          "message": "No skills found in skills/ directory."})
+            return json.dumps(
+                {
+                    "success": True,
+                    "skills": [],
+                    "categories": [],
+                    "message": "No skills found in skills/ directory.",
+                },
+                ensure_ascii=False,
+            )
+
+        # Filter by category if specified
         if category:
             all_skills = [s for s in all_skills if s.get("category") == category]
+
+        all_skills = [
+            {key: value for key, value in skill.items() if key != "conditions"}
+            for skill in all_skills
+        ]
+
+        # Sort by category then name
         all_skills = _sort_skills(all_skills)
-        categories = sorted({s.get("category") for s in all_skills if s.get("category")})
-        return _json({
-            "success": True, "skills": all_skills, "categories": categories,
-            "count": len(all_skills),
-            "hint": "Use skill_view(name) to see full content, tags, and linked files"})
+
+        # Extract unique categories
+        categories = sorted(
+            {s.get("category") for s in all_skills if s.get("category")}
+        )
+
+        return json.dumps(
+            {
+                "success": True,
+                "skills": all_skills,
+                "categories": categories,
+                "count": len(all_skills),
+                "hint": "Use skill_view(name) to see full content, tags, and linked files",
+            },
+            ensure_ascii=False,
+        )
+
     except Exception as e:
         return tool_error(str(e), success=False)
 
@@ -571,54 +760,679 @@ def _log_security_warnings(name: str, skill_md: Path, content: str, all_dirs, ac
 
 
 def skill_view(
-    name: str, file_path: str = None, task_id: str = None, preprocess: bool = True) -> str:
-    """View a skill (SKILL.md) or a file within its directory, as JSON. ``name`` is a skill name
-    or path ("axolotl", "03-fine-tuning/axolotl"); "plugin:skill" resolves plugin-provided
-    skills. ``preprocess`` applies the configured SKILL.md template / inline shell rendering;
-    slash/preload callers render the message themselves."""
+    name: str,
+    file_path: str = None,
+    task_id: str = None,
+    preprocess: bool = True,
+    _viewability_probe: bool = False,
+) -> str:
+    """
+    View the content of a skill or a specific file within a skill directory.
+
+    Args:
+        name: Name or path of the skill (e.g., "axolotl" or "03-fine-tuning/axolotl").
+            Qualified names like "plugin:skill" resolve to plugin-provided skills.
+        file_path: Optional path to a specific file within the skill (e.g., "references/api.md")
+        task_id: Optional task identifier used to probe the active backend
+        preprocess: Apply configured SKILL.md template and inline shell rendering
+            to main skill content. Internal slash/preload callers disable this
+            because they render the skill message themselves.
+
+    Returns:
+        JSON string with skill content or error message
+    """
     try:
-        # Validate before the ':' dispatch so a Windows drive path (C:\skills\foo) can't be
-        # reinterpreted as a plugin namespace.
-        if lookup_error := _skill_lookup_path_error(name):
-            return _fail(lookup_error, hint=_LOOKUP_HINT)
+        # Validate before the ':' qualified-name dispatch so a Windows drive
+        # path (e.g. C:\skills\foo) can't be reinterpreted as a plugin
+        # namespace, and so a traversal/absolute name never reaches the
+        # search-dir join that builds direct_path below.
+        lookup_error = _skill_lookup_path_error(name)
+        if lookup_error:
+            return json.dumps(
+                {
+                    "success": False,
+                    "error": lookup_error,
+                    "hint": "Use a skill name or relative path within the skills directory.",
+                },
+                ensure_ascii=False,
+            )
+
         local_category_name: str | None = None
-        if ":" in name:  # plugin registry; bare names use the flat-tree scan below
-            served, local_category_name = _resolve_plugin_skill(name, file_path, task_id, preprocess)
-            if served is not None:
-                return served
-        # The fall-through form (namespace/bare) joins onto each search dir too; re-validate it
-        # since `bare` is not namespace-checked.
-        if local_category_name and (lookup_error := _skill_lookup_path_error(local_category_name)):
-            return _fail(lookup_error, hint=_LOOKUP_HINT)
-        project_dirs, all_dirs, active_skills_dir = _skill_search_dirs()
-        error, skill_dir, skill_md = _locate_skill(
-            name, local_category_name, project_dirs, all_dirs)
-        if error is not None:
-            return error
-        try:  # read once — reused for platform check and main content
-            content = _read_skill_text(skill_md)
+        protected_call = _protected_skill_search_dirs(task_id, []) is not None
+        if protected_call:
+            # Protected runs may read authorized skill resources, but must not
+            # turn skill preprocessing into host-side command execution.
+            preprocess = False
+        if protected_call and ":" in name:
+            from agent.skill_utils import is_valid_namespace, parse_qualified_name
+
+            namespace, bare = parse_qualified_name(name)
+            if not is_valid_namespace(namespace):
+                return json.dumps(
+                    {
+                        "success": False,
+                        "error": f"Invalid namespace '{namespace}' in '{name}'.",
+                    },
+                    ensure_ascii=False,
+                )
+            local_category_name = f"{namespace}/{bare}"
+            name = local_category_name
+
+        # ── Qualified name dispatch (plugin skills) ──────────────────
+        # Names containing ':' are routed to the plugin skill registry.
+        # Bare names fall through to the existing flat-tree scan below.
+        if ":" in name:
+            from agent.skill_utils import is_valid_namespace, parse_qualified_name
+            from hermes_cli.plugins import discover_plugins, get_plugin_manager
+
+            namespace, bare = parse_qualified_name(name)
+            if not is_valid_namespace(namespace):
+                return json.dumps(
+                    {
+                        "success": False,
+                        "error": (
+                            f"Invalid namespace '{namespace}' in '{name}'. "
+                            f"Namespaces must match [a-zA-Z0-9_-]+."
+                        ),
+                    },
+                    ensure_ascii=False,
+                )
+
+            discover_plugins()  # idempotent
+            pm = get_plugin_manager()
+            active_memory_provider = None
+            try:
+                from plugins.memory import (
+                    _get_active_memory_provider,
+                    _prune_inactive_memory_provider_skills,
+                )
+
+                active_memory_provider = _get_active_memory_provider()
+                _prune_inactive_memory_provider_skills(active_memory_provider)
+            except Exception as exc:
+                logger.debug(
+                    "Failed pruning inactive memory-provider skills: %s",
+                    exc,
+                )
+
+            plugin_skill_md = pm.find_plugin_skill(name)
+
+            # Memory provider plugins are loaded through plugins.memory rather
+            # than the general PluginManager. If a memory provider shim also
+            # registers skills, load the namespaced provider once so its
+            # collector can forward those skills into the plugin skill registry
+            # before declaring the qualified skill missing.
+            if plugin_skill_md is None:
+                try:
+                    from plugins.memory import load_memory_provider
+
+                    if namespace == active_memory_provider:
+                        load_memory_provider(namespace)
+                        plugin_skill_md = pm.find_plugin_skill(name)
+                except Exception as exc:
+                    logger.debug(
+                        "Failed lazy memory-provider skill load for %s: %s",
+                        namespace,
+                        exc,
+                    )
+
+            if plugin_skill_md is not None:
+                if _protected_skill_path_allowed(task_id, plugin_skill_md) is False:
+                    return json.dumps(
+                        {
+                            "success": False,
+                            "error": (
+                                f"Skill '{name}' is outside this protected attempt's "
+                                "filesystem grants."
+                            ),
+                        },
+                        ensure_ascii=False,
+                    )
+                if not plugin_skill_md.exists():
+                    # Stale registry entry — file deleted out of band
+                    pm.remove_plugin_skill(name)
+                    return json.dumps(
+                        {
+                            "success": False,
+                            "error": (
+                                f"Skill '{name}' file no longer exists at "
+                                f"{plugin_skill_md}. The registry entry has "
+                                f"been cleaned up — try again after the "
+                                f"plugin is reloaded."
+                            ),
+                        },
+                        ensure_ascii=False,
+                    )
+                return _serve_plugin_skill(
+                    plugin_skill_md,
+                    namespace,
+                    bare,
+                    file_path=file_path,
+                    preprocess=preprocess,
+                    session_id=task_id,
+                )
+
+            # Plugin exists but this specific skill is missing?
+            available = pm.list_plugin_skills(namespace)
+            if available:
+                return json.dumps(
+                    {
+                        "success": False,
+                        "error": f"Skill '{bare}' not found in plugin '{namespace}'.",
+                        "available_skills": [f"{namespace}:{s}" for s in available],
+                        "hint": f"The '{namespace}' plugin provides {len(available)} skill(s).",
+                    },
+                    ensure_ascii=False,
+                )
+            # Plugin itself not found — fall through to flat-tree scan.
+            # Categorized local skills also use `category:skill` in config and
+            # gateway prompts, so preserve that form and translate it to the
+            # on-disk `category/skill` path during the local scan below.
+            if bare:
+                local_category_name = f"{namespace}/{bare}"
+
+        from agent.skill_utils import get_external_skills_dirs, get_project_skills_dirs
+
+        # The categorized fall-through form (namespace/bare) joins onto each
+        # search dir too; re-validate it since `bare` is not namespace-checked.
+        if local_category_name:
+            lookup_error = _skill_lookup_path_error(local_category_name)
+            if lookup_error:
+                return json.dumps(
+                    {
+                        "success": False,
+                        "error": lookup_error,
+                        "hint": "Use a skill name or relative path within the skills directory.",
+                    },
+                    ensure_ascii=False,
+                )
+
+        # Build list of all skill directories to search. Project dirs first —
+        # they're the highest-precedence tier and the collision resolver
+        # below uses this ordering.
+        project_dirs = get_project_skills_dirs()
+        all_dirs = list(project_dirs)
+        active_skills_dir = _skills_dir()
+        if active_skills_dir.exists():
+            all_dirs.append(active_skills_dir)
+        all_dirs.extend(get_external_skills_dirs())
+        protected_dirs = _protected_skill_search_dirs(task_id, all_dirs)
+        if protected_dirs is not None:
+            all_dirs = protected_dirs
+
+        if not all_dirs:
+            return json.dumps(
+                {
+                    "success": False,
+                    "error": "Skills directory does not exist yet. It will be created on first install.",
+                },
+                ensure_ascii=False,
+            )
+
+        skill_dir = None
+        skill_md = None
+
+        # Collision detection: collect ALL candidates across every dir using
+        # every lookup strategy (direct path, recursive by parent dir name,
+        # legacy flat <name>.md). If more than one matches, refuse and tell
+        # the caller — silent shadowing of a local skill by a same-named
+        # external skill is a real bug class (`/skills` shows one, agent
+        # loaded the other) so we surface it loudly instead of guessing.
+        from agent.skill_utils import iter_skill_index_files
+
+        candidates: List[Tuple[Optional[Path], Path]] = []  # (skill_dir, skill_md)
+        seen_md: set = set()
+
+        def _record(sd: Optional[Path], smd: Path) -> None:
+            if (
+                protected_dirs is not None
+                and _protected_skill_path_allowed(task_id, smd) is not True
+            ):
+                return
+            try:
+                key = smd.resolve()
+            except Exception:
+                key = smd
+            if key in seen_md:
+                return
+            seen_md.add(key)
+            candidates.append((sd, smd))
+
+        for search_dir in all_dirs:
+            # Strategy 1: direct path (e.g., "mlops/axolotl" or bare "axolotl"
+            # at the top of the dir).
+            direct_path = search_dir / name
+            if (
+                not _is_skill_support_path(direct_path)
+                and direct_path.is_dir()
+                and (direct_path / "SKILL.md").exists()
+            ):
+                _record(direct_path, direct_path / "SKILL.md")
+            elif direct_path.with_suffix(".md").exists() and not _is_skill_support_path(
+                direct_path.with_suffix(".md")
+            ) and not _is_package_owned_markdown(
+                direct_path.with_suffix(".md"), search_dir
+            ):
+                _record(None, direct_path.with_suffix(".md"))
+
+            # Strategy 1b: categorized form for plugin namespace fall-through
+            # (e.g., a "myplugin:explore" name with no plugin registered also
+            # tries the on-disk path "myplugin/explore").
+            if local_category_name:
+                categorized_path = search_dir / local_category_name
+                if (
+                    not _is_skill_support_path(categorized_path)
+                    and categorized_path.is_dir()
+                    and (categorized_path / "SKILL.md").exists()
+                ):
+                    _record(categorized_path, categorized_path / "SKILL.md")
+                elif categorized_path.with_suffix(
+                    ".md"
+                ).exists() and not _is_skill_support_path(
+                    categorized_path.with_suffix(".md")
+                ) and not _is_package_owned_markdown(
+                    categorized_path.with_suffix(".md"), search_dir
+                ):
+                    _record(None, categorized_path.with_suffix(".md"))
+
+            # Strategy 2: recursive by directory name (catches nested skills
+            # like "foundations/runtime/explore-codebase" called by bare name),
+            # plus frontmatter `name:` lookup. `skills_list()` exposes the
+            # frontmatter name, so `skill_view(name)` must accept it too even
+            # when the on-disk directory is a shorter category/alias.
+            for found_skill_md in iter_skill_index_files(search_dir, "SKILL.md"):
+                if (
+                    protected_dirs is not None
+                    and _protected_skill_path_allowed(task_id, found_skill_md) is not True
+                ):
+                    continue
+                if found_skill_md.parent.name == name:
+                    _record(found_skill_md.parent, found_skill_md)
+                    continue
+                try:
+                    fm_content = found_skill_md.read_text(encoding="utf-8-sig", errors="replace")
+                    fm, _ = _parse_frontmatter(fm_content)
+                except Exception:
+                    fm = {}
+                if fm.get("name") == name:
+                    _record(found_skill_md.parent, found_skill_md)
+
+            # Strategy 3: legacy flat <name>.md files anywhere under the dir.
+            # Exclude skill support docs: references/templates/assets/scripts
+            # are loaded through skill_view(skill, file_path=...) and must not
+            # shadow or collide with real skills that share the same basename.
+            for found_md in search_dir.rglob(f"{name}.md"):
+                if found_md.name != "SKILL.md" and not _is_skill_support_path(
+                    found_md
+                ) and not _is_package_owned_markdown(found_md, search_dir):
+                    _record(None, found_md)
+
+        if len(candidates) > 1 and project_dirs:
+            # Cross-tier collision resolution: a project skill intentionally
+            # overrides a same-named local/external skill, so when at least
+            # one candidate lives under a trusted project dir, narrow to
+            # those. Ambiguity WITHIN the project tier still refuses below.
+            def _in_project(smd: Path) -> bool:
+                try:
+                    resolved = smd.resolve()
+                except Exception:
+                    resolved = smd
+                for pd in project_dirs:
+                    try:
+                        resolved.relative_to(pd)
+                        return True
+                    except ValueError:
+                        continue
+                return False
+
+            project_candidates = [
+                (sd, smd) for sd, smd in candidates if _in_project(smd)
+            ]
+            if project_candidates:
+                candidates = project_candidates
+
+        if len(candidates) > 1:
+            roots = {_owning_search_dir(smd, all_dirs) for _sd, smd in candidates}
+            if len(roots) == 1 and None not in roots and _provably_same_skill(candidates):
+                root = roots.pop()
+                ranked = sorted(candidates, key=lambda c: _rank_same_root_candidate(c, root))
+                if _rank_same_root_candidate(ranked[0], root) != _rank_same_root_candidate(ranked[1], root):
+                    candidates = [ranked[0]]
+
+        if len(candidates) > 1:
+            paths = [str(smd) for _, smd in candidates]
+            logging.getLogger(__name__).warning(
+                "Skill name collision for '%s': %d candidates — %s",
+                name, len(candidates), "; ".join(paths),
+            )
+            return json.dumps(
+                {
+                    "success": False,
+                    "error": (
+                        f"Ambiguous skill name '{name}': {len(candidates)} skills "
+                        "match across your local skills dir and external_dirs. "
+                        "Refusing to guess — load one explicitly by its categorized path."
+                    ),
+                    "matches": paths,
+                    "hint": (
+                        "Pass the full relative path instead of the bare name "
+                        "(e.g., 'category/skill-name'), or rename one of the "
+                        "colliding skills so each name is unique."
+                    ),
+                },
+                ensure_ascii=False,
+            )
+
+        if candidates:
+            skill_dir, skill_md = candidates[0]
+
+        # Quarantine gate: a project-tier skill with a dangerous scan verdict
+        # must not load even by explicit name (same chokepoint the index and
+        # skills_list use — see agent.skill_utils.iter_project_skill_files).
+        if skill_md is not None and project_dirs:
+            from agent.skill_utils import is_quarantined_project_skill
+
+            def _under_project(p: Path) -> bool:
+                try:
+                    rp = p.resolve()
+                except Exception:
+                    rp = p
+                for pd in project_dirs:
+                    try:
+                        rp.relative_to(pd)
+                        return True
+                    except ValueError:
+                        continue
+                return False
+
+            if _under_project(skill_md) and is_quarantined_project_skill(skill_md):
+                return json.dumps(
+                    {
+                        "success": False,
+                        "error": (
+                            f"Project skill '{name}' is quarantined: the security "
+                            "scan flagged its content as dangerous. It will not "
+                            "load until the repo's skill content changes and "
+                            "passes a re-scan."
+                        ),
+                        "hint": (
+                            "Inspect the skill in the repo checkout, or untrust "
+                            "the repo with `hermes skills untrust`."
+                        ),
+                    },
+                    ensure_ascii=False,
+                )
+
+        if not skill_md or not skill_md.exists():
+            available = [
+                s["name"]
+                for s in _sort_skills(
+                    _find_all_skills(
+                        search_dirs=protected_dirs,
+                        task_id=task_id if protected_dirs is not None else None,
+                    )
+                )[:20]
+            ]
+            return json.dumps(
+                {
+                    "success": False,
+                    "error": f"Skill '{name}' not found.",
+                    "available_skills": available,
+                    "hint": "Use skills_list to see all available skills",
+                },
+                ensure_ascii=False,
+            )
+
+        # Read the file once — reused for platform check and main content below
+        if (
+            protected_dirs is not None
+            and _protected_skill_path_allowed(task_id, skill_md) is not True
+        ):
+            return json.dumps(
+                {
+                    "success": False,
+                    "error": (
+                        f"Skill '{name}' is outside this protected attempt's "
+                        "filesystem grants."
+                    ),
+                },
+                ensure_ascii=False,
+            )
+        try:
+            content = skill_md.read_text(encoding="utf-8-sig", errors="replace")
         except Exception as e:
-            return _fail(f"Failed to read skill '{name}': {e}")
-        _log_security_warnings(name, skill_md, content, all_dirs, active_skills_dir)
-        frontmatter = _safe_frontmatter(content=content)
-        if not skill_matches_platform(frontmatter):
-            return _fail(f"Skill '{name}' is not supported on this platform.", readiness_status=SkillReadinessStatus.UNSUPPORTED.value)
-        resolved_name = frontmatter.get("name", skill_md.parent.name)
+            return json.dumps(
+                {
+                    "success": False,
+                    "error": f"Failed to read skill '{name}': {e}",
+                },
+                ensure_ascii=False,
+            )
+
+        # Security: warn if skill is loaded from outside trusted directories
+        # (project dirs + local skills dir + configured external_dirs — i.e.
+        # everything in all_dirs — are trusted)
+        _outside_skills_dir = True
+        try:
+            _trusted_dirs = [directory.resolve() for directory in all_dirs]
+        except Exception:
+            _trusted_dirs = []
+        for _td in _trusted_dirs:
+            try:
+                skill_md.resolve().relative_to(_td)
+                _outside_skills_dir = False
+                break
+            except ValueError:
+                continue
+
+        # Security: detect common prompt injection patterns
+        # (pattern list at module level as _INJECTION_PATTERNS)
+        _content_lower = content.lower()
+        _injection_detected = any(p in _content_lower for p in _INJECTION_PATTERNS)
+
+        if _outside_skills_dir or _injection_detected:
+            _warnings = []
+            if _outside_skills_dir:
+                _warnings.append(f"skill file is outside the trusted skills directory (~/.hermes/skills/): {skill_md}")
+            if _injection_detected:
+                _warnings.append("skill content contains patterns that may indicate prompt injection")
+            logging.getLogger(__name__).warning("Skill security warning for '%s': %s", name, "; ".join(_warnings))
+
+        parsed_frontmatter: Dict[str, Any] = {}
+        try:
+            parsed_frontmatter, _ = _parse_frontmatter(content)
+        except Exception:
+            parsed_frontmatter = {}
+
+        if not skill_matches_platform(parsed_frontmatter):
+            return json.dumps(
+                {
+                    "success": False,
+                    "error": f"Skill '{name}' is not supported on this platform.",
+                    "readiness_status": SkillReadinessStatus.UNSUPPORTED.value,
+                },
+                ensure_ascii=False,
+            )
+
+        # Check if the skill is disabled by the user
+        resolved_name = parsed_frontmatter.get("name", skill_md.parent.name)
         if _is_skill_disabled(resolved_name):
-            return _fail(f"Skill '{resolved_name}' is disabled. Enable it with `hermes skills` or inspect the files directly on disk.")
+            return json.dumps(
+                {
+                    "success": False,
+                    "error": (
+                        f"Skill '{resolved_name}' is disabled. "
+                        "Enable it with `hermes skills` or inspect the files directly on disk."
+                    ),
+                },
+                ensure_ascii=False,
+            )
+
+        if _viewability_probe:
+            return json.dumps(
+                {"success": True, "name": resolved_name},
+                ensure_ascii=False,
+            )
+
+        # If a specific file path is requested, read that instead
         if file_path and skill_dir:
-            return _serve_skill_file(
-                skill_dir, file_path, name, list_available=True, mark_read=True,
-                hint="Use a relative path within the skill directory")
-        # tags/related_skills: metadata.hermes.* (agentskills.io) first, then top-level.
+            from tools.path_security import validate_within_dir, has_traversal_component
+
+            # Security: Prevent path traversal attacks
+            if has_traversal_component(file_path):
+                return json.dumps(
+                    {
+                        "success": False,
+                        "error": "Path traversal ('..') is not allowed.",
+                        "hint": "Use a relative path within the skill directory",
+                    },
+                    ensure_ascii=False,
+                )
+
+            target_file = skill_dir / file_path
+
+            # Security: Verify resolved path is still within skill directory
+            traversal_error = validate_within_dir(target_file, skill_dir)
+            if traversal_error:
+                return json.dumps(
+                    {
+                        "success": False,
+                        "error": traversal_error,
+                        "hint": "Use a relative path within the skill directory",
+                    },
+                    ensure_ascii=False,
+                )
+            if (
+                protected_dirs is not None
+                and _protected_skill_path_allowed(task_id, target_file) is not True
+            ):
+                return json.dumps(
+                    {
+                        "success": False,
+                        "error": (
+                            f"File '{file_path}' is outside this protected attempt's "
+                            "filesystem grants."
+                        ),
+                    },
+                    ensure_ascii=False,
+                )
+            if not target_file.is_file():
+                # List available files in the skill directory, organized by type
+                available_files = {
+                    "references": [],
+                    "templates": [],
+                    "assets": [],
+                    "scripts": [],
+                    "other": [],
+                }
+
+                # Scan for all readable files
+                for f in skill_dir.rglob("*"):
+                    if f.is_file() and f.name != "SKILL.md":
+                        rel = str(f.relative_to(skill_dir))
+                        if rel.startswith("references/"):
+                            available_files["references"].append(rel)
+                        elif rel.startswith("templates/"):
+                            available_files["templates"].append(rel)
+                        elif rel.startswith("assets/"):
+                            available_files["assets"].append(rel)
+                        elif rel.startswith("scripts/"):
+                            available_files["scripts"].append(rel)
+                        elif f.suffix in {
+                            ".md",
+                            ".py",
+                            ".yaml",
+                            ".yml",
+                            ".json",
+                            ".tex",
+                            ".sh",
+                        }:
+                            available_files["other"].append(rel)
+
+                # Remove empty categories
+                available_files = {k: v for k, v in available_files.items() if v}
+
+                return json.dumps(
+                    {
+                        "success": False,
+                        "error": f"File '{file_path}' not found in skill '{name}'.",
+                        "available_files": available_files,
+                        "hint": "Use one of the available file paths listed above",
+                    },
+                    ensure_ascii=False,
+                )
+
+            # Read the file content
+            try:
+                content = target_file.read_text(encoding="utf-8-sig", errors="replace")
+            except UnicodeDecodeError:
+                # Binary file - return info about it instead
+                return json.dumps(
+                    {
+                        "success": True,
+                        "name": name,
+                        "file": file_path,
+                        "content": f"[Binary file: {target_file.name}, size: {target_file.stat().st_size} bytes]",
+                        "is_binary": True,
+                    },
+                    ensure_ascii=False,
+                )
+
+            _mark_background_review_read(target_file)
+
+            return json.dumps(
+                {
+                    "success": True,
+                    "name": name,
+                    "file": file_path,
+                    "content": content,
+                    "file_type": target_file.suffix,
+                    # Internal: absolute source path for the repeat-view dedup
+                    # fingerprint (mtime+size change detection).
+                    "_source_path": str(target_file),
+                },
+                ensure_ascii=False,
+            )
+
+        # Reuse the parse from the platform check above
+        frontmatter = parsed_frontmatter
+
+        # Discover linked files with per-scan protected authority validation.
+        linked_files = {}
+        if skill_dir:
+            linked_scope_valid, linked_files = _discover_skill_linked_files(
+                skill_dir,
+                task_id=task_id,
+                protected=protected_dirs is not None,
+            )
+            if not linked_scope_valid:
+                return json.dumps(
+                    {
+                        "success": False,
+                        "error": (
+                            f"Skill '{name}' changed outside this protected attempt's "
+                            "filesystem authority during access."
+                        ),
+                    },
+                    ensure_ascii=False,
+                )
+        # Check metadata.hermes.* first (agentskills.io convention), fall back to top-level
+        hermes_meta = {}
         metadata = frontmatter.get("metadata")
-        hermes_meta = (metadata.get("hermes", {}) or {}) if isinstance(metadata, dict) else {}
-        tags, related_skills = (
-            _parse_tags(hermes_meta.get(k) or frontmatter.get(k, "")) for k in ("tags", "related_skills"))
-        linked_files = _skill_linked_files(skill_dir)
+        if isinstance(metadata, dict):
+            hermes_meta = metadata.get("hermes", {}) or {}
+
+        tags = _parse_tags(hermes_meta.get("tags") or frontmatter.get("tags", ""))
+        related_skills = _parse_tags(
+            hermes_meta.get("related_skills") or frontmatter.get("related_skills", "")
+        )
+
+        # linked_files was built by the bounded discovery helper above.
+
         try:
             rel_path = str(skill_md.relative_to(active_skills_dir))
-        except ValueError:  # external skill — relative to its own parent dir
+        except ValueError:
+            # External skill — use path relative to the skill's own parent dir
             rel_path = str(skill_md.relative_to(skill_md.parent.parent)) if skill_md.parent.parent else skill_md.name
         skill_name = frontmatter.get("name", skill_md.stem if not skill_dir else skill_dir.name)
         readiness, readiness_extras = _skill_readiness(frontmatter, skill_name)
@@ -751,3 +1565,195 @@ def _skill_view_with_bump(args, **kw):
 registry.register(
     name="skill_view", toolset="skills", schema=SKILL_VIEW_SCHEMA, handler=_skill_view_with_bump,
     check_fn=check_skills_requirements, emoji="📚")
+
+
+def _protected_skill_path_allowed(task_id: str | None, path: Path) -> bool | None:
+    """Return None for ordinary calls, otherwise whether skill tools may read path."""
+
+    authority = _protected_skill_authority(task_id)
+    if authority is None:
+        return None
+    if authority is False:
+        return False
+    backing_registry = getattr(authority, "backing_registry", None)
+    if backing_registry is None:
+        return False
+    try:
+        candidate = path.resolve(strict=True)
+    except OSError:
+        return False
+    for grant in authority.invocation_scope.visible_objects:
+        if grant.backing.kind != "host_path":
+            continue
+        record = backing_registry.get(grant.backing.object_id)
+        if (
+            record is None
+            or not record.exists
+            or record.root_symlink
+            or record.backing != grant.backing
+            or record.object_type != grant.object_type
+        ):
+            continue
+        root = Path(record.backing.identity)
+        if (
+            candidate == root
+            or (grant.object_type == "directory" and root in candidate.parents)
+        ):
+            # Re-check after candidate resolution. Trusted host records pin and
+            # verify the object device/inode on every registry lookup.
+            return backing_registry.get(grant.backing.object_id) == record
+
+    scope = authority.invocation_scope
+    skill_name = _trusted_skill_name_for_path(candidate)
+    if skill_name is None:
+        return False
+    if bool(getattr(scope, "all_skills", False)):
+        return True
+    return skill_name in frozenset(getattr(scope, "skill_names", ()))
+
+
+def _protected_skill_search_dirs(
+    task_id: str | None,
+    candidates: List[Path],
+) -> List[Path] | None:
+    if not task_id:
+        return None
+    authority = _protected_skill_authority(task_id)
+    if authority is None:
+        return None
+    if authority is False:
+        return []
+    # Candidate roots are trusted host configuration. Authorization is applied
+    # to each discovered SKILL.md/path, which supports both selected skills and
+    # exact-file visible-object grants without revealing the whole root.
+    return list(candidates)
+
+
+def _discover_skill_linked_files(
+    skill_dir: Path,
+    *,
+    task_id: str | None,
+    protected: bool,
+) -> tuple[bool, Dict[str, List[str]]]:
+    """Discover linked files, revalidating protected authority around scans."""
+
+    directory_authorized = True
+    if protected:
+        directory_authorized = (
+            _protected_skill_path_allowed(task_id, skill_dir) is True
+        )
+        if not directory_authorized:
+            # An exact visible-object grant for SKILL.md authorizes the skill
+            # document itself, but must not imply access to sibling resources.
+            if _protected_skill_path_allowed(task_id, skill_dir / "SKILL.md") is True:
+                return True, {}
+            return False, {}
+
+    linked: Dict[str, List[str]] = {}
+    specs = (
+        ("references", ("*.md",), False),
+        ("templates", ("*.md", "*.py", "*.yaml", "*.yml", "*.json", "*.tex", "*.sh"), True),
+        ("assets", ("*",), True),
+        ("scripts", ("*.py", "*.sh", "*.bash", "*.js", "*.ts", "*.rb"), False),
+    )
+    for directory_name, patterns, recursive in specs:
+        directory = skill_dir / directory_name
+        if protected:
+            if _protected_skill_path_allowed(task_id, directory) is not True:
+                continue
+        elif not directory.exists():
+            continue
+
+        files: List[str] = []
+        for pattern in patterns:
+            iterator = directory.rglob(pattern) if recursive else directory.glob(pattern)
+            for candidate in iterator:
+                if directory_name == "assets" and not candidate.is_file():
+                    continue
+                if (
+                    protected
+                    and _protected_skill_path_allowed(task_id, candidate) is not True
+                ):
+                    continue
+                files.append(str(candidate.relative_to(skill_dir)))
+        if files:
+            linked[directory_name] = files
+        if protected and _protected_skill_path_allowed(task_id, skill_dir) is not True:
+            return False, {}
+
+    if protected and _protected_skill_path_allowed(task_id, skill_dir) is not True:
+        return False, {}
+    return True, linked
+
+
+def _protected_skill_authority(task_id: str | None):
+    """Return None for ordinary calls, otherwise the active attempt authority."""
+
+    if not task_id:
+        return None
+    from tools.delegation_scope import attempt_scope_registry
+
+    authority = attempt_scope_registry.get(task_id)
+    if authority is None:
+        return None
+    if getattr(authority, "state", None) not in {"starting", "active"}:
+        return False
+    return authority
+
+
+def _trusted_skill_name_for_path(path: Path) -> str | None:
+    """Return the owning active-profile skill name for a trusted skill path."""
+
+    from agent.skill_utils import get_external_skills_dirs
+
+    try:
+        candidate = path.resolve(strict=True)
+    except OSError:
+        return None
+
+    roots = [_skills_dir(), *get_external_skills_dirs()]
+    for root in roots:
+        try:
+            resolved_root = root.resolve(strict=True)
+        except OSError:
+            continue
+        if candidate != resolved_root and resolved_root not in candidate.parents:
+            continue
+
+        current = candidate if candidate.is_dir() else candidate.parent
+        while current == resolved_root or resolved_root in current.parents:
+            skill_md = current / "SKILL.md"
+            if skill_md.is_file():
+                try:
+                    frontmatter, _ = _parse_frontmatter(
+                        skill_md.read_text(encoding="utf-8")[:4000]
+                    )
+                except Exception:
+                    return None
+                return str(frontmatter.get("name") or current.name)[:MAX_NAME_LENGTH]
+            if current == resolved_root:
+                break
+            current = current.parent
+    return None
+
+
+def _effective_skills(
+    *,
+    task_id: str | None = None,
+    candidate_dirs: List[Path] | None = None,
+) -> List[Dict[str, Any]]:
+    """Return the catalog authorized for one ordinary or protected caller."""
+
+    if candidate_dirs is None:
+        from agent.skill_utils import get_external_skills_dirs
+
+        candidate_dirs = []
+        active_skills_dir = _skills_dir()
+        if active_skills_dir.exists():
+            candidate_dirs.append(active_skills_dir)
+        candidate_dirs.extend(get_external_skills_dirs())
+    protected_dirs = _protected_skill_search_dirs(task_id, candidate_dirs)
+    return _find_all_skills(
+        search_dirs=protected_dirs,
+        task_id=task_id if protected_dirs is not None else None,
+    )

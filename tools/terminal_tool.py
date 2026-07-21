@@ -41,14 +41,16 @@ def _redact_terminal_error_text(value: Any) -> str:
 from tools.registry import tool_error
 from tools.terminal_tool_lifecycle import (
     _check_disk_usage_warning, _cleanup_inactive_envs, _create_configured_env,
-    _evict_environment_for_task, cleanup_all_environments, ensure_task_env,
+    _evict_environment_for_task, cleanup_all_environments, ensure_task_env, cleanup_vm, get_active_env,
 )
 from tools.terminal_tool_config import (
+    _CONTAINER_BACKENDS,
     _is_container_backend, _is_host_cwd, _is_mounted_host_cwd, _is_unusable_container_cwd,
     _is_windows_drive_path, _parse_env_var, _plugin_env_flag, _quiet, _safe_getcwd, _tenv, _tenv_bool,
     coerce_ssh_remote_cwd, translate_mounted_host_path,
 )
 from tools.terminal_tool_backends import (
+    _create_environment,
     _REQUIREMENT_CHECKERS, _VERCEL_SANDBOX_DEFAULT_CWD, _check_plugin_requirements,
     _record_unavailable_reason, terminal_backend_unavailable_reason,  # noqa: F401 — re-exported
 )
@@ -500,6 +502,11 @@ def _resolve_container_task_id(task_id: Optional[str]) -> str:
        keys its own home (``profile:<name>`` under persistent Docker, matching branch 3);
        else ``"default"``, which subagent ids collapse onto to share the parent's container.
     """
+    from tools.delegation_scope import attempt_scope_registry
+    if task_id and attempt_scope_registry.get(task_id) is not None:
+        return task_id
+    if task_id and (_task_env_overrides.get(_qualify_task_key(task_id)) or {}).get("delegation_scope_id"):
+        return task_id
     if task_id and _has_isolation_overrides(task_id):
         return _qualify_task_key(task_id)
     scope = _session_scope()
@@ -1186,7 +1193,21 @@ def _acquire_env(plan: _ExecPlan, task_id: Optional[str]) -> Any:
     of each creating their own; the cache is re-checked under that lock.
     Raises :class:`_Rejected` with the ``"disabled"`` envelope when creation
     raises ImportError.
+
+    A protected delegation attempt's own commands use its hardened environment
+    (:func:`acquire_protected_environment`); host-local control-plane commands never do.
     """
+    if not plan.effective_task_id.startswith("host-local-"):
+        try:
+            protected = acquire_protected_environment(task_id, timeout=plan.effective_timeout)
+        except ImportError as e:
+            raise _Rejected(_error_json(
+                _redact_terminal_error_text(f"Terminal tool disabled: environment creation failed ({e})"),
+                status="disabled",
+            ))
+        if protected is not None:
+            env, plan.env_type, plan.effective_task_id = protected
+            return env
     _start_cleanup_thread()
     env_type, eff = plan.env_type, plan.effective_task_id
 
@@ -1268,6 +1289,7 @@ def _run_foreground(
             # internal env.execute() consumers stay unbounded.
             result = env.execute(
                 command, timeout=effective_timeout, cwd=command_cwd, bounded_capture=True,
+                foreground_handoff={"command": command, "task_id": eff, "session_key": session_key, "cwd": command_cwd},
                 **_yield_kwargs(command, env_type=env_type, cwd=command_cwd, effective_task_id=eff,
                                 task_id=task_id, session_key=session_key),
             )
@@ -1288,6 +1310,8 @@ def _run_foreground(
                          max_retries, _safe_command_preview(command), type(e).__name__, e, eff, env_type)
             return _error_json(_redact_terminal_error_text(f"Command execution failed: {type(e).__name__}: {e}"))
 
+    if result.get("foreground_handoff"):
+        return json.dumps({**result, "exit_code": result.get("returncode"), "error": None}, ensure_ascii=False)
     if result.get("yielded_session_id"):  # handed to the background: no exit status yet
         return json.dumps({
             "output": result.get("output", ""), "exit_code": None, "error": None,
@@ -1632,3 +1656,152 @@ registry.register(
     emoji="💻",
     max_result_size_chars=100_000,
 )
+
+def acquire_protected_environment(
+    raw_task_id: Optional[str], *, timeout: Optional[int] = None
+) -> Optional[tuple[Any, str, str]]:
+    """``(env, env_type, effective_task_id)`` for a protected delegation attempt; None for any other task.
+
+    Terminal, file, code-execution and image tools ask this first, so one protected attempt shares a
+    sandbox built only from its frozen execution profile, while ordinary tasks keep their usual
+    acquisition. Raises ``ValueError`` once the attempt's authority, profile or backings no longer hold.
+    """
+    from tools.delegation_scope import attempt_scope_registry, execution_profile_hash
+
+    overrides = resolve_task_overrides(raw_task_id)
+    delegation_scope_id = overrides.get("delegation_scope_id")
+    authority = attempt_scope_registry.get(raw_task_id or "default")
+    if authority is None and delegation_scope_id is None:
+        return None
+    if authority is not None and authority.state not in {"starting", "active"}:
+        raise ValueError(f"protected task environment authority is {authority.state}")
+    if authority is not None and delegation_scope_id is None:
+        raise ValueError("protected task environment scope marker is unavailable")
+    if authority is None or authority.scope_id != delegation_scope_id:
+        raise ValueError("protected task environment authority is unavailable")
+    scope = authority.invocation_scope
+    profile = scope.profile
+    if execution_profile_hash(profile) != scope.profile_hash:
+        raise ValueError("protected execution profile snapshot changed")
+    if overrides.get("env_type") != profile.backend:
+        raise ValueError("protected environment backend override changed")
+    if overrides.get("docker_image") != profile.image:
+        raise ValueError("protected environment image override changed")
+    if overrides.get("cwd") != str(scope.workdir):
+        raise ValueError("protected environment workdir override changed")
+
+    def _validate_backings() -> None:
+        registry = authority.backing_registry
+        for grant in scope.visible_objects:
+            record = registry.get(grant.backing.object_id) if registry is not None else None
+            if (
+                record is None
+                or not record.exists
+                or record.root_symlink
+                or record.object_type != grant.object_type
+                or record.backing != grant.backing
+            ):
+                raise ValueError(f"protected backing object changed: {grant.backing.object_id}")
+
+    _validate_backings()
+    config = _get_env_config()
+    env_type = profile.backend
+    effective_task_id = _resolve_container_task_id(raw_task_id)
+
+    _start_cleanup_thread()
+    with _env_lock:
+        env = _lookup_active_env(effective_task_id, raw_task_id)
+    if env is not None:
+        return env, env_type, effective_task_id
+
+    with _creation_locks_lock:
+        task_lock = _creation_locks.setdefault(effective_task_id, threading.Lock())
+    with task_lock:
+        with _env_lock:
+            env = _lookup_active_env(effective_task_id, raw_task_id)
+        if env is not None:
+            return env, env_type, effective_task_id
+        if profile.network not in {"none", "full"}:
+            raise ValueError("protected execution profile network inheritance was not frozen")
+
+        def _mount_source(grant) -> str:
+            if profile.runtime_identity is None:
+                return grant.backing.identity
+            source = authority.prepared_mount_sources.get(grant.backing.object_id)
+            if not isinstance(source, str) or not source:
+                raise ValueError(f"idmapped reveal is unavailable: {grant.backing.object_id}")
+            return source
+
+        container_config = {
+            "container_cpu": profile.cpu or 0,
+            "container_memory": profile.memory_mb or 0,
+            "container_disk": 0,
+            "container_persistent": False,
+            "docker_network": profile.network == "full",
+            "docker_persist_across_processes": False,
+            "suppress_implicit_mounts": True,
+            "trusted_mounts": [
+                {
+                    "kind": grant.backing.kind,
+                    "source": _mount_source(grant),
+                    "target": str(grant.visible_path),
+                    "mode": grant.mode.value,
+                }
+                for grant in scope.visible_objects
+            ],
+            "shm_mb": profile.shm_mb,
+            "pids_limit": profile.pids_limit,
+            "delegation_scope_id": authority.scope_id,
+            "delegation_attempt_id": authority.attempt_id,
+            "trusted_mounts_validator": _validate_backings,
+        }
+        env = _create_environment(
+            env_type=env_type,
+            image=_select_image(env_type, overrides, config),
+            cwd=str(scope.workdir),
+            timeout=timeout or config["timeout"],
+            ssh_config=None,
+            container_config=container_config,
+            local_config=None,
+            task_id=effective_task_id,
+            host_cwd=config.get("host_cwd"),
+        )
+        with _env_lock:
+            _active_environments[effective_task_id] = env
+            _last_activity[effective_task_id] = time.time()
+        return env, env_type, effective_task_id
+
+
+def _configure_forced_handoff_session(proc_session, session_key: str) -> None:
+    """Route completion for a foreground process that was adopted mid-wait."""
+    from tools.process_registry import process_registry
+    from gateway.session_context import (
+        async_delivery_supported,
+        get_session_env,
+    )
+
+    if not async_delivery_supported():
+        proc_session.notify_on_complete = False
+        return
+    platform = get_session_env("HERMES_SESSION_PLATFORM", "")
+    if not platform:
+        return
+    proc_session.watcher_platform = platform
+    proc_session.watcher_chat_id = get_session_env("HERMES_SESSION_CHAT_ID", "")
+    proc_session.watcher_user_id = get_session_env("HERMES_SESSION_USER_ID", "")
+    proc_session.watcher_user_name = get_session_env("HERMES_SESSION_USER_NAME", "")
+    proc_session.watcher_thread_id = get_session_env("HERMES_SESSION_THREAD_ID", "")
+    proc_session.watcher_message_id = get_session_env("HERMES_SESSION_MESSAGE_ID", "")
+    proc_session.watcher_interval = 5
+    process_registry.pending_watchers.append({
+        "session_id": proc_session.id,
+        "check_interval": 5,
+        "session_key": session_key,
+        "platform": proc_session.watcher_platform,
+        "chat_id": proc_session.watcher_chat_id,
+        "user_id": proc_session.watcher_user_id,
+        "user_name": proc_session.watcher_user_name,
+        "thread_id": proc_session.watcher_thread_id,
+        "message_id": proc_session.watcher_message_id,
+        "notify_on_complete": True,
+    })

@@ -22,12 +22,16 @@ is unsupported (cron), forcing the synchronous fallback.
 from __future__ import annotations
 
 import json
+import pytest
 import threading
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 
 import tools.delegate_tool as dt
+
+
+pytestmark = pytest.mark.usefixtures("admitted_delegate_route")
 
 
 def _mock_response(content="Hello", finish_reason="stop", tool_calls=None):

@@ -30,6 +30,9 @@ from gateway.session_context import (
 )
 
 
+pytestmark = pytest.mark.usefixtures("admitted_delegate_route")
+
+
 # ---------------------------------------------------------------------------
 # Capability helper
 # ---------------------------------------------------------------------------

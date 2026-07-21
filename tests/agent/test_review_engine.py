@@ -22,6 +22,11 @@ from agent.review_engine import (
 from tools import async_delegation as ad
 from tools.process_registry import process_registry
 
+
+pytestmark = pytest.mark.usefixtures("admitted_delegate_route")
+
+
+
 @pytest.fixture(autouse=True)
 def _clean_state():
     ad._reset_for_tests()

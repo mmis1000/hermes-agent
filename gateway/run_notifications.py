@@ -170,6 +170,7 @@ class GatewayNotificationsMixin:
 
         delegation_id: str = ""
         claim_id: str = ""
+        authoritative: bool = False
         proceed: bool = True
         early_result: Optional[bool] = None
 
@@ -1370,6 +1371,8 @@ class GatewayNotificationsMixin:
         """
         evt_type = str(evt.get("type") or "")
         if evt_type == "async_delegation":
+            if evt.get("event_kind") == "fallback":
+                return (evt_type, "fallback", str(evt.get("notification_id") or ""))
             producer_id = str(evt.get("delegation_id") or "")
             if not producer_id:
                 return None
@@ -1378,7 +1381,7 @@ class GatewayNotificationsMixin:
                 # batch's final result as already delivered, nor a sibling's notice.
                 task_idx = ((evt.get("results") or [{}])[0] or {}).get("task_index", "")
                 return (evt_type, producer_id, f"task_failure:{task_idx}")
-            return (evt_type, producer_id, "")
+            return (evt_type, producer_id, str(evt.get("run_id") or ""))
         if evt_type == "completion":
             producer_id = str(evt.get("session_id") or "")
             started_at = evt.get("started_at")
@@ -1445,14 +1448,15 @@ class GatewayNotificationsMixin:
         return "deliver"
 
     @staticmethod
-    def _settle_durable_claim(kind: str, delegation_id: str, claim_id: str) -> None:
+    def _settle_durable_claim(kind: str, delegation_id: str, claim_id: str, run_id=None) -> bool:
         """Best-effort ``drop``/``release`` of a durable completion claim."""
         fn_name, fail_msg = _DURABLE_CLAIM_OPS[kind]
         try:
             import tools.async_delegation as _ad
-            getattr(_ad, fn_name)(delegation_id, claim_id)
+            return bool(getattr(_ad, fn_name)(delegation_id, claim_id, run_id=run_id))
         except Exception:
             logger.log(logging.WARNING if kind == "complete" else logging.DEBUG, fail_msg, exc_info=True)
+            return False
 
     async def _completion_delivery_ready(self, evt: dict) -> bool:
         """Unavailable owners/transports must not spend a durable delivery attempt."""
@@ -1499,13 +1503,14 @@ class GatewayNotificationsMixin:
             return claim
         # An interim per-task notice shares the batch's delegation_id but is not the durable
         # completion; claiming that row here would acknowledge the FINAL result before it exists.
-        if evt_type == "async_delegation" and not evt.get("task_failure_notice"):
+        if evt_type == "async_delegation" and not evt.get("task_failure_notice") and evt.get("event_kind") != "fallback":
             claim.delegation_id = str(evt.get("delegation_id") or "")
             if claim.delegation_id:
                 try:
-                    from tools.async_delegation import claim_completion_delivery
+                    from tools.async_delegation import claim_completion_delivery, get_durable_delegation
+                    claim.authoritative = bool(evt.get("delivery_managed") or get_durable_delegation(claim.delegation_id) is not None)
                     claim.claim_id = f"gateway:{id(self)}:{__import__('uuid').uuid4().hex}"
-                    if not claim_completion_delivery(claim.delegation_id, claim.claim_id):
+                    if not claim_completion_delivery(claim.delegation_id, claim.claim_id, run_id=evt.get("run_id")):
                         claim.proceed = False
                         return claim
                 except Exception as exc:
@@ -1532,7 +1537,7 @@ class GatewayNotificationsMixin:
                     claim.delegation_id or "<legacy>", parent_session_id,
                 )
                 if claim.claim_id:
-                    self._settle_durable_claim("drop", claim.delegation_id, claim.claim_id)
+                    self._settle_durable_claim("drop", claim.delegation_id, claim.claim_id, evt.get("run_id"))
             else:
                 logger.warning(
                     "Background process %s completion targets "
@@ -1544,7 +1549,7 @@ class GatewayNotificationsMixin:
         elif verdict == "retry":
             # Transient uncertainty: tell the watcher to re-poll rather than drop or misroute.
             if claim.claim_id:
-                self._settle_durable_claim("release", claim.delegation_id, claim.claim_id)
+                self._settle_durable_claim("release", claim.delegation_id, claim.claim_id, evt.get("run_id"))
             claim.proceed, claim.early_result = False, False
         return claim
 
@@ -1586,6 +1591,12 @@ class GatewayNotificationsMixin:
     async def _deliver_completion_notification_scoped(
         self, synth_text: str, evt: dict, *, sibling_claims=(),
     ) -> Optional[bool]:
+        retained = evt.get("_gateway_async_delivery_claim")
+        if retained:
+            if self._settle_durable_claim("complete", evt["delegation_id"], retained, evt.get("run_id")):
+                evt.pop("_gateway_async_delivery_claim", None)
+                return True
+            return False
         from gateway.wake import WakeNotAccepted
         identity = self._completion_delivery_identity(evt)
         claim = self._CompletionClaim()
@@ -1605,6 +1616,12 @@ class GatewayNotificationsMixin:
             if identity is not None:
                 with self._completion_delivery_lock:
                     self._mark_completions_delivered_locked((identity,))
+            if claim.claim_id:
+                if not self._settle_durable_claim("complete", claim.delegation_id, claim.claim_id, evt.get("run_id")) and claim.authoritative:
+                    evt["_gateway_async_delivery_claim"] = claim.claim_id
+                    claim.claim_id = None
+                    return False
+                claim.claim_id = None
             return True
         except WakeNotAccepted:
             refused = True
@@ -1615,10 +1632,10 @@ class GatewayNotificationsMixin:
                     self._completion_deliveries_inflight.discard(identity)
             operation = "complete" if accepted else "defer" if refused else "release"
             if claim.claim_id:
-                self._settle_durable_claim(operation, claim.delegation_id, claim.claim_id)
+                self._settle_durable_claim(operation, claim.delegation_id, claim.claim_id, evt.get("run_id"))
             for sibling, claim_id in sibling_claims:
                 if claim_id:
-                    self._settle_durable_claim(operation, sibling["delegation_id"], claim_id)
+                    self._settle_durable_claim(operation, sibling["delegation_id"], claim_id, sibling.get("run_id"))
             if accepted and sibling_claims:
                 self._record_coalesced_completion_siblings([event for event, _claim_id in sibling_claims])
 
@@ -1885,6 +1902,11 @@ class GatewayNotificationsMixin:
         """
         await asyncio.sleep(3)  # let platforms finish connecting
         from tools.async_delegation import ORPHAN_SWEEP_INTERVAL_S
+        from tools.async_delegation import restore_stale_wait_completions
+        def _owns_gateway_event(evt):
+            self._enrich_async_delegation_routing(evt)
+            source = self._build_process_event_source(evt)
+            return source is not None and source.platform in self.adapters
         from tools.process_registry import process_registry as _pr
         last_orphan_sweep = None
         while self._running:
@@ -1893,6 +1915,7 @@ class GatewayNotificationsMixin:
                 if last_orphan_sweep is None or time.monotonic() - last_orphan_sweep >= ORPHAN_SWEEP_INTERVAL_S:
                     last_orphan_sweep = time.monotonic()
                     await asyncio.to_thread(self._sweep_orphaned_completion_ledgers)
+                    await asyncio.to_thread(restore_stale_wait_completions, _pr.completion_queue, owns_event=_owns_gateway_event)
                 # Pattern events also need an idle consumer; foreground turns are optional.
                 await self._drain_watch_notifications(_pr.completion_queue)
                 # Process completions remain owned by their per-process watchers.

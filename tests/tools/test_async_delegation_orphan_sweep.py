@@ -58,18 +58,29 @@ def _orphan(home: Path) -> str:
 
 
 def _row(home: Path, delegation_id: str) -> dict:
+    """The delegation's latest run, which owns delivery, with its summary state and owning process."""
     conn = sqlite3.connect(home / "state.db")
     try:
         conn.row_factory = sqlite3.Row
-        return dict(conn.execute("SELECT * FROM async_delegations WHERE delegation_id=?", (delegation_id,)).fetchone())
+        run = dict(conn.execute(
+            "SELECT * FROM delegation_runs WHERE delegation_id=? ORDER BY run_number DESC LIMIT 1",
+            (delegation_id,)).fetchone())
+        state = conn.execute("SELECT state FROM async_delegations WHERE delegation_id=?", (delegation_id,)).fetchone()
+        owner = conn.execute(
+            "SELECT owner_pid FROM delegation_attempts WHERE run_id=? ORDER BY attempt_number DESC LIMIT 1",
+            (run["run_id"],)).fetchone()
     finally:
         conn.close()
+    # A run is idle since it completed: that is the staleness clock the sweep reads.
+    return {**run, "state": state[0], "owner_pid": owner[0] if owner else None, "updated_at": run["completed_at"]}
 
 
 def _set(home: Path, delegation_id: str, **cols) -> None:
+    cols = {("completed_at" if k == "updated_at" else k): v for k, v in cols.items()}
     conn = sqlite3.connect(home / "state.db")
     try:
-        conn.execute(f"UPDATE async_delegations SET {', '.join(f'{k}=?' for k in cols)} WHERE delegation_id=?",
+        conn.execute(f"UPDATE delegation_runs SET {', '.join(f'{k}=?' for k in cols)} WHERE run_id=("
+                     "SELECT run_id FROM delegation_runs WHERE delegation_id=? ORDER BY run_number DESC LIMIT 1)",
                      (*cols.values(), delegation_id))
         conn.commit()
     finally:

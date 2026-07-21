@@ -185,6 +185,6 @@ def test_restore_drops_completions_older_than_replay_cap(_isolated_delegation_db
     # The stale row must converge to a terminal state, not replay forever.
     with ad._DB_LOCK, ad._transaction() as conn:
         state = conn.execute(
-            "SELECT delivery_state FROM async_delegations WHERE delegation_id='deleg_stale'"
+            "SELECT delivery_state FROM delegation_runs WHERE delegation_id='deleg_stale'"
         ).fetchone()[0]
     assert state == "dropped"

@@ -13,6 +13,7 @@ import asyncio
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from contextvars import ContextVar
+import copy
 import logging
 import threading
 import time
@@ -212,20 +213,28 @@ def _clear_tool_defs_cache() -> None:
 
 
 def get_tool_definitions(enabled_toolsets: Optional[List[str]] = None, disabled_toolsets: Optional[List[str]] = None,
-                         quiet_mode: bool = False, skip_tool_search_assembly: bool = False) -> List[Dict[str, Any]]:
+                         quiet_mode: bool = False, skip_tool_search_assembly: bool = False,
+                         delegation_policy: Any = None) -> List[Dict[str, Any]]:
     """Tool definitions for model API calls, filtered by toolset.
 
     enabled_toolsets None = all; disabled_toolsets are subtracted after enabling.
     quiet_mode suppresses status prints and enables memoization.
     skip_tool_search_assembly returns raw schemas for every enabled tool — only
     the tool_search bridge should use it (it reads the real, uncollapsed catalog).
+    delegation_policy (trusted, set at agent construction) constrains delegate_task's ``profile``;
+    memoized results are keyed by its schema-shaping fingerprint.
     """
     def compute():
-        return _compute_tool_definitions(enabled_toolsets, disabled_toolsets, quiet_mode,
-                                         skip_tool_search_assembly=skip_tool_search_assembly)
+        definitions = _compute_tool_definitions(enabled_toolsets, disabled_toolsets, quiet_mode,
+                                                skip_tool_search_assembly=skip_tool_search_assembly)
+        if delegation_policy is None:
+            return definitions
+        return _apply_delegation_policy_schema(definitions, delegation_policy)
     if not quiet_mode:
         return compute()
     cache_key = _tool_defs_cache_key(enabled_toolsets, disabled_toolsets, skip_tool_search_assembly)
+    if cache_key is not None:
+        cache_key += (_delegation_policy_fingerprint(delegation_policy),)
     # Cache the freshly-computed list, but hand callers a shallow copy so downstream mutations (e.g.
     # run_agent appending memory/LCM tool schemas to self.tools) don't poison the cache. Without this, a
     # long-lived Gateway process accumulates duplicate tool names across agent inits and providers that
@@ -705,7 +714,7 @@ def _emit_post_tool_call_hook(
 
 
 def _dispatch_bridge_tool(function_name: str, function_args: Dict[str, Any],
-                          enabled_toolsets: Optional[List[str]], disabled_toolsets: Optional[List[str]]):
+                          enabled_toolsets: Optional[List[str]], disabled_toolsets: Optional[List[str]], parent_agent=None):
     """Handle a Tool Search bridge call (tool_search / tool_describe / tool_call).
 
     None when *function_name* is not a bridge tool; ``(result, None)`` for a
@@ -725,6 +734,9 @@ def _dispatch_bridge_tool(function_name: str, function_args: Dict[str, Any],
                                             quiet_mode=True, skip_tool_search_assembly=True) or []
     except Exception:
         current_defs = []
+    protected = getattr(parent_agent, "_protected_deferred_tool_snapshot", None)
+    if protected is not None:
+        current_defs = [d for d in current_defs if not ts.is_deferrable_tool_name((d.get("function") or {}).get("name", "")) or (d.get("function") or {}).get("name") in protected]
     args = function_args or {}
     if function_name == ts.TOOL_SEARCH_NAME:
         return ts.dispatch_tool_search(args, current_tool_defs=current_defs), None
@@ -821,10 +833,12 @@ def _approval_observability(ids: _CallIds):
 
 
 def _execute_tool(function_name: str, function_args: Dict[str, Any], original_args: Dict[str, Any], ids: _CallIds,
-                  *, user_task: Optional[str], enabled_tools: Optional[List[str]], skip_tool_execution_middleware: bool) -> Any:
+                  *, user_task: Optional[str], enabled_tools: Optional[List[str]], skip_tool_execution_middleware: bool, parent_agent: Any = None) -> Any:
     """Run the registry handler (through tool-execution middleware unless skipped)
     with the approval observability context bound for the duration."""
     dispatch_kwargs: Dict[str, Any] = {"task_id": ids.task_id, "session_id": ids.session_id}
+    if function_name in {"delegate_task", "delegation"}:
+        dispatch_kwargs["parent_agent"] = parent_agent
     if function_name == "execute_code":
         # Prefer the caller's list so subagents can't overwrite the parent's
         # tool set via the process-global.
@@ -877,6 +891,7 @@ def handle_function_call(
     skip_pre_tool_call_hook: bool = False, skip_tool_request_middleware: bool = False,
     skip_tool_execution_middleware: bool = False, tool_request_middleware_trace: Optional[List[Dict[str, Any]]] = None,
     enabled_toolsets: Optional[List[str]] = None, disabled_toolsets: Optional[List[str]] = None,
+    parent_agent: Any = None,
 ) -> str:
     """Route a tool call through hooks/middleware to the registry; returns a JSON string.
 
@@ -903,7 +918,7 @@ def handle_function_call(
     # Tool Search bridge: tool_search / tool_describe are catalog reads handled
     # inline; tool_call is unwrapped so every downstream hook (pre/post, edit
     # approval, guardrails) sees the real tool name, never the bridge.
-    bridged = _dispatch_bridge_tool(function_name, function_args, enabled_toolsets, disabled_toolsets)
+    bridged = _dispatch_bridge_tool(function_name, function_args, enabled_toolsets, disabled_toolsets, parent_agent)
     if bridged is not None:
         result, underlying = bridged
         if underlying is None:
@@ -954,7 +969,7 @@ def handle_function_call(
         # duration_ms (monotonic) is exposed to post_tool_call / transform_tool_result.
         start = time.monotonic()
         result = _execute_tool(function_name, function_args, original_args, ids, user_task=user_task,
-                               enabled_tools=enabled_tools, skip_tool_execution_middleware=skip_tool_execution_middleware)
+                               enabled_tools=enabled_tools, skip_tool_execution_middleware=skip_tool_execution_middleware, parent_agent=parent_agent)
         duration_ms = _elapsed_ms(start)
         _emit(result, duration_ms=duration_ms)
         return _apply_transform_tool_result_hook(function_name, function_args, result, duration_ms, ids)
@@ -991,3 +1006,57 @@ def check_toolset_requirements() -> Dict[str, bool]:
 def check_tool_availability(quiet: bool = False) -> Tuple[List[str], List[dict]]:
     """(available_toolsets, unavailable_info)."""
     return registry.check_tool_availability(quiet=quiet)
+
+
+def _delegation_policy_fingerprint(policy: Any) -> tuple | None:
+    """Return only the immutable schema-shaping delegation policy state."""
+    if policy is None:
+        return None
+    return (
+        bool(policy.profile_required),
+        tuple(sorted(policy.allowed_profiles)),
+    )
+
+
+def _apply_delegation_policy_schema(
+    definitions: List[Dict[str, Any]], delegation_policy: Any
+) -> List[Dict[str, Any]]:
+    """Copy and constrain delegate_task without mutating the registry schema."""
+
+    result = list(definitions)
+    for index, definition in enumerate(result):
+        function = definition.get("function", {})
+        if function.get("name") != "delegate_task":
+            continue
+        owned = copy.deepcopy(definition)
+        parameters = owned["function"]["parameters"]
+        parameters["properties"]["profile"]["enum"] = sorted(
+            delegation_policy.allowed_profiles
+        )
+        # ``profile`` is spawn-only authority.  Making it globally required
+        # makes harmless status/wait/steer calls invalid before they reach the
+        # control plane.  Keep the base required list profile-free and express
+        # the protected-spawn requirement as a conditional schema instead.
+        required = [name for name in parameters.get("required", []) if name != "profile"]
+        if required:
+            parameters["required"] = required
+        else:
+            parameters.pop("required", None)
+        if delegation_policy.profile_required:
+            all_of = list(parameters.get("allOf", []))
+            all_of.append(
+                {
+                    "if": {
+                        "anyOf": [
+                            {"not": {"required": ["action"]}},
+                            {"properties": {"action": {"const": "spawn"}}},
+                        ]
+                    },
+                    "then": {"required": ["profile"]},
+                }
+            )
+            parameters["allOf"] = all_of
+        result[index] = owned
+
+        break
+    return result

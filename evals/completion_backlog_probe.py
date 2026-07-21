@@ -155,8 +155,8 @@ def probe(surface, scenario, directory):
             delegation_delivered = None
             if delegation:
                 with ad._transaction() as conn:
-                    row = conn.execute("SELECT delivery_state, delivery_attempts FROM async_delegations WHERE delegation_id=?",
-                                       (delegation['delegation_id'],)).fetchone()
+                    row = conn.execute("SELECT delivery_state, delivery_attempts FROM delegation_runs WHERE delegation_id=? "
+                                       "ORDER BY run_number DESC LIMIT 1", (delegation['delegation_id'],)).fetchone()
                     delegation_delivered = tuple(row) == ('delivered', 1)
             return {'surface': surface, 'scenario': scenario, 'children': count,
                     'wire_turns': len(texts), 'texts': texts,

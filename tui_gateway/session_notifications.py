@@ -122,6 +122,8 @@ def _notification_event_dedup_key(evt: dict) -> tuple:
     """UI-emission identity for a process notification event."""
     evt_type = evt.get("type", "completion")
     if evt_type == "async_delegation":
+        if evt.get("event_kind") == "fallback":
+            return (evt.get("notification_id", ""), evt_type, "fallback")
         # No process session_id: else every completion keys as ("", "async_delegation") and the second is suppressed forever.
         # An early per-task failure notice must not collapse with the batch's final result (nor with a sibling's notice).
         if evt.get("task_failure_notice"):
@@ -734,6 +736,7 @@ def _notification_poller_scoped_loop(stop_event: threading.Event, sid: str, sess
         now = time.monotonic()
         # Completions whose owner process died after this one started (#97202); throttled per profile home.
         async_delegation.maybe_sweep_orphaned_completions(queue)
+        async_delegation.restore_stale_wait_completions(queue, owns_event=lambda evt: _session_owns_notification_event(sid, session, evt))
         if now - last_bot_poll >= _BOT_DELIVERY_POLL_SECONDS:  # bot DM → live-owner delivery latency ≤ 5 s
             last_bot_poll = now
             _poll_bot_live_delivery_guarded(sid, session, now)
