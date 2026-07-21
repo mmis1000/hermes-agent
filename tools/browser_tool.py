@@ -70,6 +70,7 @@ from hermes_constants import agent_browser_runnable, get_hermes_home
 from utils import env_int, is_truthy_value
 from hermes_cli.config import DEFAULT_CONFIG, cfg_get
 from hermes_cli._subprocess_compat import windows_hide_flags
+from tools.environments.base import _child_oom_score_adj_kwargs
 
 # Browser-specific tool keys passed through to the agent-browser subprocess
 # AFTER credential stripping.  agent-browser is a Node process loading npm
@@ -1148,6 +1149,7 @@ def _run_chrome_fallback_command(
             proc = subprocess.Popen(
                 full, stdout=stdout_fd, stderr=stderr_fd,
                 stdin=subprocess.DEVNULL, env=browser_env,
+                **_child_oom_score_adj_kwargs(),
                 **_popen_extra,
             )
         finally:
@@ -2492,6 +2494,7 @@ def _run_browser_command(
                 stderr=stderr_fd,
                 stdin=subprocess.DEVNULL,
                 env=browser_env,
+                **_child_oom_score_adj_kwargs(),
                 **_popen_extra,
             )
         finally:

@@ -12,8 +12,13 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+from typing import Any
 
-from tools.environments.base import BaseEnvironment, _pipe_stdin
+from tools.environments.base import (
+    BaseEnvironment,
+    _child_oom_score_adj_kwargs,
+    _pipe_stdin,
+)
 from hermes_cli._subprocess_compat import windows_hide_flags
 
 _IS_WINDOWS = platform.system() == "Windows"
@@ -1374,7 +1379,9 @@ class LocalEnvironment(BaseEnvironment):
 
         _popen_cwd = self.cwd
 
-        _popen_kwargs = {"creationflags": windows_hide_flags()} if _IS_WINDOWS else {}
+        _popen_kwargs: dict[str, Any] = (
+            {"creationflags": windows_hide_flags()} if _IS_WINDOWS else {}
+        )
 
         proc = subprocess.Popen(
             args,
@@ -1387,11 +1394,12 @@ class LocalEnvironment(BaseEnvironment):
             stdin=subprocess.PIPE if stdin_data is not None else subprocess.DEVNULL,
             start_new_session=True,
             cwd=_popen_cwd,
+            **_child_oom_score_adj_kwargs(),
             **_popen_kwargs,
         )
         if not _IS_WINDOWS:
             try:
-                proc._hermes_pgid = os.getpgid(proc.pid)
+                setattr(proc, "_hermes_pgid", os.getpgid(proc.pid))
             except ProcessLookupError:
                 pass
 
