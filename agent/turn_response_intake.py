@@ -63,10 +63,10 @@ def _fire_post_api_request_hook(
     from agent.conversation_loop import _moa_reference_metrics_for_hook
 
     try:
-        from hermes_cli.lifecycle import has_hook, invoke_hook as _invoke_hook
+        from hermes_cli.lifecycle import has_hook
         if has_hook("post_api_request"):
-            _invoke_hook(
-                "post_api_request",
+            agent._invoke_token_usage_hook(
+                _hook_available=True, advance_session_event=True,
                 task_id=effective_task_id,
                 turn_id=turn_id,
                 api_request_id=api_request_id,
@@ -140,11 +140,6 @@ def normalize_model_response(
     # call/result rows before this turn's assistant message; no-op for ordinary providers.
     splice_provider_projection(agent, response, messages)
 
-    _fire_post_api_request_hook(
-        agent, response, assistant_message, finish_reason, api_messages=api_messages,
-        api_call_count=api_call_count, api_duration=api_duration, api_start_time=api_start_time,
-        api_request_id=api_request_id, effective_task_id=effective_task_id, turn_id=turn_id,
-    )
     from hermes_cli.observability.shared_metrics_harness import record_reply_content
     record_reply_content(agent, response, assistant_message)
 

@@ -7,6 +7,7 @@ from __future__ import annotations
 import contextvars
 import functools
 import json
+import math
 import logging
 import os
 import threading
@@ -124,11 +125,14 @@ def _coerce_usage_int(value: Any) -> int:
     if isinstance(value, int):
         return max(value, 0)
     if isinstance(value, float):
+        if not math.isfinite(value):
+            return 0
         return max(int(value), 0)
     if isinstance(value, str):
-        # Only the str->int parse is guarded; a float NaN still raises like it always has.
-        with suppress(ValueError):
+        try:
             return max(int(value), 0)
+        except (ValueError, OverflowError):
+            return 0
     return 0
 
 
@@ -145,6 +149,44 @@ def _queue_token_counts(agent, fail_msg: str, *fail_extra: Any, counts: Callable
     except Exception as exc:
         logger.debug(fail_msg, agent.session_id, *fail_extra, exc)
 
+
+def _codex_app_server_usage_summary(usage: Any) -> dict[str, int]:
+    """Return strict per-request token buckets from one Codex ``last`` update."""
+    if not isinstance(usage, dict) or not usage:
+        return {}
+    input_tokens = _coerce_usage_int(usage.get("inputTokens"))
+    cache_read_tokens = _coerce_usage_int(usage.get("cachedInputTokens"))
+    output_tokens = _coerce_usage_int(usage.get("outputTokens"))
+    reasoning_tokens = _coerce_usage_int(usage.get("reasoningOutputTokens"))
+    reported_total = _coerce_usage_int(usage.get("totalTokens"))
+    return {
+        "prompt_tokens": input_tokens + cache_read_tokens,
+        "completion_tokens": output_tokens,
+        "total_tokens": reported_total
+        or input_tokens + cache_read_tokens + output_tokens,
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "cache_read_tokens": cache_read_tokens,
+        "cache_write_tokens": 0,
+        "reasoning_tokens": reasoning_tokens,
+    }
+
+def _next_codex_app_server_request_id(
+    agent,
+    *,
+    thread_id: str = "",
+    turn_id: str = "",
+) -> str:
+    """Build a session-unique request id even when Codex omits ``turnId``."""
+    sequence = getattr(agent, "_codex_token_usage_request_sequence", 0)
+    if not isinstance(sequence, int) or isinstance(sequence, bool) or sequence < 0:
+        sequence = 0
+    sequence += 1
+    agent._codex_token_usage_request_sequence = sequence
+    return (
+        f"codex:{thread_id or agent.session_id or 'thread-unknown'}:"
+        f"{turn_id or 'turn-unknown'}:{sequence}"
+    )
 
 def _record_codex_app_server_usage(agent, turn, messages=None) -> dict[str, Any]:
     """Translate Codex app-server token usage into Hermes accounting. Prompt bucket = uncached + cached
@@ -188,7 +230,11 @@ def _record_codex_app_server_usage(agent, turn, messages=None) -> dict[str, Any]
         try:
             compressor.update_from_response(usage_dict)
             context_window = getattr(turn, "model_context_window", None)
-            if isinstance(context_window, int) and context_window > 0:
+            if (
+                isinstance(context_window, int)
+                and not isinstance(context_window, bool)
+                and context_window > 0
+            ):
                 compressor.context_length = context_window
         except Exception:
             logger.debug("codex app-server usage update failed", exc_info=True)
@@ -667,7 +713,16 @@ def run_codex_app_server_turn(agent, *, user_message: str, original_user_message
         from agent.conversation_compression import _checkpoint_blocked
         raise _checkpoint_blocked("codex_app_server owns the authoritative thread and compacts it "
                                   "without a truthful pre-compaction transcript boundary")
+    usage_notification_count = 0
+    def on_token_usage(update):
+        nonlocal usage_notification_count
+        last = update.get("last") if isinstance(update, dict) else None
+        if not isinstance(last, dict) or not last:
+            return
+        usage_notification_count += 1
+        agent._invoke_token_usage_hook(task_id=effective_task_id, turn_id=update.get("turn_id") or "", api_request_id=_next_codex_app_server_request_id(agent, thread_id=update.get("thread_id") or "", turn_id=update.get("turn_id") or ""), api_call_count=usage_notification_count, usage=_codex_app_server_usage_summary(last), raw_usage=last, source="codex_app_server", response_model=agent.model, codex_total_usage=update.get("total"), advance_session_event=True)
     _ensure_codex_session(agent, messages)
+    agent._codex_session._on_token_usage = on_token_usage
     try:
         _start_codex_thread(agent)
         turn = agent._codex_session.run_turn(user_input=user_message)
@@ -691,6 +746,10 @@ def run_codex_app_server_turn(agent, *, user_message: str, original_user_message
     usage_result = _finish_codex_turn(
         agent, turn, messages, original_user_message=original_user_message, should_review_memory=should_review_memory,
     )
+    if usage_notification_count == 0:
+        last = getattr(turn, "token_usage_last", None)
+        if isinstance(last, dict) and last:
+            agent._invoke_token_usage_hook(task_id=effective_task_id, turn_id=getattr(turn, "turn_id", None) or "", api_request_id=_next_codex_app_server_request_id(agent, thread_id=getattr(turn, "thread_id", None) or "", turn_id=getattr(turn, "turn_id", None) or ""), api_call_count=1, usage=_codex_app_server_usage_summary(last), raw_usage=last, source="codex_app_server", response_model=agent.model, codex_total_usage=getattr(turn, "token_usage_total", None), advance_session_event=True, core_includes_current=True)
     return _turn_result(
         interrupt, messages, api_calls=1, completed=not turn.interrupted and turn.error is None, error=turn.error,
         # We flushed the projected rows ourselves (agent_persisted); the gateway must skip its own DB write.
