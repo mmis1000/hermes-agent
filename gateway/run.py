@@ -3536,6 +3536,11 @@ class GatewayRunner(
         self._signal_interrupt_grace_timeout = self._load_signal_interrupt_grace_timeout()
         self._provider_routing = self._load_provider_routing()
         self._fallback_model = self._load_fallback_model()
+        # Tiny task-relationship judge state. This is deliberately separate
+        # from the AIAgent cache: the judge has no tools, transcript, or persona.
+        self._task_intent_judge_cache = OrderedDict()
+        self._task_intent_judge_signature = ""
+        self._task_intent_judge_cache_lock = threading.Lock()
 
     def _init_session_store(self) -> None:
         """Build the SessionStore (with process-registry reset guard), its async facade and the router."""
@@ -4136,6 +4141,227 @@ class GatewayRunner(
             with suppress(Exception):
                 cached_sources.move_to_end(session_key)
         return source
+
+    @staticmethod
+    def _capture_task_intent_ingress(event: MessageEvent) -> None:
+        """Snapshot exact inbound wording before gateway-owned decoration.
+
+        BasePlatformAdapter normally performs this at its first ingress seam.
+        This idempotent runner-side fallback covers direct handler calls in tests
+        and adapters that intentionally bypass the base dispatch path.
+        """
+        metadata = getattr(event, "metadata", None)
+        if not isinstance(metadata, dict):
+            metadata = {}
+            try:
+                event.metadata = metadata
+            except Exception:
+                return
+        metadata.setdefault("_task_intent_raw_ingress", getattr(event, "text", ""))
+
+    def _load_task_intent_micro_judge_config(self):
+        """Load the bounded ``task_intents.relationship_judge`` config."""
+        from hermes_cli.config import load_config
+        from hermes_cli.task_intent_micro_judge import TaskIntentMicroJudgeConfig
+
+        try:
+            config = load_config()
+        except Exception:
+            config = {}
+        if not isinstance(config, dict):
+            config = {}
+
+        merged: Dict[str, Any] = {}
+        root = config.get("task_intents")
+        if isinstance(root, dict):
+            judge = root.get("relationship_judge")
+            if isinstance(judge, dict):
+                merged.update(judge)
+            elif isinstance(judge, bool):
+                merged["enabled"] = judge
+
+        return TaskIntentMicroJudgeConfig.from_mapping(merged or None)
+
+    async def _judge_direct_task_relationship(
+        self,
+        *,
+        state: Any,
+        current_message: str,
+        message_id: str,
+        source_kind: str,
+        source: SessionSource,
+        session_key: str,
+    ):
+        """Run the annotation-only micro-judge under the current model route."""
+        from hermes_cli.task_intent_micro_judge import TaskIntentMicroJudge
+
+        config = self._load_task_intent_micro_judge_config()
+        if not config.enabled:
+            return None
+
+        cache = getattr(self, "_task_intent_judge_cache", None)
+        if cache is None:
+            cache = OrderedDict()
+            self._task_intent_judge_cache = cache
+        cache_lock = getattr(self, "_task_intent_judge_cache_lock", None)
+        if cache_lock is None:
+            cache_lock = threading.Lock()
+            self._task_intent_judge_cache_lock = cache_lock
+
+        def _run_judge():
+            def _run_in_scope():
+                from agent.auxiliary_client import call_llm
+
+                model, runtime = self._resolve_session_agent_runtime(
+                    source=source,
+                    session_key=session_key,
+                )
+                main_runtime = dict(runtime or {})
+                main_runtime["model"] = model
+
+                def _call(**kwargs):
+                    return call_llm(
+                        task="task_intent",
+                        main_runtime=main_runtime,
+                        messages=kwargs["messages"],
+                        timeout=kwargs.get("timeout"),
+                        max_tokens=kwargs.get("max_tokens"),
+                        temperature=0,
+                    )
+
+                judge = TaskIntentMicroJudge(
+                    llm_call=_call,
+                    config=config,
+                    cache=cache,
+                    cache_lock=cache_lock,
+                )
+                return judge.judge(
+                    state=state,
+                    current_message=current_message,
+                    message_id=message_id,
+                    source_kind=source_kind,
+                )
+
+            if getattr(getattr(self, "config", None), "multiplex_profiles", False):
+                with _profile_runtime_scope(self._resolve_profile_home_for_source(source)):
+                    return _run_in_scope()
+            return _run_in_scope()
+
+        # The provider call has its own timeout. The outer deadline bounds local
+        # setup/parsing as well; the small grace avoids racing the client timeout.
+        try:
+            return await asyncio.wait_for(
+                asyncio.to_thread(_run_judge),
+                timeout=config.timeout_seconds + 0.5,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "task-intent relationship judge timed out for session=%s message_id=%s",
+                session_key,
+                message_id or "none",
+            )
+            return None
+
+    async def _record_task_intent_event(
+        self,
+        *,
+        event: MessageEvent,
+        session_id: str,
+        session_key: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Persist authoritative DM provenance and annotate this user turn."""
+        metadata = getattr(event, "metadata", None)
+        if not isinstance(metadata, dict):
+            return None
+        raw = metadata.get("_task_intent_raw_ingress")
+        if not isinstance(raw, str) or raw == "":
+            return None
+
+        source = getattr(event, "source", None)
+        if source is None or getattr(source, "chat_type", None) != "dm":
+            return None
+
+        machine_origin = str(metadata.get("task_intent_machine_origin") or "").strip()
+        is_internal = bool(getattr(event, "internal", False))
+        if is_internal:
+            if not machine_origin:
+                return None
+            source_kind = "machine_continuation"
+        else:
+            source_kind = "direct_external_user"
+
+        db = getattr(getattr(self, "session_store", None), "_db", None)
+        if db is None:
+            db = getattr(getattr(self, "_session_db", None), "_db", None)
+        if db is None:
+            return None
+
+        from hermes_cli.task_intents import TaskIntentManager
+
+        manager = await asyncio.to_thread(TaskIntentManager, session_id, db=db)
+        message_id = str(getattr(event, "message_id", None) or "")
+        decision = None
+        if source_kind != "machine_continuation" and manager.state is not None:
+            decision = await self._judge_direct_task_relationship(
+                state=manager.state,
+                current_message=raw,
+                message_id=message_id,
+                source_kind=source_kind,
+                source=source,
+                session_key=session_key,
+            )
+
+        if source_kind == "machine_continuation":
+            state = await asyncio.to_thread(
+                manager.record_machine_continuation,
+                raw,
+                origin=machine_origin,
+                message_id=message_id,
+            )
+            sidecar: Dict[str, Any] = {
+                "raw_text": raw,
+                "source_kind": source_kind,
+                "message_id": message_id,
+                "machine_origin": machine_origin,
+                "synthetic": True,
+            }
+        else:
+            source_id = (
+                f"{getattr(source.platform, 'value', source.platform)}:"
+                f"{source.user_id or ''}"
+            )
+            state = await asyncio.to_thread(
+                manager.record_direct_message,
+                raw,
+                source_kind=source_kind,
+                source_id=source_id,
+                message_id=message_id,
+                relationship_decision=decision,
+            )
+            sidecar = {
+                "raw_text": raw,
+                "source_kind": source_kind,
+                "source_id": source_id,
+                "message_id": message_id,
+                "synthetic": False,
+            }
+
+        if state is not None:
+            sidecar["task_id"] = state.id
+            if state.raw_messages:
+                provenance = state.raw_messages[-1]
+                sidecar["relationship"] = provenance.relationship_to_active_task
+                sidecar["state_effect"] = provenance.state_effect
+        metadata["task_intent_message_metadata"] = sidecar
+        logger.info(
+            "task-intent ingress recorded: session=%s message_id=%s source=%s relationship=%s effect=%s",
+            session_id,
+            message_id or "none",
+            source_kind,
+            sidecar.get("relationship", "none"),
+            sidecar.get("state_effect", "none"),
+        )
+        return sidecar
 
     @dataclasses.dataclass
     class _HygieneSettings:
