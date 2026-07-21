@@ -209,7 +209,38 @@ class TestRunTurn:
         # turn_id propagated for downstream session-DB linkage
         assert r.turn_id == "turn-fake-001"
 
+    def test_every_token_usage_notification_is_forwarded_without_hiding_ui_events(self):
+        client = FakeClient()
+        for index in (1, 2):
+            client.queue_notification(
+                "thread/tokenUsage/updated",
+                threadId="thread-fake-001",
+                turnId="turn-fake-001",
+                tokenUsage={
+                    "last": {"inputTokens": index, "totalTokens": index},
+                    "total": {"inputTokens": index, "totalTokens": index},
+                },
+            )
+        client.queue_notification(
+            "turn/completed",
+            threadId="thread-fake-001",
+            turn={"id": "turn-fake-001", "status": "completed", "error": None},
+        )
+        updates = []
+        ui_events = []
 
+        make_session(
+            client,
+            on_event=ui_events.append,
+            on_token_usage=updates.append,
+        ).run_turn("hi", turn_timeout=2.0)
+
+        assert [update["last"]["inputTokens"] for update in updates] == [1, 2]
+        assert [note["method"] for note in ui_events] == [
+            "thread/tokenUsage/updated",
+            "thread/tokenUsage/updated",
+            "turn/completed",
+        ]
 
     def test_foreign_completion_in_server_request_drain_is_ignored(self):
         """Approval draining must not project a child result into the parent."""
