@@ -207,6 +207,7 @@ class CodexAppServerSession:
         permission_profile: Optional[str] = None,
         approval_callback: Optional[Callable[..., str]] = None,
         on_event: Optional[Callable[[dict], None]] = None,
+        on_token_usage: Optional[Callable[[dict], None]] = None,
         request_routing: Optional[_ServerRequestRouting] = None,
         client_factory: Optional[Callable[..., CodexAppServerClient]] = None,
     ) -> None:
@@ -221,6 +222,7 @@ class CodexAppServerSession:
         )
         self._approval_callback = approval_callback
         self._on_event = on_event  # Display hook (kawaii spinner ticks etc.)
+        self._on_token_usage = on_token_usage
         self._routing = request_routing or _ServerRequestRouting()
         self._client_factory = client_factory or CodexAppServerClient
 
@@ -519,7 +521,9 @@ class CodexAppServerSession:
                             logger.debug(
                                 "on_event callback raised", exc_info=True
                             )
-                    _apply_token_usage_notification(result, pending)
+                    self._emit_token_usage(
+                        _apply_token_usage_notification(result, pending)
+                    )
                     _apply_compaction_notification(result, pending)
                     self._track_pending_file_change(pending)
                     proj = projector.project(pending)
@@ -556,7 +560,7 @@ class CodexAppServerSession:
                 except Exception:  # pragma: no cover - display callback
                     logger.debug("on_event callback raised", exc_info=True)
 
-            _apply_token_usage_notification(result, note)
+            self._emit_token_usage(_apply_token_usage_notification(result, note))
             _apply_compaction_notification(result, note)
 
             # Track in-progress fileChange items so the approval bridge
@@ -743,7 +747,7 @@ class CodexAppServerSession:
                 except Exception:  # pragma: no cover - display callback
                     logger.debug("on_event callback raised", exc_info=True)
 
-            _apply_token_usage_notification(result, note)
+            self._emit_token_usage(_apply_token_usage_notification(result, note))
             _apply_compaction_notification(result, note)
             self._track_pending_file_change(note)
 
@@ -798,6 +802,20 @@ class CodexAppServerSession:
         return result
 
     # ---------- internals ----------
+
+    def _emit_token_usage(self, usage_update: Optional[dict]) -> None:
+        """Forward every valid usage notification to the owning runtime.
+
+        This callback is deliberately separate from ``on_event`` so the
+        existing Codex UI bridge continues to receive the original event while
+        accounting/observability can consume every per-request usage update.
+        """
+        if not usage_update or self._on_token_usage is None:
+            return
+        try:
+            self._on_token_usage(usage_update)
+        except Exception:  # pragma: no cover - observability is best-effort
+            logger.debug("on_token_usage callback raised", exc_info=True)
 
     def _issue_interrupt(self, turn_id: Optional[str]) -> None:
         if self._client is None or self._thread_id is None or turn_id is None:
@@ -986,28 +1004,40 @@ class CodexAppServerSession:
         return cached
 
 
-def _apply_token_usage_notification(result: TurnResult, note: dict) -> None:
-    """Capture Codex app-server token usage updates for caller accounting.
+def _apply_token_usage_notification(
+    result: TurnResult, note: dict
+) -> Optional[dict]:
+    """Capture and normalize one Codex app-server usage notification.
 
-    Codex does not put token usage on turn/completed. It emits a separate
-    thread/tokenUsage/updated notification containing cumulative totals and
-    the latest turn breakdown.
+    ``last`` is the per-model-request breakdown while ``total`` is cumulative.
+    The returned payload feeds the optional observability callback; ``None``
+    means the notification carried no usable token-usage data.
     """
     if not isinstance(note, dict) or note.get("method") != "thread/tokenUsage/updated":
-        return
+        return None
     params = note.get("params") or {}
     token_usage = params.get("tokenUsage") or {}
     if not isinstance(token_usage, dict):
-        return
+        return None
+    update: dict[str, Any] = {
+        "thread_id": params.get("threadId"),
+        "turn_id": params.get("turnId"),
+    }
     last = token_usage.get("last")
     total = token_usage.get("total")
     if isinstance(last, dict):
         result.token_usage_last = dict(last)
+        update["last"] = dict(last)
     if isinstance(total, dict):
         result.token_usage_total = dict(total)
+        update["total"] = dict(total)
     window = token_usage.get("modelContextWindow")
-    if isinstance(window, int) and window > 0:
+    if isinstance(window, int) and not isinstance(window, bool) and window > 0:
         result.model_context_window = window
+        update["model_context_window"] = window
+    if any(key in update for key in ("last", "total", "model_context_window")):
+        return update
+    return None
 
 
 def _apply_compaction_notification(result: TurnResult, note: dict) -> None:

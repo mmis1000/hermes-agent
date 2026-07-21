@@ -225,10 +225,51 @@ class TestRunTurn:
             threadId="t",
             turn={"id": "tu1", "status": "completed", "error": None},
         )
-        r = make_session(client).run_turn("hi", turn_timeout=2.0)
+        updates = []
+        r = make_session(client, on_token_usage=updates.append).run_turn(
+            "hi", turn_timeout=2.0
+        )
         assert r.token_usage_last["totalTokens"] == 130
         assert r.token_usage_total["totalTokens"] == 500
         assert r.model_context_window == 200000
+        assert len(updates) == 1
+        assert updates[0]["thread_id"] == "thread-fake-001"
+        assert updates[0]["turn_id"] == "turn-fake-001"
+        assert updates[0]["last"]["reasoningOutputTokens"] == 5
+        assert updates[0]["total"]["reasoningOutputTokens"] == 25
+
+    def test_every_token_usage_notification_is_forwarded_without_hiding_ui_events(self):
+        client = FakeClient()
+        for index in (1, 2):
+            client.queue_notification(
+                "thread/tokenUsage/updated",
+                threadId="thread-fake-001",
+                turnId="turn-fake-001",
+                tokenUsage={
+                    "last": {"inputTokens": index, "totalTokens": index},
+                    "total": {"inputTokens": index, "totalTokens": index},
+                },
+            )
+        client.queue_notification(
+            "turn/completed",
+            threadId="thread-fake-001",
+            turn={"id": "turn-fake-001", "status": "completed", "error": None},
+        )
+        updates = []
+        ui_events = []
+
+        make_session(
+            client,
+            on_event=ui_events.append,
+            on_token_usage=updates.append,
+        ).run_turn("hi", turn_timeout=2.0)
+
+        assert [update["last"]["inputTokens"] for update in updates] == [1, 2]
+        assert [note["method"] for note in ui_events] == [
+            "thread/tokenUsage/updated",
+            "thread/tokenUsage/updated",
+            "turn/completed",
+        ]
 
     def test_rich_content_turn_is_collapsed_to_text_payload(self):
         client = FakeClient()

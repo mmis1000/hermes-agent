@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import time
 from types import SimpleNamespace
@@ -34,13 +35,55 @@ def _coerce_usage_int(value: Any) -> int:
     if isinstance(value, int):
         return max(value, 0)
     if isinstance(value, float):
+        if not math.isfinite(value):
+            return 0
         return max(int(value), 0)
     if isinstance(value, str):
         try:
             return max(int(value), 0)
-        except ValueError:
+        except (ValueError, OverflowError):
             return 0
     return 0
+
+
+def _codex_app_server_usage_summary(usage: Any) -> dict[str, int]:
+    """Return strict per-request token buckets from one Codex ``last`` update."""
+    if not isinstance(usage, dict) or not usage:
+        return {}
+    input_tokens = _coerce_usage_int(usage.get("inputTokens"))
+    cache_read_tokens = _coerce_usage_int(usage.get("cachedInputTokens"))
+    output_tokens = _coerce_usage_int(usage.get("outputTokens"))
+    reasoning_tokens = _coerce_usage_int(usage.get("reasoningOutputTokens"))
+    reported_total = _coerce_usage_int(usage.get("totalTokens"))
+    return {
+        "prompt_tokens": input_tokens + cache_read_tokens,
+        "completion_tokens": output_tokens,
+        "total_tokens": reported_total
+        or input_tokens + cache_read_tokens + output_tokens,
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "cache_read_tokens": cache_read_tokens,
+        "cache_write_tokens": 0,
+        "reasoning_tokens": reasoning_tokens,
+    }
+
+
+def _next_codex_app_server_request_id(
+    agent,
+    *,
+    thread_id: str = "",
+    turn_id: str = "",
+) -> str:
+    """Build a session-unique request id even when Codex omits ``turnId``."""
+    sequence = getattr(agent, "_codex_token_usage_request_sequence", 0)
+    if not isinstance(sequence, int) or isinstance(sequence, bool) or sequence < 0:
+        sequence = 0
+    sequence += 1
+    agent._codex_token_usage_request_sequence = sequence
+    return (
+        f"codex:{thread_id or agent.session_id or 'thread-unknown'}:"
+        f"{turn_id or 'turn-unknown'}:{sequence}"
+    )
 
 
 def _record_codex_app_server_usage(agent, turn) -> dict[str, Any]:
@@ -124,7 +167,11 @@ def _record_codex_app_server_usage(agent, turn) -> dict[str, Any]:
         try:
             compressor.update_from_response(usage_dict)
             context_window = getattr(turn, "model_context_window", None)
-            if isinstance(context_window, int) and context_window > 0:
+            if (
+                isinstance(context_window, int)
+                and not isinstance(context_window, bool)
+                and context_window > 0
+            ):
                 compressor.context_length = context_window
         except Exception:
             logger.debug("codex app-server usage update failed", exc_info=True)
@@ -633,6 +680,37 @@ def run_codex_app_server_turn(
         _ServerRequestRouting,
     )
 
+    usage_notification_count = 0
+
+    def on_token_usage(update: dict) -> None:
+        """Emit one hook event for each Codex per-model-request usage update."""
+        nonlocal usage_notification_count
+        if not isinstance(update, dict):
+            return
+        last = update.get("last")
+        if not isinstance(last, dict) or not last:
+            return
+        usage_notification_count += 1
+        event_index = usage_notification_count
+        update_turn_id = update.get("turn_id") or ""
+        update_thread_id = update.get("thread_id") or ""
+        agent._invoke_token_usage_hook(
+            task_id=effective_task_id,
+            turn_id=update_turn_id,
+            api_request_id=_next_codex_app_server_request_id(
+                agent,
+                thread_id=update_thread_id,
+                turn_id=update_turn_id,
+            ),
+            api_call_count=event_index,
+            usage=_codex_app_server_usage_summary(last),
+            raw_usage=last,
+            source="codex_app_server",
+            response_model=agent.model,
+            codex_total_usage=update.get("total"),
+            advance_session_event=True,
+        )
+
     # Lazy session: one CodexAppServerSession per AIAgent instance.
     # Spawned on first turn, reused across turns, closed at AIAgent
     # shutdown (see _cleanup hook).
@@ -685,7 +763,12 @@ def run_codex_app_server_turn(
                 auto_approve_apply_patch=auto_approve_requests,
             ),
             on_event=make_codex_app_server_event_bridge(agent),
+            on_token_usage=on_token_usage,
         )
+
+    # The app-server session is reused across user turns. Refresh the callback
+    # so task/turn-local counters and fallback suppression belong to this turn.
+    agent._codex_session._on_token_usage = on_token_usage
 
     # NOTE: the user message is ALREADY appended to messages by the
     # standard run_conversation() flow (line ~11823) before the early
@@ -771,6 +854,31 @@ def run_codex_app_server_turn(
     _record_codex_app_server_compaction(agent, turn)
     usage_result = _record_codex_app_server_usage(agent, turn)
     api_calls = 1
+
+    # Older app-server versions may expose only the terminal TurnResult usage.
+    # Emit that fallback exactly when this turn produced zero valid updates.
+    if usage_notification_count == 0:
+        fallback_usage = getattr(turn, "token_usage_last", None)
+        if isinstance(fallback_usage, dict) and fallback_usage:
+            fallback_turn_id = getattr(turn, "turn_id", None) or ""
+            fallback_thread_id = getattr(turn, "thread_id", None) or ""
+            agent._invoke_token_usage_hook(
+                task_id=effective_task_id,
+                turn_id=fallback_turn_id,
+                api_request_id=_next_codex_app_server_request_id(
+                    agent,
+                    thread_id=fallback_thread_id,
+                    turn_id=fallback_turn_id,
+                ),
+                api_call_count=1,
+                usage=_codex_app_server_usage_summary(fallback_usage),
+                raw_usage=fallback_usage,
+                source="codex_app_server",
+                response_model=agent.model,
+                codex_total_usage=getattr(turn, "token_usage_total", None),
+                advance_session_event=True,
+                core_includes_current=True,
+            )
 
     # Now check the skill nudge AFTER iters were incremented — same
     # pattern the chat_completions path uses (line ~15432).

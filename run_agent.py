@@ -37,6 +37,7 @@ import copy
 import hashlib
 import json
 import logging
+import math
 logger = logging.getLogger(__name__)
 import os
 import re
@@ -2392,6 +2393,166 @@ class AIAgent:
         summary["total_tokens"] = cu.total_tokens
         return summary
 
+    def _next_token_usage_session_event_index(
+        self,
+        *,
+        core_includes_current: bool = False,
+    ) -> int:
+        """Advance the one session-wide counter used by usage hook producers.
+
+        The standard API loop emits before its normal accounting increment,
+        while the Codex terminal fallback runs after core accounting already
+        included the turn. Anchoring both paths to this private counter keeps
+        notification/fallback/ordinary sequences monotonic without changing
+        the existing session accounting authority.
+        """
+        current = getattr(self, "_token_usage_hook_session_events", None)
+        if not isinstance(current, int) or isinstance(current, bool) or current < 0:
+            current = 0
+        core_count = getattr(self, "session_api_calls", 0)
+        if not isinstance(core_count, int) or isinstance(core_count, bool):
+            try:
+                core_count = int(core_count or 0)
+            except (TypeError, ValueError, OverflowError):
+                core_count = 0
+        core_baseline = max(core_count - (1 if core_includes_current else 0), 0)
+        current = max(current, core_baseline) + 1
+        self._token_usage_hook_session_events = current
+        return current
+
+    @staticmethod
+    def _coerce_token_usage_hook_int(value: Any) -> int:
+        """Reject malformed provider token counts at the hook boundary."""
+        if value is None or value == "" or isinstance(value, bool):
+            return 0
+        if isinstance(value, float) and not math.isfinite(value):
+            return 0
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError, OverflowError):
+            return 0
+        return parsed if parsed >= 0 else 0
+
+    def _invoke_token_usage_hook(
+        self,
+        *,
+        task_id: str = "",
+        turn_id: str = "",
+        api_request_id: Optional[str] = None,
+        api_call_count: int = 0,
+        session_api_call_count: Optional[int] = None,
+        usage: Optional[Dict[str, Any]] = None,
+        raw_usage: Any = None,
+        source: str = "api_response",
+        started_at: Optional[float] = None,
+        ended_at: Optional[float] = None,
+        api_duration: Optional[float] = None,
+        finish_reason: Optional[str] = None,
+        response_model: Optional[str] = None,
+        response: Any = None,
+        assistant_message: Any = None,
+        _hook_available: bool = False,
+        advance_session_event: bool = False,
+        core_includes_current: bool = False,
+        **extra: Any,
+    ) -> None:
+        """Emit one provider-response event through ``post_api_request``.
+
+        ``post_api_request`` is the current per-request observer contract, so
+        alternate runtimes reuse it rather than introducing a parallel hook.
+        Payloads are best-effort, bounded, secret-redacted, and JSON-safe; a
+        plugin failure must never fail an otherwise completed model response.
+        """
+        try:
+            from hermes_cli import plugins as _plugins
+
+            if not _hook_available and not _plugins.has_hook("post_api_request"):
+                return
+
+            if advance_session_event:
+                session_api_call_count = self._next_token_usage_session_event_index(
+                    core_includes_current=core_includes_current,
+                )
+
+            usage_payload = self._sanitize_hook_payload(usage or {})
+            if isinstance(usage_payload, dict):
+                for key in (
+                    "prompt_tokens",
+                    "completion_tokens",
+                    "total_tokens",
+                    "reported_total_tokens",
+                    "input_tokens",
+                    "output_tokens",
+                    "cache_read_tokens",
+                    "cache_write_tokens",
+                    "reasoning_tokens",
+                ):
+                    if key in usage_payload:
+                        usage_payload[key] = self._coerce_token_usage_hook_int(
+                            usage_payload.get(key)
+                        )
+            raw_usage_payload = (
+                self._sanitize_hook_payload(raw_usage)
+                if raw_usage is not None
+                else None
+            )
+            kwargs: Dict[str, Any] = {
+                "task_id": task_id,
+                "turn_id": turn_id,
+                "api_request_id": api_request_id or turn_id,
+                "session_id": self.session_id or "",
+                "platform": self.platform or "",
+                "model": self.model,
+                "provider": self.provider,
+                "base_url": self.base_url,
+                "api_mode": self.api_mode,
+                "source": source,
+                "api_call_count": api_call_count,
+                "session_api_call_count": (
+                    session_api_call_count
+                    if session_api_call_count is not None
+                    else getattr(self, "session_api_calls", 0)
+                ),
+                "finish_reason": finish_reason,
+                "response_model": response_model,
+                "usage": usage_payload,
+                "raw_usage": raw_usage_payload,
+            }
+            if isinstance(usage_payload, dict):
+                for key in (
+                    "prompt_tokens",
+                    "completion_tokens",
+                    "total_tokens",
+                    "input_tokens",
+                    "output_tokens",
+                    "cache_read_tokens",
+                    "cache_write_tokens",
+                    "reasoning_tokens",
+                    "estimated_cost_usd",
+                    "cost_status",
+                    "cost_source",
+                ):
+                    if key in usage_payload:
+                        kwargs[key] = usage_payload.get(key)
+            if started_at is not None:
+                kwargs["started_at"] = started_at
+            if ended_at is not None:
+                kwargs["ended_at"] = ended_at
+            if api_duration is not None:
+                kwargs["api_duration"] = api_duration
+            if response is not None:
+                kwargs["response"] = response
+            if assistant_message is not None:
+                # Preserve the established post_api_request payload for
+                # subscribers such as Langfuse that serialize this object.
+                kwargs["assistant_message"] = assistant_message
+            for key, value in extra.items():
+                if value is not None:
+                    kwargs[key] = self._sanitize_hook_payload(value)
+            _plugins.invoke_hook("post_api_request", **kwargs)
+        except Exception:
+            pass
+
     @staticmethod
     def _hook_payload_max_chars() -> int:
         raw = os.getenv("HERMES_PLUGIN_PAYLOAD_MAX_CHARS", "50000")
@@ -2426,8 +2587,10 @@ class AIAgent:
     ) -> Any:
         if depth > max_depth:
             return f"<{type(value).__name__} depth limit>"
-        if value is None or isinstance(value, (bool, int, float)):
+        if value is None or isinstance(value, (bool, int)):
             return value
+        if isinstance(value, float):
+            return value if math.isfinite(value) else None
         if isinstance(value, str):
             if len(value) > max_string:
                 return value[:max_string] + f"...[truncated {len(value) - max_string} chars]"
@@ -2562,6 +2725,7 @@ class AIAgent:
         assistant_message: Any,
         *,
         finish_reason: Optional[str],
+        usage_summary: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         # ``tool_calls`` is the raw list of provider SDK objects (e.g.
         # OpenAI ``ChatCompletionMessageToolCall``).  We deliberately hand
@@ -2580,7 +2744,9 @@ class AIAgent:
                     "content": getattr(assistant_message, "content", None),
                     "tool_calls": tool_calls,
                 },
-                "usage": self._usage_summary_for_api_request_hook(response),
+                "usage": usage_summary
+                if usage_summary is not None
+                else self._usage_summary_for_api_request_hook(response),
             }
         )
 

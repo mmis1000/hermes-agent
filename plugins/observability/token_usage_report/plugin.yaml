@@ -1,0 +1,6 @@
+name: token_usage_report
+version: "1.0.0"
+description: "Writes per-model-request token usage events and a Markdown report, including reasoning-token clustering around fixed boundaries."
+author: NousResearch
+hooks:
+  - post_api_request

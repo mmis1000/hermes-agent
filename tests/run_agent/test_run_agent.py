@@ -4327,8 +4327,17 @@ class TestRunConversation:
     def test_request_scoped_api_hooks_fire_for_each_api_call(self, agent):
         self._setup_agent(agent)
         tc = _mock_tool_call(name="web_search", arguments="{}", call_id="c1")
-        resp1 = _mock_response(content="", finish_reason="tool_calls", tool_calls=[tc])
-        resp2 = _mock_response(content="Done searching", finish_reason="stop")
+        resp1 = _mock_response(
+            content="",
+            finish_reason="tool_calls",
+            tool_calls=[tc],
+            usage={"prompt_tokens": 100, "completion_tokens": 25, "total_tokens": 125},
+        )
+        resp2 = _mock_response(
+            content="Done searching",
+            finish_reason="stop",
+            usage={"prompt_tokens": 110, "completion_tokens": 10, "total_tokens": 120},
+        )
         agent.client.chat.completions.create.side_effect = [resp1, resp2]
 
         hook_calls = []
@@ -4357,6 +4366,9 @@ class TestRunConversation:
         assert len(post_request_calls) == 2
         assert [call["api_call_count"] for call in pre_request_calls] == [1, 2]
         assert [call["api_call_count"] for call in post_request_calls] == [1, 2]
+        assert [call["session_api_call_count"] for call in post_request_calls] == [1, 2]
+        assert [call["usage"]["input_tokens"] for call in post_request_calls] == [100, 110]
+        assert [call["usage"]["output_tokens"] for call in post_request_calls] == [25, 10]
         assert all(call["session_id"] == agent.session_id for call in pre_request_calls)
         assert all(call["turn_id"] == pre_request_calls[0]["turn_id"] for call in pre_request_calls + post_request_calls)
         assert [call["api_request_id"] for call in pre_request_calls] == [
@@ -5064,22 +5076,44 @@ class TestRunConversation:
         assert result["completed"] is True
 
     def test_length_finish_reason_requests_continuation(self, agent):
-        """Normal truncation (partial real content) triggers continuation."""
+        """Every paid truncation/continuation response emits exactly once."""
         self._setup_agent(agent)
-        first = _mock_response(content="Part 1 ", finish_reason="length")
-        second = _mock_response(content="Part 2", finish_reason="stop")
+        first = _mock_response(
+            content="Part 1 ",
+            finish_reason="length",
+            usage={"prompt_tokens": 100, "completion_tokens": 20, "total_tokens": 120},
+        )
+        second = _mock_response(
+            content="Part 2",
+            finish_reason="stop",
+            usage={"prompt_tokens": 120, "completion_tokens": 30, "total_tokens": 150},
+        )
         agent.client.chat.completions.create.side_effect = [first, second]
+        hook_calls = []
+
+        def _record_hook(name, **kwargs):
+            hook_calls.append((name, kwargs))
+            return []
 
         with (
             patch.object(agent, "_persist_session"),
             patch.object(agent, "_save_trajectory"),
             patch.object(agent, "_cleanup_task_resources"),
+            patch(
+                "hermes_cli.plugins.has_hook",
+                side_effect=lambda name: name == "post_api_request",
+            ),
+            patch("hermes_cli.plugins.invoke_hook", side_effect=_record_hook),
         ):
             result = agent.run_conversation("hello")
 
         assert result["completed"] is True
         assert result["api_calls"] == 2
         assert result["final_response"] == "Part 1 Part 2"
+        post_calls = [kwargs for name, kwargs in hook_calls if name == "post_api_request"]
+        assert [call["finish_reason"] for call in post_calls] == ["length", "stop"]
+        assert [call["usage"]["total_tokens"] for call in post_calls] == [120, 150]
+        assert [call["session_api_call_count"] for call in post_calls] == [1, 2]
 
         second_call_messages = agent.client.chat.completions.create.call_args_list[1].kwargs["messages"]
         assert second_call_messages[-1]["role"] == "user"
@@ -5949,6 +5983,49 @@ class TestHookPayloadSanitizesSimpleNamespace:
         result = AIAgent._sanitize_hook_payload(ns)
         assert result == {"id": "call_1", "value": 42, "nested": {"name": "x"}}
 
+    def test_hook_jsonable_replaces_nonfinite_floats(self):
+        result = AIAgent._sanitize_hook_payload(
+            {"values": [float("nan"), float("inf"), float("-inf"), 1.5]}
+        )
+
+        assert result == {"values": [None, None, None, 1.5]}
+        json.dumps(result, allow_nan=False)
+
+    def test_token_usage_hook_rejects_bool_negative_and_nonfinite_counts(self, agent):
+        hook_calls = []
+
+        with (
+            patch("hermes_cli.plugins.has_hook", return_value=True),
+            patch(
+                "hermes_cli.plugins.invoke_hook",
+                side_effect=lambda name, **kwargs: hook_calls.append((name, kwargs)),
+            ),
+        ):
+            agent._invoke_token_usage_hook(
+                usage={
+                    "input_tokens": True,
+                    "output_tokens": -3,
+                    "cache_read_tokens": float("inf"),
+                    "cache_write_tokens": float("nan"),
+                    "reasoning_tokens": float("-inf"),
+                    "total_tokens": "-9",
+                },
+                raw_usage={"nested": {"nan": float("nan")}},
+            )
+
+        assert len(hook_calls) == 1
+        payload = hook_calls[0][1]
+        assert payload["usage"] == {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cache_read_tokens": 0,
+            "cache_write_tokens": 0,
+            "reasoning_tokens": 0,
+            "total_tokens": 0,
+        }
+        assert payload["raw_usage"] == {"nested": {"nan": None}}
+        json.dumps(payload, allow_nan=False, default=str)
+
     def test_api_response_payload_for_hook_normalizes_simplenamespace_tool_calls(self, agent):
         # Shape mirrors agent/bedrock_adapter.py::normalize_converse_response and
         # agent/codex_responses_adapter.py — raw SDK objects are SimpleNamespace.
@@ -6058,14 +6135,29 @@ class TestRetryExhaustion:
                 finish_reason="stop",
             )],
             model="test/model",
-            usage=None,
+            usage=SimpleNamespace(
+                prompt_tokens=90,
+                completion_tokens=3,
+                total_tokens=93,
+            ),
             id="resp_1",
         )
         agent.client.chat.completions.create.return_value = refusal_resp
+        hook_calls = []
+
+        def _record_hook(name, **kwargs):
+            hook_calls.append((name, kwargs))
+            return []
+
         with (
             patch.object(agent, "_persist_session"),
             patch.object(agent, "_save_trajectory"),
             patch.object(agent, "_cleanup_task_resources"),
+            patch(
+                "hermes_cli.plugins.has_hook",
+                side_effect=lambda name: name == "post_api_request",
+            ),
+            patch("hermes_cli.plugins.invoke_hook", side_effect=_record_hook),
         ):
             result = agent.run_conversation("please do something disallowed")
         assert result.get("completed") is False
@@ -6076,6 +6168,10 @@ class TestRetryExhaustion:
         # Crucial regression guard: a deterministic refusal is NOT retried —
         # exactly one API call, no empty-response retry loop.
         assert agent.client.chat.completions.create.call_count == 1
+        post_calls = [kwargs for name, kwargs in hook_calls if name == "post_api_request"]
+        assert len(post_calls) == 1
+        assert post_calls[0]["finish_reason"] == "content_filter"
+        assert post_calls[0]["usage"]["total_tokens"] == 93
 
     def test_api_error_returns_gracefully_after_retries(self, agent):
         """Exhausted retries on API errors must return error result, not crash."""

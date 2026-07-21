@@ -1780,6 +1780,99 @@ def run_conversation(
                         )
                         finish_reason = "length"
 
+                # Normalize usage immediately after response metadata and finish
+                # status become available. Refusal and truncation branches below
+                # can return/continue, but every provider-reported response must
+                # emit exactly one post_api_request event first. The canonical
+                # value is then reused by ordinary accounting farther below.
+                _token_usage_canonical = None
+                _token_usage_summary = None
+                raw_usage = getattr(response, "usage", None)
+                if raw_usage:
+                    try:
+                        _token_usage_canonical = normalize_usage(
+                            raw_usage,
+                            provider=agent.provider,
+                            api_mode=agent.api_mode,
+                        )
+                        _token_usage_summary = {
+                            "prompt_tokens": _token_usage_canonical.prompt_tokens,
+                            "completion_tokens": _token_usage_canonical.output_tokens,
+                            "total_tokens": _token_usage_canonical.total_tokens,
+                            "input_tokens": _token_usage_canonical.input_tokens,
+                            "output_tokens": _token_usage_canonical.output_tokens,
+                            "cache_read_tokens": _token_usage_canonical.cache_read_tokens,
+                            "cache_write_tokens": _token_usage_canonical.cache_write_tokens,
+                            "reasoning_tokens": _token_usage_canonical.reasoning_tokens,
+                        }
+                    except Exception as exc:
+                        logger.debug(
+                            "Per-response token usage normalization failed: %s", exc
+                        )
+
+                try:
+                    from hermes_cli.plugins import has_hook as _has_hook
+
+                    _has_post_api_request_hook = _has_hook("post_api_request")
+                except Exception:
+                    _has_post_api_request_hook = False
+
+                if _has_post_api_request_hook:
+                    # Preserve the established post_api_request output fields
+                    # for ordinary subscribers, but do not normalize or build
+                    # payloads when no subscriber is installed.
+                    _hook_assistant_message = None
+                    try:
+                        _hook_transport = agent._get_transport()
+                        _hook_normalize_kwargs = {}
+                        if agent.api_mode == "anthropic_messages":
+                            _hook_normalize_kwargs["strip_tool_prefix"] = (
+                                agent._is_anthropic_oauth
+                            )
+                        _hook_assistant_message = _hook_transport.normalize_response(
+                            response, **_hook_normalize_kwargs
+                        )
+                    except Exception:
+                        logger.debug(
+                            "post_api_request response normalization failed",
+                            exc_info=True,
+                        )
+
+                    _hook_tool_calls = (
+                        getattr(_hook_assistant_message, "tool_calls", None) or []
+                    )
+                    _hook_text = (
+                        getattr(_hook_assistant_message, "content", None) or ""
+                    )
+                    agent._invoke_token_usage_hook(
+                        task_id=effective_task_id,
+                        turn_id=turn_id,
+                        api_request_id=api_request_id,
+                        api_call_count=api_call_count,
+                        usage=_token_usage_summary or {},
+                        raw_usage=raw_usage,
+                        source="api_response",
+                        started_at=api_start_time,
+                        ended_at=api_start_time + api_duration,
+                        api_duration=api_duration,
+                        finish_reason=finish_reason,
+                        response_model=getattr(response, "model", None),
+                        response=agent._api_response_payload_for_hook(
+                            response,
+                            _hook_assistant_message,
+                            finish_reason=finish_reason,
+                            usage_summary=_token_usage_summary,
+                        )
+                        if _hook_assistant_message is not None
+                        else None,
+                        assistant_message=_hook_assistant_message,
+                        message_count=len(api_messages),
+                        assistant_content_chars=len(_hook_text),
+                        assistant_tool_call_count=len(_hook_tool_calls),
+                        _hook_available=True,
+                        advance_session_event=True,
+                    )
+
                 # ── Content-policy refusal (HTTP 200) ──────────────────
                 # The model — or the provider's safety system — returned a
                 # *successful* response whose stop/finish reason is a refusal:
@@ -2184,13 +2277,11 @@ def run_conversation(
                             "error": "First response truncated due to output length limit"
                         }
                 
-                # Track actual token usage from response for context management
-                if hasattr(response, 'usage') and response.usage:
-                    canonical_usage = normalize_usage(
-                        response.usage,
-                        provider=agent.provider,
-                        api_mode=agent.api_mode,
-                    )
+                # Track actual token usage from response for context management.
+                # Reuse the canonical value created before early exits so normal
+                # responses are not normalized a second time.
+                if _token_usage_canonical is not None:
+                    canonical_usage = _token_usage_canonical
                     # Aggregator-only usage is retained for cost pricing: MoA
                     # advisor tokens must be priced at each advisor's OWN model
                     # rate, not the aggregator's, so they are added as dollars
@@ -2259,7 +2350,7 @@ def run_conversation(
                     # does not remain latched indefinitely.
                     agent.context_compressor.update_from_response({})
 
-                if hasattr(response, 'usage') and response.usage:
+                if _token_usage_canonical is not None:
                     # Cache discovered context length after successful call.
                     # Only persist limits confirmed by the provider (parsed
                     # from the error message), not guessed probe tiers.
@@ -4470,48 +4561,6 @@ def run_conversation(
                     assistant_message.content = "\n".join(parts)
                 else:
                     assistant_message.content = str(raw)
-
-            try:
-                from hermes_cli.plugins import (
-                    has_hook,
-                    invoke_hook as _invoke_hook,
-                )
-                if has_hook("post_api_request"):
-                    _assistant_tool_calls = (
-                        getattr(assistant_message, "tool_calls", None) or []
-                    )
-                    _assistant_text = assistant_message.content or ""
-                    _api_ended_at = api_start_time + api_duration
-                    _invoke_hook(
-                        "post_api_request",
-                        task_id=effective_task_id,
-                        turn_id=turn_id,
-                        api_request_id=api_request_id,
-                        session_id=agent.session_id or "",
-                        platform=agent.platform or "",
-                        model=agent.model,
-                        provider=agent.provider,
-                        base_url=agent.base_url,
-                        api_mode=agent.api_mode,
-                        api_call_count=api_call_count,
-                        api_duration=api_duration,
-                        started_at=api_start_time,
-                        ended_at=_api_ended_at,
-                        finish_reason=finish_reason,
-                        message_count=len(api_messages),
-                        response_model=getattr(response, "model", None),
-                        response=agent._api_response_payload_for_hook(
-                            response,
-                            assistant_message,
-                            finish_reason=finish_reason,
-                        ),
-                        usage=agent._usage_summary_for_api_request_hook(response),
-                        assistant_message=assistant_message,
-                        assistant_content_chars=len(_assistant_text),
-                        assistant_tool_call_count=len(_assistant_tool_calls),
-                    )
-            except Exception:
-                pass
 
             # Handle assistant response
             if assistant_message.content and not agent.quiet_mode:
