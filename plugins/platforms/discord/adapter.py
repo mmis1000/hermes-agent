@@ -1050,6 +1050,63 @@ def _read_discord_prompt_timeout() -> int:
 from plugins.platforms.discord.adapter_media import DiscordMediaMixin
 
 
+_DISCORD_RESULT_ATTACHMENT_LIMIT = 10
+_DISCORD_RESULT_ATTACHMENT_STRING_LIMITS = {
+    "id": 128,
+    "filename": 1024,
+    "content_type": 256,
+    "url": 4096,
+    "proxy_url": 4096,
+}
+_DISCORD_RESULT_ATTACHMENT_KEYS = (
+    "id",
+    "filename",
+    "size",
+    "content_type",
+    "url",
+    "proxy_url",
+    "width",
+    "height",
+)
+_DISCORD_RESULT_ID_LIMIT = 128
+
+def _serialize_discord_attachments(attachments: Any) -> List[Dict[str, Any]]:
+    """Return bounded, JSON-safe metadata for Discord message attachments.
+
+    Discord caps a message at ten attachments. Keep that same bound in tool
+    and gateway results, and copy only stable scalar fields so raw adapter/API
+    objects cannot leak arbitrary nested state into a tool transcript.
+    """
+    if not attachments:
+        return []
+
+    try:
+        iterator = iter(attachments)
+    except TypeError:
+        return []
+
+    serialized: List[Dict[str, Any]] = []
+    for attachment in iterator:
+        if len(serialized) >= _DISCORD_RESULT_ATTACHMENT_LIMIT:
+            break
+        item: Dict[str, Any] = {}
+        for key in _DISCORD_RESULT_ATTACHMENT_KEYS:
+            if isinstance(attachment, dict):
+                value = attachment.get(key)
+            else:
+                value = getattr(attachment, key, None)
+
+            if key in _DISCORD_RESULT_ATTACHMENT_STRING_LIMITS and value is not None:
+                value = str(value)[:_DISCORD_RESULT_ATTACHMENT_STRING_LIMITS[key]]
+            elif key in {"size", "width", "height"} and value is not None:
+                try:
+                    value = int(value)
+                except (TypeError, ValueError, OverflowError):
+                    value = None
+            item[key] = value
+        serialized.append(item)
+    return serialized
+
 class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
     """Discord bot adapter: guild/DM messages, threads, slash commands, button approvals, reactions."""
 
@@ -3046,6 +3103,58 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             kept.append(notice)
         return kept
 
+    async def _resolve_delivery_target(
+        self,
+        chat_id: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[Optional[Any], str, Optional[str]]:
+        """Resolve the one Discord channel/thread targeted by an outbound send."""
+        thread_value = metadata.get("thread_id") if metadata else None
+        thread_id = str(thread_value) if thread_value not in {None, ""} else None
+        target_id = thread_id or str(chat_id)
+        channel = await self._resolve_channel(target_id)
+        return channel, target_id, thread_id
+
+    def _message_send_result(
+        self,
+        channel: Any,
+        message: Any,
+        *,
+        thread_id: Optional[str] = None,
+    ) -> SendResult:
+        """Build a metadata-rich result from a discord.py or REST message."""
+        if isinstance(message, dict):
+            message_id = message.get("id")
+            response_channel_id = message.get("channel_id")
+            attachments = message.get("attachments")
+        else:
+            message_id = getattr(message, "id", None)
+            response_channel_id = getattr(message, "channel_id", None)
+            attachments = getattr(message, "attachments", None)
+
+        channel_id = str(
+            response_channel_id or getattr(channel, "id", "")
+        )[:_DISCORD_RESULT_ID_LIMIT]
+        raw_response: Dict[str, Any] = {
+            "channel_id": channel_id,
+            "attachments": _serialize_discord_attachments(attachments),
+        }
+        if thread_id:
+            raw_response["thread_id"] = str(thread_id)[:_DISCORD_RESULT_ID_LIMIT]
+
+        normalized_message_id = (
+            str(message_id)[:_DISCORD_RESULT_ID_LIMIT]
+            if message_id is not None
+            else None
+        )
+        if normalized_message_id and channel_id:
+            self._last_self_message_id[channel_id] = normalized_message_id
+        return SendResult(
+            success=True,
+            message_id=normalized_message_id,
+            raw_response=raw_response,
+        )
+
     async def send(
         self,
         chat_id: str,
@@ -3167,7 +3276,7 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                 warning = f"Failed to send follow-up chunk to forum thread {thread_id}: {e}"
                 logger.warning("[%s] %s", self.name, warning)
                 warnings.append(warning)
-        raw_response: Dict[str, Any] = {"message_ids": message_ids, "thread_id": thread_id}
+        raw_response: Dict[str, Any] = {"message_ids": message_ids, "channel_id": thread_id, "thread_id": thread_id, "attachments": _serialize_discord_attachments(getattr(starter_msg, "attachments", None))}
         if warnings:
             raw_response["warnings"] = warnings
         return SendResult(success=True, message_id=message_ids[0], raw_response=raw_response)
@@ -3223,7 +3332,7 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                     raw_response={"thread_id": thread_id},
                 )
         return SendResult(
-            success=True, message_id=message_id, raw_response={"thread_id": thread_id},
+            success=True, message_id=message_id, raw_response={"channel_id": thread_id, "thread_id": thread_id, "attachments": _serialize_discord_attachments(getattr(starter_msg, "attachments", None))},
         )
 
     async def edit_message(
@@ -7081,6 +7190,14 @@ async def _standalone_send(
         media_files = media_files or []
         last_data = None
         warnings = []
+        delivery_channel_id = str(thread_id or chat_id)[:_DISCORD_RESULT_ID_LIMIT]
+        result_attachments = []
+        def _remember_delivery(data):
+            nonlocal delivery_channel_id, result_attachments
+            if not isinstance(data, dict):
+                return
+            delivery_channel_id = str(data.get("channel_id") or delivery_channel_id)[:_DISCORD_RESULT_ID_LIMIT]
+            result_attachments = _serialize_discord_attachments([*result_attachments, *_serialize_discord_attachments(data.get("attachments"))])
         if thread_id:
             url = f"https://discord.com/api/v10/channels/{thread_id}/messages"
         else:
@@ -7133,6 +7250,8 @@ async def _standalone_send(
                 result = {
                     "success": True, "platform": "discord", "chat_id": chat_id,
                     "thread_id": thread_id_created, "message_id": starter_msg_id,
+                    "channel_id": str((data.get("message") or {}).get("channel_id") or thread_id_created or chat_id)[:_DISCORD_RESULT_ID_LIMIT],
+                    "attachments": _serialize_discord_attachments((data.get("message") or {}).get("attachments")),
                 }
                 if warnings:
                     result["warnings"] = warnings
@@ -7159,6 +7278,7 @@ async def _standalone_send(
                                     last_data = await _standalone_read_json_limited(
                                         resp, _DISCORD_STANDALONE_JSON_BODY_LIMIT_BYTES,
                                     )
+                                    _remember_delivery(last_data)
                                     caption_pending = False
                         except Exception:
                             logger.warning("Discord caption-fallback send failed for missing media")
@@ -7182,6 +7302,7 @@ async def _standalone_send(
                                 warnings.append(warning)
                                 continue
                             last_data = data
+                            _remember_delivery(last_data)
                 except Exception as e:
                     warning = send_error(f"Failed to send media {media_path}: {e}")["error"]
                     logger.error(warning)
@@ -7189,7 +7310,7 @@ async def _standalone_send(
         if last_data is None:
             error = "No deliverable text or media remained after processing"
             return {**send_error(error), **({"warnings": warnings} if warnings else {})}
-        result = {"success": True, "platform": "discord", "chat_id": chat_id, "message_id": last_data.get("id")}
+        result = {"success": True, "platform": "discord", "chat_id": chat_id, "message_id": last_data.get("id"), "channel_id": delivery_channel_id, "attachments": result_attachments, **({"thread_id": str(thread_id)[:_DISCORD_RESULT_ID_LIMIT]} if thread_id else {})}
         if warnings:
             result["warnings"] = warnings
         return result
@@ -7468,3 +7589,63 @@ def register(ctx) -> None:
         emoji="🎮",
         allow_update_command=True,
     )
+
+_DISCORD_RESULT_ATTACHMENT_LIMIT = 10
+
+_DISCORD_RESULT_ATTACHMENT_STRING_LIMITS = {
+    "id": 128,
+    "filename": 1024,
+    "content_type": 256,
+    "url": 4096,
+    "proxy_url": 4096,
+}
+
+_DISCORD_RESULT_ATTACHMENT_KEYS = (
+    "id",
+    "filename",
+    "size",
+    "content_type",
+    "url",
+    "proxy_url",
+    "width",
+    "height",
+)
+
+_DISCORD_RESULT_ID_LIMIT = 128
+
+def _serialize_discord_attachments(attachments: Any) -> List[Dict[str, Any]]:
+    """Return bounded, JSON-safe metadata for Discord message attachments.
+
+    Discord caps a message at ten attachments. Keep that same bound in tool
+    and gateway results, and copy only stable scalar fields so raw adapter/API
+    objects cannot leak arbitrary nested state into a tool transcript.
+    """
+    if not attachments:
+        return []
+
+    try:
+        iterator = iter(attachments)
+    except TypeError:
+        return []
+
+    serialized: List[Dict[str, Any]] = []
+    for attachment in iterator:
+        if len(serialized) >= _DISCORD_RESULT_ATTACHMENT_LIMIT:
+            break
+        item: Dict[str, Any] = {}
+        for key in _DISCORD_RESULT_ATTACHMENT_KEYS:
+            if isinstance(attachment, dict):
+                value = attachment.get(key)
+            else:
+                value = getattr(attachment, key, None)
+
+            if key in _DISCORD_RESULT_ATTACHMENT_STRING_LIMITS and value is not None:
+                value = str(value)[:_DISCORD_RESULT_ATTACHMENT_STRING_LIMITS[key]]
+            elif key in {"size", "width", "height"} and value is not None:
+                try:
+                    value = int(value)
+                except (TypeError, ValueError, OverflowError):
+                    value = None
+            item[key] = value
+        serialized.append(item)
+    return serialized
