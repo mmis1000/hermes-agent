@@ -1978,11 +1978,14 @@ class TestAsyncDelegationsSchemaAgreement:
 
         from hermes_state_common import SCHEMA_SQL
 
-        legacy_sql = SCHEMA_SQL.replace(
-            "    origin_session_id TEXT NOT NULL DEFAULT ''\n", ""
-        ).replace(
-            "    delivery_claimed_at REAL,\n",
-            "    delivery_claimed_at REAL\n",
+        # Cut async_delegations right after delivery_claimed_at: origin_session_id and every
+        # later column did not exist yet.
+        legacy_sql = re.sub(
+            r"(CREATE TABLE IF NOT EXISTS async_delegations \(.*?\n    delivery_claimed_at REAL),\n.*?\n\);",
+            r"\1\n);",
+            SCHEMA_SQL,
+            count=1,
+            flags=re.S,
         )
         conn = sqlite3.connect(db_path)
         try:
