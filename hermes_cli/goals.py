@@ -533,17 +533,26 @@ def _get_session_db() -> Optional[Any]:
     return db
 
 
-def load_goal(session_id: str) -> Optional[GoalState]:
+def load_goal(
+    session_id: str,
+    *,
+    db: Any = None,
+    raise_on_error: bool = False,
+) -> Optional[GoalState]:
     """Load the goal for a session, or None if none exists."""
     if not session_id:
         return None
-    db = _get_session_db()
-    if db is None:
+    database = db or _get_session_db()
+    if database is None:
+        if raise_on_error:
+            raise RuntimeError("goal database unavailable")
         return None
     try:
-        raw = db.get_meta(_meta_key(session_id))
+        raw = database.get_meta(_meta_key(session_id))
     except Exception as exc:
         logger.debug("GoalManager: get_meta failed: %s", exc)
+        if raise_on_error:
+            raise
         return None
     if not raw:
         return None
@@ -551,18 +560,20 @@ def load_goal(session_id: str) -> Optional[GoalState]:
         return GoalState.from_json(raw)
     except Exception as exc:
         logger.warning("GoalManager: could not parse stored goal for %s: %s", session_id, exc)
+        if raise_on_error:
+            raise
         return None
 
 
-def save_goal(session_id: str, state: GoalState) -> None:
+def save_goal(session_id: str, state: GoalState, *, db: Any = None) -> None:
     """Persist a goal to SessionDB. No-op if DB unavailable."""
     if not session_id:
         return
-    db = _get_session_db()
-    if db is None:
+    database = db or _get_session_db()
+    if database is None:
         return
     try:
-        db.set_meta(_meta_key(session_id), state.to_json())
+        database.set_meta(_meta_key(session_id), state.to_json())
     except Exception as exc:
         logger.debug("GoalManager: set_meta failed: %s", exc)
 
@@ -1093,10 +1104,22 @@ class GoalManager:
       feed back into ``run_conversation``.
     """
 
-    def __init__(self, session_id: str, *, default_max_turns: int = DEFAULT_MAX_TURNS):
+    def __init__(
+        self,
+        session_id: str,
+        *,
+        default_max_turns: int = DEFAULT_MAX_TURNS,
+        db: Any = None,
+        strict_load: bool = False,
+    ):
         self.session_id = session_id
         self.default_max_turns = int(default_max_turns or DEFAULT_MAX_TURNS)
-        self._state: Optional[GoalState] = load_goal(session_id)
+        self._db = db
+        self._state: Optional[GoalState] = load_goal(
+            session_id,
+            db=db,
+            raise_on_error=strict_load,
+        )
 
     # --- introspection ------------------------------------------------
 
@@ -1156,7 +1179,7 @@ class GoalManager:
             contract=contract if contract is not None else GoalContract(),
         )
         self._state = state
-        save_goal(self.session_id, state)
+        save_goal(self.session_id, state, db=self._db)
         return state
 
     def set_contract(self, contract: GoalContract) -> Optional[GoalState]:
@@ -1167,7 +1190,7 @@ class GoalManager:
         if self._state is None:
             return None
         self._state.contract = contract or GoalContract()
-        save_goal(self.session_id, self._state)
+        save_goal(self.session_id, self._state, db=self._db)
         return self._state
 
     def pause(self, reason: str = "user-paused") -> Optional[GoalState]:
@@ -1181,7 +1204,7 @@ class GoalManager:
         self._state.waiting_until = 0.0
         self._state.waiting_reason = None
         self._state.waiting_since = 0.0
-        save_goal(self.session_id, self._state)
+        save_goal(self.session_id, self._state, db=self._db)
         return self._state
 
     def resume(self, *, reset_budget: bool = True) -> Optional[GoalState]:
@@ -1197,14 +1220,14 @@ class GoalManager:
         self._state.waiting_since = 0.0
         if reset_budget:
             self._state.turns_used = 0
-        save_goal(self.session_id, self._state)
+        save_goal(self.session_id, self._state, db=self._db)
         return self._state
 
     def clear(self) -> None:
         if self._state is None:
             return
         self._state.status = "cleared"
-        save_goal(self.session_id, self._state)
+        save_goal(self.session_id, self._state, db=self._db)
         self._state = None
 
     def mark_done(self, reason: str) -> None:
@@ -1213,7 +1236,7 @@ class GoalManager:
         self._state.status = "done"
         self._state.last_verdict = "done"
         self._state.last_reason = reason
-        save_goal(self.session_id, self._state)
+        save_goal(self.session_id, self._state, db=self._db)
 
     # --- /subgoal user controls ---------------------------------------
 
@@ -1229,7 +1252,7 @@ class GoalManager:
         if not text:
             raise ValueError("subgoal text is empty")
         self._state.subgoals.append(text)
-        save_goal(self.session_id, self._state)
+        save_goal(self.session_id, self._state, db=self._db)
         return text
 
     def remove_subgoal(self, index_1based: int) -> str:
@@ -1242,7 +1265,7 @@ class GoalManager:
                 f"index out of range (1..{len(self._state.subgoals)})"
             )
         removed = self._state.subgoals.pop(idx)
-        save_goal(self.session_id, self._state)
+        save_goal(self.session_id, self._state, db=self._db)
         return removed
 
     def clear_subgoals(self) -> int:
@@ -1251,7 +1274,7 @@ class GoalManager:
             raise RuntimeError("no active goal")
         prev = len(self._state.subgoals)
         self._state.subgoals = []
-        save_goal(self.session_id, self._state)
+        save_goal(self.session_id, self._state, db=self._db)
         return prev
 
     def render_subgoals(self) -> str:
@@ -1285,7 +1308,7 @@ class GoalManager:
         self._state.waiting_until = 0.0
         self._state.waiting_reason = (reason or "").strip() or None
         self._state.waiting_since = time.time()
-        save_goal(self.session_id, self._state)
+        save_goal(self.session_id, self._state, db=self._db)
         return self._state
 
     def wait_on_session(self, session_id: str, reason: str = "") -> GoalState:
@@ -1307,7 +1330,7 @@ class GoalManager:
         self._state.waiting_until = 0.0
         self._state.waiting_reason = (reason or "").strip() or None
         self._state.waiting_since = time.time()
-        save_goal(self.session_id, self._state)
+        save_goal(self.session_id, self._state, db=self._db)
         return self._state
 
     def wait_for_seconds(self, seconds: int, reason: str = "") -> GoalState:
@@ -1328,7 +1351,7 @@ class GoalManager:
         self._state.waiting_until = time.time() + seconds
         self._state.waiting_reason = (reason or "").strip() or None
         self._state.waiting_since = time.time()
-        save_goal(self.session_id, self._state)
+        save_goal(self.session_id, self._state, db=self._db)
         return self._state
 
     def stop_waiting(self) -> bool:
@@ -1347,7 +1370,7 @@ class GoalManager:
         self._state.waiting_until = 0.0
         self._state.waiting_reason = None
         self._state.waiting_since = 0.0
-        save_goal(self.session_id, self._state)
+        save_goal(self.session_id, self._state, db=self._db)
         return True
 
     def is_waiting(self) -> bool:
@@ -1498,7 +1521,7 @@ class GoalManager:
 
         if verdict == "done":
             state.status = "done"
-            save_goal(self.session_id, state)
+            save_goal(self.session_id, state, db=self._db)
             return {
                 "status": "done",
                 "should_continue": False,
@@ -1519,7 +1542,7 @@ class GoalManager:
                 f"judge API unreachable {state.consecutive_transport_failures} turns in a row "
                 f"(check auxiliary.goal_judge provider/key in config.yaml)"
             )
-            save_goal(self.session_id, state)
+            save_goal(self.session_id, state, db=self._db)
             return {
                 "status": "paused",
                 "should_continue": False,
@@ -1549,7 +1572,7 @@ class GoalManager:
             state.paused_reason = (
                 f"judge model returned unparseable output {state.consecutive_parse_failures} turns in a row"
             )
-            save_goal(self.session_id, state)
+            save_goal(self.session_id, state, db=self._db)
             return {
                 "status": "paused",
                 "should_continue": False,
@@ -1571,7 +1594,7 @@ class GoalManager:
         if state.turns_used >= state.max_turns:
             state.status = "paused"
             state.paused_reason = f"turn budget exhausted ({state.turns_used}/{state.max_turns})"
-            save_goal(self.session_id, state)
+            save_goal(self.session_id, state, db=self._db)
             return {
                 "status": "paused",
                 "should_continue": False,
@@ -1584,7 +1607,7 @@ class GoalManager:
                 ),
             }
 
-        save_goal(self.session_id, state)
+        save_goal(self.session_id, state, db=self._db)
         return {
             "status": "active",
             "should_continue": True,

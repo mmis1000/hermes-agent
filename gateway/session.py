@@ -1652,6 +1652,9 @@ class SessionStore:
             )
             return False
 
+        if self._has_active_goal_safe(entry, context="expiry"):
+            return False
+
         policy = self.config.get_reset_policy(
             platform=entry.platform,
             session_type=entry.chat_type,
@@ -1736,6 +1739,27 @@ class SessionStore:
             return False
         return bool(row is not None and row.get("end_reason") is not None)
 
+    def _has_active_goal_safe(self, entry: SessionEntry, *, context: str) -> bool:
+        """Protect automatic reset boundaries when goal state is active or unknown."""
+        try:
+            from hermes_cli.goals import GoalManager
+
+            return GoalManager(
+                entry.session_id,
+                db=self._db,
+                strict_load=True,
+            ).is_active()
+        except Exception:
+            # Fail closed: losing durable work is worse than retaining a session
+            # until the goal database becomes readable again.
+            logger.warning(
+                "Session %s %s blocked — active-goal lookup failed",
+                entry.session_key,
+                context,
+                exc_info=True,
+            )
+            return True
+
     def _should_reset(self, entry: SessionEntry, source: SessionSource) -> Optional[str]:
         """
         Check if a session should be reset based on policy.
@@ -1751,6 +1775,9 @@ class SessionStore:
                 "Session reset skipped for %s — active background processes",
                 session_key,
             )
+            return None
+
+        if self._has_active_goal_safe(entry, context="reset"):
             return None
 
         policy = self.config.get_reset_policy(
@@ -2598,6 +2625,7 @@ class SessionStore:
             # any gateway-side persistence path or the next turn's
             # replay diverges at this row.
             api_content=extract_api_content_sidecar(message),
+            task_intent_metadata=message.get("_task_intent"),
         )
 
     # Maximum in-memory pending messages per session before dropping the

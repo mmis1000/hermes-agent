@@ -2731,6 +2731,26 @@ This compaction should PRIORITISE preserving all information related to the focu
                 continue
             if not _is_real_user_message(msg):
                 continue
+            task_intent = msg.get("_task_intent")
+            if isinstance(task_intent, dict):
+                raw_text = task_intent.get("raw_text")
+                if (
+                    isinstance(raw_text, str)
+                    and raw_text
+                    and task_intent.get("synthetic") is not True
+                    and task_intent.get("source_kind")
+                    in {"direct_user", "direct_external_user"}
+                ):
+                    if len(raw_text) > _ACTIVE_TASK_MAX_CHARS:
+                        raw_text = (
+                            raw_text[: _ACTIVE_TASK_MAX_CHARS - 15]
+                            + " ...[truncated]"
+                        )
+                    return (
+                        "User asked (deterministic raw ingress):\n"
+                        f"{raw_text}\n"
+                        "Historical only; newer protected-tail messages after this summary win."
+                    )
             content = msg.get("content")
             text = redact_sensitive_text(_content_text_for_contains(content).strip())
             if not text:
@@ -2763,11 +2783,10 @@ This compaction should PRIORITISE preserving all information related to the focu
         # next iterative compaction (which would then delete every following
         # section via the \Z branch).
         replacement = f"{HISTORICAL_TASK_HEADING}\n{snapshot}\n\n"
-        if _HISTORICAL_TASK_SECTION_RE.search(body):
-            grounded = _HISTORICAL_TASK_SECTION_RE.sub(
-                lambda _m: replacement, body, count=1
-            )
-            return grounded.strip()
+        # Iterative compaction can inherit more than one stale historical-task
+        # section. Remove every old copy before inserting the one deterministic
+        # raw-ingress snapshot.
+        body = _HISTORICAL_TASK_SECTION_RE.sub("", body)
         return f"{replacement}{body}".strip()
 
     @classmethod

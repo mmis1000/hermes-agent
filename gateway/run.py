@@ -3137,6 +3137,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._restart_drain_timeout = self._load_restart_drain_timeout()
         self._provider_routing = self._load_provider_routing()
         self._fallback_model = self._load_fallback_model()
+        # Tiny task-relationship judge state. This is deliberately separate
+        # from the AIAgent cache: the judge has no tools, transcript, or persona.
+        self._task_intent_judge_cache = OrderedDict()
+        self._task_intent_judge_signature = ""
+        self._task_intent_judge_cache_lock = threading.Lock()
 
         # Wire process registry into session store for reset protection.
         # A background process older than the configured threshold (default 24h,
@@ -4279,6 +4284,238 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _last_good["*"] = model
 
         return model, runtime_kwargs
+
+    @staticmethod
+    def _capture_task_intent_ingress(event: MessageEvent) -> None:
+        """Snapshot exact inbound wording before gateway-owned decoration.
+
+        BasePlatformAdapter normally performs this at its first ingress seam.
+        This idempotent runner-side fallback covers direct handler calls in tests
+        and adapters that intentionally bypass the base dispatch path.
+        """
+        metadata = getattr(event, "metadata", None)
+        if not isinstance(metadata, dict):
+            metadata = {}
+            try:
+                event.metadata = metadata
+            except Exception:
+                return
+        metadata.setdefault("_task_intent_raw_ingress", getattr(event, "text", ""))
+
+    def _load_task_intent_micro_judge_config(self):
+        """Load the bounded relationship judge config with legacy precedence."""
+        from hermes_cli.config import load_config
+        from hermes_cli.task_intent_micro_judge import TaskIntentMicroJudgeConfig
+
+        try:
+            config = load_config()
+        except Exception:
+            config = {}
+        if not isinstance(config, dict):
+            config = {}
+
+        merged: Dict[str, Any] = {}
+        modern_root = config.get("task_intents")
+        if isinstance(modern_root, dict):
+            modern = modern_root.get("relationship_judge")
+            if isinstance(modern, dict):
+                merged.update(modern)
+            elif isinstance(modern, bool):
+                merged["enabled"] = modern
+
+        # Historical installs used singular ``task_intent``. Values explicitly
+        # configured there are operator intent, so an upstream/default plural
+        # block containing enabled:false must not silently mask the opt-in.
+        legacy_root = config.get("task_intent")
+        if isinstance(legacy_root, dict):
+            legacy = legacy_root.get("relationship_judge")
+            if isinstance(legacy, dict):
+                merged.update(legacy)
+            elif isinstance(legacy, bool):
+                merged["enabled"] = legacy
+
+        return TaskIntentMicroJudgeConfig.from_mapping(merged or None)
+
+    async def _judge_direct_task_relationship(
+        self,
+        *,
+        state: Any,
+        current_message: str,
+        message_id: str,
+        source_kind: str,
+        source: SessionSource,
+        session_key: str,
+    ):
+        """Run the annotation-only micro-judge under the current model route."""
+        from hermes_cli.task_intent_micro_judge import TaskIntentMicroJudge
+
+        config = self._load_task_intent_micro_judge_config()
+        if not config.enabled:
+            return None
+
+        cache = getattr(self, "_task_intent_judge_cache", None)
+        if cache is None:
+            cache = OrderedDict()
+            self._task_intent_judge_cache = cache
+        cache_lock = getattr(self, "_task_intent_judge_cache_lock", None)
+        if cache_lock is None:
+            cache_lock = threading.Lock()
+            self._task_intent_judge_cache_lock = cache_lock
+
+        def _run_judge():
+            def _run_in_scope():
+                from agent.auxiliary_client import call_llm
+
+                model, runtime = self._resolve_session_agent_runtime(
+                    source=source,
+                    session_key=session_key,
+                )
+                main_runtime = dict(runtime or {})
+                main_runtime["model"] = model
+
+                def _call(**kwargs):
+                    return call_llm(
+                        task="task_intent",
+                        main_runtime=main_runtime,
+                        messages=kwargs["messages"],
+                        timeout=kwargs.get("timeout"),
+                        max_tokens=kwargs.get("max_tokens"),
+                        temperature=0,
+                    )
+
+                judge = TaskIntentMicroJudge(
+                    llm_call=_call,
+                    config=config,
+                    cache=cache,
+                    cache_lock=cache_lock,
+                )
+                return judge.judge(
+                    state=state,
+                    current_message=current_message,
+                    message_id=message_id,
+                    source_kind=source_kind,
+                )
+
+            if getattr(getattr(self, "config", None), "multiplex_profiles", False):
+                with _profile_runtime_scope(self._resolve_profile_home_for_source(source)):
+                    return _run_in_scope()
+            return _run_in_scope()
+
+        # The provider call has its own timeout. The outer deadline bounds local
+        # setup/parsing as well; the small grace avoids racing the client timeout.
+        try:
+            return await asyncio.wait_for(
+                asyncio.to_thread(_run_judge),
+                timeout=config.timeout_seconds + 0.5,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "task-intent relationship judge timed out for session=%s message_id=%s",
+                session_key,
+                message_id or "none",
+            )
+            return None
+
+    async def _record_task_intent_event(
+        self,
+        *,
+        event: MessageEvent,
+        session_id: str,
+        session_key: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Persist authoritative DM provenance and annotate this user turn."""
+        metadata = getattr(event, "metadata", None)
+        if not isinstance(metadata, dict):
+            return None
+        raw = metadata.get("_task_intent_raw_ingress")
+        if not isinstance(raw, str) or raw == "":
+            return None
+
+        source = getattr(event, "source", None)
+        if source is None or getattr(source, "chat_type", None) != "dm":
+            return None
+
+        machine_origin = str(metadata.get("task_intent_machine_origin") or "").strip()
+        is_internal = bool(getattr(event, "internal", False))
+        if is_internal:
+            if not machine_origin:
+                return None
+            source_kind = "machine_continuation"
+        else:
+            source_kind = "direct_external_user"
+
+        db = getattr(getattr(self, "session_store", None), "_db", None)
+        if db is None:
+            db = getattr(getattr(self, "_session_db", None), "_db", None)
+        if db is None:
+            return None
+
+        from hermes_cli.task_intents import TaskIntentManager
+
+        manager = await asyncio.to_thread(TaskIntentManager, session_id, db=db)
+        message_id = str(getattr(event, "message_id", None) or "")
+        decision = None
+        if source_kind != "machine_continuation" and manager.state is not None:
+            decision = await self._judge_direct_task_relationship(
+                state=manager.state,
+                current_message=raw,
+                message_id=message_id,
+                source_kind=source_kind,
+                source=source,
+                session_key=session_key,
+            )
+
+        if source_kind == "machine_continuation":
+            state = await asyncio.to_thread(
+                manager.record_machine_continuation,
+                raw,
+                origin=machine_origin,
+                message_id=message_id,
+            )
+            sidecar: Dict[str, Any] = {
+                "raw_text": raw,
+                "source_kind": source_kind,
+                "message_id": message_id,
+                "machine_origin": machine_origin,
+                "synthetic": True,
+            }
+        else:
+            source_id = (
+                f"{getattr(source.platform, 'value', source.platform)}:"
+                f"{source.user_id or ''}"
+            )
+            state = await asyncio.to_thread(
+                manager.record_direct_message,
+                raw,
+                source_kind=source_kind,
+                source_id=source_id,
+                message_id=message_id,
+                relationship_decision=decision,
+            )
+            sidecar = {
+                "raw_text": raw,
+                "source_kind": source_kind,
+                "source_id": source_id,
+                "message_id": message_id,
+                "synthetic": False,
+            }
+
+        if state is not None:
+            sidecar["task_id"] = state.id
+            if state.raw_messages:
+                provenance = state.raw_messages[-1]
+                sidecar["relationship"] = provenance.relationship_to_active_task
+                sidecar["state_effect"] = provenance.state_effect
+        metadata["task_intent_message_metadata"] = sidecar
+        logger.info(
+            "task-intent ingress recorded: session=%s message_id=%s source=%s relationship=%s effect=%s",
+            session_id,
+            message_id or "none",
+            source_kind,
+            sidecar.get("relationship", "none"),
+            sidecar.get("state_effect", "none"),
+        )
+        return sidecar
 
     def _resolve_turn_agent_config(self, user_message: str, model: str, runtime_kwargs: dict) -> dict:
         """Build the effective model/runtime config for a single turn.
@@ -10016,6 +10253,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         6. Run agent conversation
         7. Return response
         """
+        self._capture_task_intent_ingress(event)
         source = event.source
 
         # 🔴 Cross-session leak guard. This handler runs inside a per-message
@@ -12349,6 +12587,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     self._turn_lease_tokens = {}
                 self._turn_lease_tokens[(_quick_key, run_generation)] = _lease_token
 
+        # Final routing and the per-session turn lease are established above.
+        # Record canonical raw ingress here so two alias routing keys cannot race
+        # relationship transitions, while earlier command/auth exits remain free
+        # of task-intent side effects.
+        await self._record_task_intent_event(
+            event=event,
+            session_id=session_entry.session_id,
+            session_key=session_key,
+        )
+
         # Load conversation history from transcript
         history = await self.async_session_store.load_transcript(session_entry.session_id)
         
@@ -12983,6 +13231,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 moa_config=getattr(event, "_moa_config", None),
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
+                task_intent_metadata=(
+                    (getattr(event, "metadata", None) or {}).get(
+                        "task_intent_message_metadata"
+                    )
+                ),
             )
 
             # Stop persistent typing indicator now that the agent is done.
@@ -14258,6 +14511,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     source=source,
                     message_id=None,
                     channel_prompt=None,
+                    internal=True,
+                    metadata={"task_intent_machine_origin": "goal_continuation"},
                 )
                 self._enqueue_fifo(_quick_key, cont_event, adapter)
         except Exception as exc:
@@ -18850,6 +19105,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         moa_config: Optional[dict] = None,
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
+        task_intent_metadata: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Profile-scoping wrapper around the agent run.
 
@@ -18868,6 +19124,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 channel_prompt=channel_prompt, moa_config=moa_config,
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
+                task_intent_metadata=task_intent_metadata,
             )
 
         profile_home = self._resolve_profile_home_for_source(source)
@@ -18879,6 +19136,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 channel_prompt=channel_prompt, moa_config=moa_config,
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
+                task_intent_metadata=task_intent_metadata,
             )
 
     def _profile_name_for_source(self, source: SessionSource) -> Optional[str]:
@@ -19000,6 +19258,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         moa_config: Optional[dict] = None,
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
+        task_intent_metadata: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -21017,7 +21276,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _conversation_kwargs["moa_config"] = moa_config
                 if _persist_user_timestamp_override is not None:
                     _conversation_kwargs["persist_user_timestamp"] = _persist_user_timestamp_override
-                result = agent.run_conversation(_api_run_message, **_conversation_kwargs)
+                agent._pending_task_intent_metadata = (
+                    dict(task_intent_metadata)
+                    if isinstance(task_intent_metadata, dict)
+                    else None
+                )
+                try:
+                    result = agent.run_conversation(
+                        _api_run_message, **_conversation_kwargs
+                    )
+                finally:
+                    agent._pending_task_intent_metadata = None
             finally:
                 unregister_gateway_notify(_approval_session_key)
                 # Cancel any pending clarify entries so blocked agent

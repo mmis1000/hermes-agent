@@ -591,6 +591,12 @@ def _is_real_user_message(message: Any) -> bool:
     """
     if not isinstance(message, dict) or message.get("role") != "user":
         return False
+    task_intent = message.get("_task_intent")
+    if isinstance(task_intent, dict) and (
+        task_intent.get("synthetic") is True
+        or task_intent.get("source_kind") == "machine_continuation"
+    ):
+        return False
     if any(message.get(flag) for flag in _SYNTHETIC_USER_FLAGS):
         return False
     text = _message_text(message).strip()
