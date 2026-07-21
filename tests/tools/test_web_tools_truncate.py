@@ -127,4 +127,3 @@ def test_binary_payload_is_refused_but_prose_with_short_signature_prefix_passes(
     assert results[2]["error"] is None if "error" in results[2] else True
     assert results[2]["content"] == "BMW reviews are fine"
     assert results[3]["content"] == "# hi"
-

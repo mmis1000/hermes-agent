@@ -190,5 +190,3 @@ def test_install_id_persists_across_calls(tmp_path, monkeypatch):
     second = ensure_install_id(cfg_mod.load_config())
     assert second == first
     assert first in (tmp_path / "config.yaml").read_text()
-
-

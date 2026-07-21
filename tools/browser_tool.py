@@ -13,6 +13,7 @@ import json
 import logging
 import os
 import subprocess
+from tools.environments.base import _child_oom_score_adj_kwargs
 import sys
 import tempfile
 import threading

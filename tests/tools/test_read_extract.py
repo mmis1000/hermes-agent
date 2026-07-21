@@ -916,4 +916,3 @@ class TestSqliteExtraction(unittest.TestCase):
                 fh.write(b"hello, not a database")
             refused = json.loads(read_file_tool(fake))
             self.assertIn("not a SQLite database", refused["error"])
-
