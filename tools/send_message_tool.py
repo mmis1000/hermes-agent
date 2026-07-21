@@ -561,7 +561,13 @@ async def _send_via_adapter(platform, pconfig, chat_id, chunk, *, thread_id=None
         if isinstance(result, dict):
             return result
         if result.success:
-            return {"success": True, "message_id": result.message_id}
+            payload = {"success": True, "message_id": result.message_id}
+            raw = getattr(result, "raw_response", None)
+            if isinstance(raw, dict):
+                visible = {k: raw[k] for k in ("channel_id", "thread_id", "attachments", "warnings") if k in raw}
+                if visible:
+                    payload.update(platform=platform_name, chat_id=chat_id, **visible)
+            return payload
         return {"error": f"Adapter send failed: {_bounded_send_error(result.error)}"}
     try:
         from gateway.platform_registry import platform_registry
