@@ -1146,6 +1146,9 @@ def _build_replay_entry(
             if (_rval is None) if _rkey == "reasoning_content" else (not _rval):
                 continue
             entry[_rkey] = _rval
+    if role == "user" and msg.get("_iteration_control_synthetic"):
+        entry["_iteration_control_synthetic"] = True
+        entry["task_intent_source"] = "iteration_control"
     if preserve_timestamp and msg.get("timestamp"):
         entry["timestamp"] = msg["timestamp"]
     # Replay rebuilds the SAME conversation for its next turn: every role keeps its uid and merge witness, so a
@@ -4362,6 +4365,93 @@ class GatewayRunner(
             sidecar.get("state_effect", "none"),
         )
         return sidecar
+
+    def _judge_iteration_budget_exhaustion(
+        self,
+        *,
+        result: Dict[str, Any],
+        raw_goal: str,
+        model: str,
+        main_runtime: Dict[str, Any],
+    ):
+        """Run the small, toolless max-iteration continuation reviewer."""
+
+        from agent.auxiliary_client import call_llm
+        from gateway.iteration_continuation import judge_iteration_exhaustion
+
+        return judge_iteration_exhaustion(
+            result=result,
+            raw_goal=raw_goal,
+            llm_call=call_llm,
+            model=model,
+            main_runtime=main_runtime,
+        )
+
+    async def _request_iteration_continuation_confirmation(
+        self,
+        *,
+        source: SessionSource,
+        session_key: str,
+        reason: str,
+        event_message_id: Optional[str] = None,
+    ) -> bool:
+        """Ask whether an exhausted task should receive another iteration pass."""
+
+        import uuid
+
+        from tools import clarify_gateway as clarify
+
+        adapter = self._adapter_for_source(source)
+        if adapter is None:
+            return False
+
+        clarify_id = uuid.uuid4().hex[:10]
+        question = (
+            "The agent reached its per-turn iteration limit and the safety "
+            "review could not approve automatic continuation. Continue the "
+            f"same task?\n\nReview: {reason}"
+        )
+        choices = ["Continue", "Stop"]
+        clarify.register(
+            clarify_id=clarify_id,
+            session_key=session_key or "",
+            question=question,
+            choices=choices,
+        )
+        try:
+            pause_typing = getattr(adapter, "pause_typing_for_chat", None)
+            if callable(pause_typing):
+                pause_typing(source.chat_id)
+            metadata = self._thread_metadata_for_source(source, event_message_id)
+            send_result = await adapter.send_clarify(
+                chat_id=source.chat_id,
+                question=question,
+                choices=choices,
+                clarify_id=clarify_id,
+                session_key=session_key or "",
+                metadata=metadata,
+            )
+            if not getattr(send_result, "success", False):
+                clarify.clear_session(session_key or "")
+                return False
+            timeout = float(clarify.get_clarify_timeout())
+            response = await self._run_in_executor_with_context(
+                clarify.wait_for_response,
+                clarify_id,
+                timeout,
+            )
+        except asyncio.CancelledError:
+            clarify.clear_session(session_key or "")
+            raise
+        except Exception:
+            clarify.clear_session(session_key or "")
+            logger.warning(
+                "Iteration continuation confirmation failed for session %s",
+                session_key or "?",
+                exc_info=True,
+            )
+            return False
+        return str(response or "").strip().casefold() == "continue"
 
     @dataclasses.dataclass
     class _HygieneSettings:
