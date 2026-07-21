@@ -512,6 +512,65 @@ def resolve_skill_command_key(command: str) -> Optional[str]:
     return cmd_key if cmd_key in get_skill_commands() else None
 
 
+_PLAN_SKILL_NAME = "plan"
+_BRAINSTORMING_SKILL_NAME = "brainstorming"
+
+
+def _with_implicit_plan_brainstorming(
+    cmd_keys: list[str], commands: Dict[str, Dict[str, Any]]
+) -> list[str]:
+    """Insert enabled brainstorming guidance immediately before plan.
+
+    The command map is already filtered for unavailable, platform-incompatible,
+    environment-incompatible, and disabled skills. The direct disabled-skill
+    check also protects long-lived callers holding a command map populated
+    before a config change. Explicitly stacked brainstorming keeps its original
+    position and is never duplicated.
+    """
+    keys = list(cmd_keys)
+
+    def _skill_name(key: str) -> str:
+        info = commands.get(key) or {}
+        return str(info.get("name") or key.lstrip("/"))
+
+    names = [_skill_name(key) for key in keys]
+    if _PLAN_SKILL_NAME not in names or _BRAINSTORMING_SKILL_NAME in names:
+        return keys
+
+    try:
+        from agent.skill_utils import get_disabled_skill_names
+
+        disabled_names = get_disabled_skill_names()
+    except Exception:
+        disabled_names = set()
+
+    brainstorming_key = next(
+        (
+            key
+            for key, info in commands.items()
+            if str((info or {}).get("name") or key.lstrip("/"))
+            == _BRAINSTORMING_SKILL_NAME
+        ),
+        None,
+    )
+    if brainstorming_key is None:
+        return keys
+
+    brainstorming_info = commands.get(brainstorming_key) or {}
+    brainstorming_name = str(
+        brainstorming_info.get("name") or _BRAINSTORMING_SKILL_NAME
+    )
+    if (
+        _BRAINSTORMING_SKILL_NAME in disabled_names
+        or brainstorming_name in disabled_names
+    ):
+        return keys
+
+    plan_index = names.index(_PLAN_SKILL_NAME)
+    keys.insert(plan_index, brainstorming_key)
+    return keys
+
+
 def build_skill_invocation_message(
     cmd_key: str,
     user_instruction: str = "",
@@ -531,6 +590,20 @@ def build_skill_invocation_message(
     skill_info = commands.get(cmd_key)
     if not skill_info:
         return None
+
+    effective_cmd_keys = _with_implicit_plan_brainstorming([cmd_key], commands)
+    if effective_cmd_keys != [cmd_key]:
+        stacked = build_stacked_skill_invocation_message(
+            effective_cmd_keys,
+            user_instruction=user_instruction,
+            task_id=task_id,
+        )
+        if stacked is None:
+            return None
+        message = stacked[0]
+        if runtime_note:
+            message += f"\n\n[Runtime note: {runtime_note}]"
+        return message
 
     loaded = _load_skill_payload(skill_info["skill_dir"], task_id=task_id)
     if not loaded:
@@ -624,6 +697,8 @@ def build_stacked_skill_invocation_message(
         when no skill could be loaded at all.
     """
     commands = get_skill_commands()
+    typed_cmd_keys = list(cmd_keys)
+    cmd_keys = _with_implicit_plan_brainstorming(cmd_keys, commands)
 
     loaded_names: list[str] = []
     missing: list[str] = []
@@ -673,7 +748,7 @@ def build_stacked_skill_invocation_message(
 
     # Header — must contain " skill bundle," so the bundle-format extractor
     # in extract_user_instruction_from_skill_message() applies unchanged.
-    typed = " ".join(k for k in cmd_keys if k)
+    typed = " ".join(k for k in typed_cmd_keys if k)
     header_lines = [
         f'[IMPORTANT: The user has invoked the "{typed}" stacked skill bundle, '
         f"loading {len(loaded_names)} skills together. Treat every skill below "

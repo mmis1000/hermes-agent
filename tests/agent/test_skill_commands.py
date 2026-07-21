@@ -10,6 +10,7 @@ import tools.skills_tool as skills_tool_module
 from agent.skill_commands import (
     build_preloaded_skills_prompt,
     build_skill_invocation_message,
+    build_stacked_skill_invocation_message,
     resolve_skill_command_key,
     scan_skill_commands,
 )
@@ -728,6 +729,104 @@ Generate some audio.
 
         assert msg is not None
         assert 'file_path="<path>"' in msg
+
+
+class TestPlanBrainstormingPreload:
+    def test_simple_plan_preloads_brainstorming_before_plan(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(tmp_path, "brainstorming", body="BRAINSTORM BODY")
+            _make_skill(tmp_path, "plan", body="PLAN BODY")
+            scan_skill_commands()
+
+            msg = build_skill_invocation_message(
+                "/plan",
+                "design the feature",
+                runtime_note="keep this note",
+            )
+
+        from agent.skill_commands import extract_user_instruction_from_skill_message
+
+        assert msg is not None
+        assert msg.index("BRAINSTORM BODY") < msg.index("PLAN BODY")
+        assert msg.count("BRAINSTORM BODY") == 1
+        assert "User instruction: design the feature" in msg
+        assert "[Runtime note: keep this note]" in msg
+        assert extract_user_instruction_from_skill_message(msg) == "design the feature"
+
+    def test_stacked_plan_inserts_brainstorming_without_reordering_explicit_skills(
+        self, tmp_path
+    ):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(tmp_path, "skill-a", body="BODY A")
+            _make_skill(tmp_path, "brainstorming", body="BRAINSTORM BODY")
+            _make_skill(tmp_path, "plan", body="PLAN BODY")
+            _make_skill(tmp_path, "skill-b", body="BODY B")
+            scan_skill_commands()
+
+            result = build_stacked_skill_invocation_message(
+                ["/skill-a", "/plan", "/skill-b"], "design it"
+            )
+
+        assert result is not None
+        msg, loaded, missing = result
+        assert loaded == ["skill-a", "brainstorming", "plan", "skill-b"]
+        assert missing == []
+        assert msg.index("BODY A") < msg.index("BRAINSTORM BODY")
+        assert msg.index("BRAINSTORM BODY") < msg.index("PLAN BODY")
+        assert msg.index("PLAN BODY") < msg.index("BODY B")
+
+    def test_explicit_brainstorming_is_not_duplicated_or_reordered(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(tmp_path, "plan", body="PLAN BODY")
+            _make_skill(tmp_path, "brainstorming", body="BRAINSTORM BODY")
+            _make_skill(tmp_path, "skill-b", body="BODY B")
+            scan_skill_commands()
+
+            result = build_stacked_skill_invocation_message(
+                ["/plan", "/brainstorming", "/skill-b"], "design it"
+            )
+
+        assert result is not None
+        msg, loaded, missing = result
+        assert loaded == ["plan", "brainstorming", "skill-b"]
+        assert missing == []
+        assert msg.count("BRAINSTORM BODY") == 1
+        assert msg.index("PLAN BODY") < msg.index("BRAINSTORM BODY")
+        assert msg.index("BRAINSTORM BODY") < msg.index("BODY B")
+
+    def test_disabled_brainstorming_is_not_implicitly_loaded(
+        self, tmp_path, monkeypatch
+    ):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(tmp_path, "brainstorming", body="BRAINSTORM BODY")
+            _make_skill(tmp_path, "plan", body="PLAN BODY")
+            scan_skill_commands()
+
+            import agent.skill_utils as skill_utils
+
+            monkeypatch.setattr(
+                skill_utils,
+                "get_disabled_skill_names",
+                lambda platform=None: {"brainstorming"},
+            )
+            msg = build_skill_invocation_message("/plan", "design it")
+
+        assert msg is not None
+        assert "PLAN BODY" in msg
+        assert "BRAINSTORM BODY" not in msg
+
+    def test_unavailable_brainstorming_does_not_block_plan(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(tmp_path, "plan", body="PLAN BODY")
+            scan_skill_commands()
+
+            result = build_stacked_skill_invocation_message(["/plan"], "design it")
+
+        assert result is not None
+        msg, loaded, missing = result
+        assert loaded == ["plan"]
+        assert missing == []
+        assert "PLAN BODY" in msg
 
 
 class TestSkillDirectoryHeader:
