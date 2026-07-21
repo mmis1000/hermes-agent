@@ -341,9 +341,11 @@ class TaskIntentMicroJudge:
             source_kind=source_kind,
             config=self.config,
         )
-        messages = build_relationship_judge_messages(payload, config=self.config)
         started = time.monotonic()
         try:
+            messages = build_relationship_judge_messages(
+                payload, config=self.config
+            )
             response = self._llm_call(
                 messages=messages,
                 timeout=self.config.timeout_seconds,
