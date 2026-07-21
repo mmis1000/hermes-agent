@@ -557,12 +557,97 @@ def resolve_slash_key(command: str, table: Dict[str, Any]) -> Optional[str]:
     return cmd_key if cmd_key in table else None
 
 
+_PLAN_SKILL_NAME = "plan"
+_BRAINSTORMING_SKILL_NAME = "brainstorming"
+
+
+def _with_implicit_plan_brainstorming(
+    cmd_keys: list[str], commands: Dict[str, Dict[str, Any]]
+) -> list[str]:
+    """Insert enabled brainstorming guidance immediately before plan.
+
+    The command map is already filtered for unavailable, platform-incompatible,
+    environment-incompatible, and disabled skills. The direct disabled-skill
+    check also protects long-lived callers holding a command map populated
+    before a config change. Explicitly stacked brainstorming keeps its original
+    position and is never duplicated.
+    """
+    keys = list(cmd_keys)
+
+    def _skill_name(key: str) -> str:
+        info = commands.get(key) or {}
+        return str(info.get("name") or key.lstrip("/"))
+
+    names = [_skill_name(key) for key in keys]
+    if _PLAN_SKILL_NAME not in names or _BRAINSTORMING_SKILL_NAME in names:
+        return keys
+
+    try:
+        from agent.skill_utils import get_disabled_skill_names
+
+        disabled_names = get_disabled_skill_names()
+    except Exception:
+        disabled_names = set()
+
+    brainstorming_key = next(
+        (
+            key
+            for key, info in commands.items()
+            if str((info or {}).get("name") or key.lstrip("/"))
+            == _BRAINSTORMING_SKILL_NAME
+        ),
+        None,
+    )
+    if brainstorming_key is None:
+        return keys
+
+    brainstorming_info = commands.get(brainstorming_key) or {}
+    brainstorming_name = str(
+        brainstorming_info.get("name") or _BRAINSTORMING_SKILL_NAME
+    )
+    if (
+        _BRAINSTORMING_SKILL_NAME in disabled_names
+        or brainstorming_name in disabled_names
+    ):
+        return keys
+
+    plan_index = names.index(_PLAN_SKILL_NAME)
+    keys.insert(plan_index, brainstorming_key)
+    return keys
+
+
 def build_skill_invocation_message(
     cmd_key: str, user_instruction: str = "", task_id: str | None = None, runtime_note: str = "",
 ) -> Optional[str]:
-    """Build the user message for a skill slash command, or None if not found."""
-    skill_info = get_skill_commands().get(cmd_key)
-    loaded = _load_skill_payload(skill_info["skill_dir"], task_id=task_id) if skill_info else None
+    """Build the user message content for a skill slash command invocation.
+
+    Args:
+        cmd_key: The command key including leading slash (e.g., "/gif-search").
+        user_instruction: Optional text the user typed after the command.
+
+    Returns:
+        The formatted message string, or None if the skill wasn't found.
+    """
+    commands = get_skill_commands()
+    skill_info = commands.get(cmd_key)
+    if not skill_info:
+        return None
+
+    effective_cmd_keys = _with_implicit_plan_brainstorming([cmd_key], commands)
+    if effective_cmd_keys != [cmd_key]:
+        stacked = build_stacked_skill_invocation_message(
+            effective_cmd_keys,
+            user_instruction=user_instruction,
+            task_id=task_id,
+        )
+        if stacked is None:
+            return None
+        message = stacked[0]
+        if runtime_note:
+            message += f"\n\n[Runtime note: {runtime_note}]"
+        return message
+
+    loaded = _load_skill_payload(skill_info["skill_dir"], task_id=task_id)
     if not loaded:
         return None
     note = (f'[IMPORTANT: The user has invoked the "{loaded[2]}" skill, indicating they want '
@@ -601,7 +686,8 @@ def build_stacked_skill_invocation_message(
     """Build the user message for a stacked multi-skill slash invocation:
     ``(message, loaded_skill_names, missing_skill_names)``, or ``None`` when no skill loaded."""
     commands = get_skill_commands()
-    keys = [k for k in cmd_keys if k]
+    typed_cmd_keys = list(cmd_keys)
+    keys = [k for k in _with_implicit_plan_brainstorming(cmd_keys, commands) if k]
     loaded_names, missing, _disabled, skill_blocks = _load_skill_blocks(
         keys,
         lambda cmd_key: _load_skill_payload(commands[cmd_key]["skill_dir"], task_id=task_id) if cmd_key in commands else None,
@@ -610,7 +696,7 @@ def build_stacked_skill_invocation_message(
     )
     if not skill_blocks:
         return None
-    typed = " ".join(keys)
+    typed = " ".join(k for k in typed_cmd_keys if k)
     header = _scaffold_header(f'"{typed}" stacked skill bundle', loaded_names, missing=missing, user_instruction=user_instruction)
     return ("\n\n".join([header, *skill_blocks]), loaded_names, missing)
 
