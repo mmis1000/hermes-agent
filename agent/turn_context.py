@@ -437,6 +437,7 @@ def build_turn_context(
     stream_callback,
     persist_user_message: Optional[Any],
     persist_user_timestamp: Optional[float] = None,
+    persist_user_metadata: Optional[Dict[str, Any]] = None,
     *,
     persist_user_display_kind: Optional[str] = None,
     persist_user_display_metadata: Optional[Dict[str, Any]] = None,
@@ -653,6 +654,13 @@ def build_turn_context(
         # Internal provenance sidecar: persisted with the clean user row and
         # stripped by transport sanitizers before any provider request.
         user_msg["_task_intent"] = dict(task_intent_metadata)
+    # Gateway-created control turns can carry source metadata without
+    # changing the API-facing user content. Never allow metadata to replace
+    # role/content fields: those remain owned by turn construction.
+    if isinstance(persist_user_metadata, dict):
+        for key, value in persist_user_metadata.items():
+            if key not in {"role", "content", "api_content"}:
+                user_msg[key] = value
 
     # Hydrate todo store from conversation history.
     if conversation_history and not agent._todo_store.has_items():
