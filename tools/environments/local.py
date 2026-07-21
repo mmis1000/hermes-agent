@@ -9,6 +9,7 @@ import re
 import shutil
 import signal
 import subprocess
+from tools.environments.base import _child_oom_score_adj_kwargs
 import sys
 import tempfile
 import threading
@@ -1002,7 +1003,7 @@ class LocalEnvironment(BaseEnvironment):
             args, text=True, env=_make_run_env(self.env), encoding="utf-8", errors="replace",
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             stdin=subprocess.PIPE if stdin_data is not None else subprocess.DEVNULL,
-            start_new_session=True, cwd=self.cwd,
+            start_new_session=True, cwd=self.cwd, **_child_oom_score_adj_kwargs(),
             **({"creationflags": windows_hide_flags()} if _IS_WINDOWS else {}))
         if not _IS_WINDOWS:
             with contextlib.suppress(ProcessLookupError):

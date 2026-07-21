@@ -252,6 +252,9 @@ def _popen_bash(cmd: list[str], stdin_data: str | None = None, **kwargs) -> subp
     """Spawn a subprocess with standard stdout/stderr/stdin setup; *stdin_data* is written
     asynchronously via :func:`_pipe_stdin`. Backends with special Popen needs (e.g. local's
     ``preexec_fn``) can bypass this and call :func:`_pipe_stdin` directly."""
+    from tools.environments.base import _child_oom_score_adj_kwargs
+    setup = kwargs.pop("preexec_fn", None)
+    kwargs.update(_child_oom_score_adj_kwargs(setup))
     kwargs.setdefault("creationflags", windows_hide_flags())
     proc = subprocess.Popen(
         cmd,

@@ -12,6 +12,7 @@ import logging
 import os
 import shlex
 import subprocess
+import sys
 import threading
 import time
 import uuid
@@ -756,3 +757,58 @@ class BaseEnvironment(ABC):
             return self._wait_for_process(proc, timeout=self._SUDO_PROBE_TIMEOUT_S).get("returncode") == 0
         except Exception:
             return False
+
+
+def _read_child_oom_score_adj() -> int | None:
+    """Return the configured positive Linux child ``oom_score_adj`` value."""
+    raw = os.getenv("HERMES_CHILD_OOM_SCORE_ADJ", "300").strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.debug("Ignoring invalid HERMES_CHILD_OOM_SCORE_ADJ=%r", raw)
+        return None
+    if not 1 <= value <= 1000:
+        logger.debug("Ignoring out-of-range HERMES_CHILD_OOM_SCORE_ADJ=%r", raw)
+        return None
+    return value
+
+
+def _child_oom_score_adj_kwargs(existing_child_setup=None) -> dict:
+    """Build fail-safe Linux child setup kwargs for ``subprocess`` spawns.
+
+    A positive score makes tool/browser/build children more disposable than the
+    long-lived Hermes parent under memory pressure. The adjustment runs before
+    exec so daemon grandchildren inherit it. Any existing child setup callback
+    is composed rather than replaced; ``start_new_session`` remains an
+    independent ``Popen`` option at callers that need process-group isolation.
+
+    Unsupported platforms, invalid/disabled values, and ``/proc`` permission
+    errors are all no-ops. The callback uses only low-level ``os`` operations in
+    the post-fork window.
+    """
+    if not sys.platform.startswith("linux"):
+        return {"preexec_fn": existing_child_setup} if existing_child_setup else {}
+
+    value = _read_child_oom_score_adj()
+    if value is None:
+        return {"preexec_fn": existing_child_setup} if existing_child_setup else {}
+    encoded_value = str(value).encode("ascii")
+
+    def _set_child_oom_score_adj() -> None:
+        if existing_child_setup is not None:
+            existing_child_setup()
+
+        fd = None
+        try:
+            fd = os.open("/proc/self/oom_score_adj", os.O_WRONLY)
+            os.write(fd, encoded_value)
+        except OSError:
+            pass
+        finally:
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+
+    return {"preexec_fn": _set_child_oom_score_adj}
