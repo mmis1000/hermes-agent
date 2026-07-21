@@ -12,6 +12,7 @@ Verifies that:
 
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -135,6 +136,193 @@ class TestRunConversationCodexPath:
         assert agent.context_compressor.last_completion_tokens == 25
         assert agent.context_compressor.last_total_tokens == 130
         assert agent.context_compressor.context_length == 200000
+
+    def test_usage_notifications_emit_post_api_once_per_provider_response(self, monkeypatch):
+        usage_updates = [
+            {
+                "totalTokens": 12,
+                "inputTokens": 8,
+                "cachedInputTokens": 2,
+                "outputTokens": 2,
+                "reasoningOutputTokens": 1,
+            },
+            {
+                "totalTokens": 18,
+                "inputTokens": 10,
+                "cachedInputTokens": 3,
+                "outputTokens": 5,
+                "reasoningOutputTokens": 2,
+            },
+        ]
+
+        def fake_run_turn(session, user_input: str, **kwargs):
+            for usage in usage_updates:
+                session._on_token_usage(
+                    {
+                        "thread_id": "thread-notify",
+                        "turn_id": "turn-notify",
+                        "last": usage,
+                        "total": usage,
+                    }
+                )
+            return TurnResult(
+                final_text="done",
+                projected_messages=[{"role": "assistant", "content": "done"}],
+                turn_id="turn-notify",
+                thread_id="thread-notify",
+                token_usage_last=usage_updates[-1],
+                token_usage_total=usage_updates[-1],
+            )
+
+        monkeypatch.setattr(CodexAppServerSession, "run_turn", fake_run_turn)
+        monkeypatch.setattr(
+            CodexAppServerSession, "ensure_started", lambda self: "thread-notify"
+        )
+        agent = _make_codex_agent()
+        hook_calls = []
+
+        def _record_hook(name, **kwargs):
+            hook_calls.append((name, kwargs))
+            return []
+
+        with (
+            patch.object(agent, "_spawn_background_review", return_value=None),
+            patch(
+                "hermes_cli.plugins.has_hook",
+                side_effect=lambda name: name == "post_api_request",
+            ),
+            patch("hermes_cli.plugins.invoke_hook", side_effect=_record_hook),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert result["completed"] is True
+        post_calls = [kwargs for name, kwargs in hook_calls if name == "post_api_request"]
+        assert len(post_calls) == 2  # terminal fallback is suppressed
+        assert [call["api_call_count"] for call in post_calls] == [1, 2]
+        assert [call["session_api_call_count"] for call in post_calls] == [1, 2]
+        assert len({call["api_request_id"] for call in post_calls}) == 2
+        assert [call["usage"]["reasoning_tokens"] for call in post_calls] == [1, 2]
+        assert all(call["source"] == "codex_app_server" for call in post_calls)
+
+    def test_notification_fallback_notification_counters_share_one_authority(
+        self, monkeypatch
+    ):
+        turn_number = 0
+        usage = {
+            "totalTokens": 10,
+            "inputTokens": 6,
+            "cachedInputTokens": 0,
+            "outputTokens": 4,
+            "reasoningOutputTokens": 1,
+        }
+
+        def fake_run_turn(session, user_input: str, **kwargs):
+            nonlocal turn_number
+            turn_number += 1
+            turn_id = f"turn-{turn_number}"
+            if turn_number != 2:
+                session._on_token_usage(
+                    {
+                        "thread_id": "thread-mixed",
+                        "turn_id": turn_id,
+                        "last": usage,
+                        "total": usage,
+                    }
+                )
+            return TurnResult(
+                final_text="done",
+                projected_messages=[{"role": "assistant", "content": "done"}],
+                turn_id=turn_id,
+                thread_id="thread-mixed",
+                token_usage_last=usage,
+                token_usage_total=usage,
+            )
+
+        monkeypatch.setattr(CodexAppServerSession, "run_turn", fake_run_turn)
+        monkeypatch.setattr(
+            CodexAppServerSession, "ensure_started", lambda self: "thread-mixed"
+        )
+        agent = _make_codex_agent()
+        hook_calls = []
+
+        def _record_hook(name, **kwargs):
+            hook_calls.append((name, kwargs))
+            return []
+
+        with (
+            patch.object(agent, "_spawn_background_review", return_value=None),
+            patch(
+                "hermes_cli.plugins.has_hook",
+                side_effect=lambda name: name == "post_api_request",
+            ),
+            patch("hermes_cli.plugins.invoke_hook", side_effect=_record_hook),
+        ):
+            agent.run_conversation("notification")
+            agent.run_conversation("fallback")
+            agent.run_conversation("notification again")
+
+        post_calls = [kwargs for name, kwargs in hook_calls if name == "post_api_request"]
+        assert [call["session_api_call_count"] for call in post_calls] == [1, 2, 3]
+        assert [call["turn_id"] for call in post_calls] == ["turn-1", "turn-2", "turn-3"]
+        assert agent.session_api_calls == 3
+
+    def test_nonfinite_codex_usage_is_sanitized_without_failing_turn(self, monkeypatch):
+        invalid_usage = {
+            "totalTokens": float("inf"),
+            "inputTokens": float("nan"),
+            "cachedInputTokens": float("-inf"),
+            "outputTokens": -3,
+            "reasoningOutputTokens": True,
+            "nested": {"nan": float("nan")},
+        }
+
+        def fake_run_turn(session, user_input: str, **kwargs):
+            session._on_token_usage(
+                {
+                    "thread_id": "thread-nonfinite",
+                    "turn_id": "turn-nonfinite",
+                    "last": invalid_usage,
+                    "total": invalid_usage,
+                }
+            )
+            return TurnResult(
+                final_text="done",
+                projected_messages=[{"role": "assistant", "content": "done"}],
+                turn_id="turn-nonfinite",
+                thread_id="thread-nonfinite",
+                token_usage_last=invalid_usage,
+            )
+
+        monkeypatch.setattr(CodexAppServerSession, "run_turn", fake_run_turn)
+        monkeypatch.setattr(
+            CodexAppServerSession, "ensure_started", lambda self: "thread-nonfinite"
+        )
+        agent = _make_codex_agent()
+        hook_calls = []
+
+        def _record_hook(name, **kwargs):
+            hook_calls.append((name, kwargs))
+            return []
+
+        with (
+            patch.object(agent, "_spawn_background_review", return_value=None),
+            patch(
+                "hermes_cli.plugins.has_hook",
+                side_effect=lambda name: name == "post_api_request",
+            ),
+            patch("hermes_cli.plugins.invoke_hook", side_effect=_record_hook),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert result["completed"] is True
+        assert result["total_tokens"] == 0
+        post_calls = [kwargs for name, kwargs in hook_calls if name == "post_api_request"]
+        assert len(post_calls) == 1
+        assert post_calls[0]["usage"]["input_tokens"] == 0
+        assert post_calls[0]["usage"]["reasoning_tokens"] == 0
+        assert post_calls[0]["raw_usage"]["inputTokens"] is None
+        assert post_calls[0]["raw_usage"]["nested"]["nan"] is None
+        json.dumps(post_calls[0], allow_nan=False, default=str)
 
     def test_native_codex_compaction_updates_bookkeeping(self, monkeypatch):
         def fake_run_turn(self, user_input: str, **kwargs):
