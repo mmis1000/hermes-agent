@@ -731,7 +731,30 @@ async def _send_via_adapter(
             except Exception as e:
                 return {"error": f"Plugin platform send failed: {e}"}
             if result.success:
-                return {"success": True, "message_id": result.message_id}
+                payload = {
+                    "success": True,
+                    "message_id": result.message_id,
+                }
+                raw_response = getattr(result, "raw_response", None)
+                metadata_keys = (
+                    "channel_id",
+                    "thread_id",
+                    "attachments",
+                    "warnings",
+                )
+                if isinstance(raw_response, dict):
+                    visible_metadata = {
+                        key: raw_response[key]
+                        for key in metadata_keys
+                        if key in raw_response
+                    }
+                    if visible_metadata:
+                        payload.update(
+                            platform=platform_name,
+                            chat_id=chat_id,
+                            **visible_metadata,
+                        )
+                return payload
             return {"error": f"Adapter send failed: {result.error}"}
 
     entry = None

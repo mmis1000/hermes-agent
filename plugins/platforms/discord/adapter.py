@@ -63,6 +63,25 @@ _DISCORD_MAX_APP_COMMANDS = 100
 _DISCORD_SELECT_FIELD_LIMIT = 100
 _DISCORD_BUTTON_LABEL_LIMIT = 80
 _DISCORD_ELLIPSIS = "\u2026"
+_DISCORD_RESULT_ATTACHMENT_LIMIT = 10
+_DISCORD_RESULT_ATTACHMENT_STRING_LIMITS = {
+    "id": 128,
+    "filename": 1024,
+    "content_type": 256,
+    "url": 4096,
+    "proxy_url": 4096,
+}
+_DISCORD_RESULT_ATTACHMENT_KEYS = (
+    "id",
+    "filename",
+    "size",
+    "content_type",
+    "url",
+    "proxy_url",
+    "width",
+    "height",
+)
+_DISCORD_RESULT_ID_LIMIT = 128
 _DISCORD_NONCONVERSATIONAL_METADATA_KEYS = frozenset({
     "non_conversational",
     "non_conversational_history",
@@ -133,6 +152,44 @@ from gateway.platforms.base import (
     validate_inbound_media_size,
 )
 from tools.url_safety import is_safe_url
+
+
+def _serialize_discord_attachments(attachments: Any) -> List[Dict[str, Any]]:
+    """Return bounded, JSON-safe metadata for Discord message attachments.
+
+    Discord caps a message at ten attachments. Keep that same bound in tool
+    and gateway results, and copy only stable scalar fields so raw adapter/API
+    objects cannot leak arbitrary nested state into a tool transcript.
+    """
+    if not attachments:
+        return []
+
+    try:
+        iterator = iter(attachments)
+    except TypeError:
+        return []
+
+    serialized: List[Dict[str, Any]] = []
+    for attachment in iterator:
+        if len(serialized) >= _DISCORD_RESULT_ATTACHMENT_LIMIT:
+            break
+        item: Dict[str, Any] = {}
+        for key in _DISCORD_RESULT_ATTACHMENT_KEYS:
+            if isinstance(attachment, dict):
+                value = attachment.get(key)
+            else:
+                value = getattr(attachment, key, None)
+
+            if key in _DISCORD_RESULT_ATTACHMENT_STRING_LIMITS and value is not None:
+                value = str(value)[:_DISCORD_RESULT_ATTACHMENT_STRING_LIMITS[key]]
+            elif key in {"size", "width", "height"} and value is not None:
+                try:
+                    value = int(value)
+                except (TypeError, ValueError, OverflowError):
+                    value = None
+            item[key] = value
+        serialized.append(item)
+    return serialized
 
 
 def _truncate_discord_component_text(text: str, limit: int) -> str:
@@ -2813,6 +2870,60 @@ class DiscordAdapter(BasePlatformAdapter):
             elif outcome == ProcessingOutcome.FAILURE:
                 await self._add_reaction(message, "❌")
 
+    async def _resolve_delivery_target(
+        self,
+        chat_id: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[Optional[Any], str, Optional[str]]:
+        """Resolve the one Discord channel/thread targeted by an outbound send."""
+        thread_value = metadata.get("thread_id") if metadata else None
+        thread_id = str(thread_value) if thread_value not in {None, ""} else None
+        target_id = thread_id or str(chat_id)
+        channel = self._client.get_channel(int(target_id))
+        if not channel:
+            channel = await self._client.fetch_channel(int(target_id))
+        return channel, target_id, thread_id
+
+    def _message_send_result(
+        self,
+        channel: Any,
+        message: Any,
+        *,
+        thread_id: Optional[str] = None,
+    ) -> SendResult:
+        """Build a metadata-rich result from a discord.py or REST message."""
+        if isinstance(message, dict):
+            message_id = message.get("id")
+            response_channel_id = message.get("channel_id")
+            attachments = message.get("attachments")
+        else:
+            message_id = getattr(message, "id", None)
+            response_channel_id = getattr(message, "channel_id", None)
+            attachments = getattr(message, "attachments", None)
+
+        channel_id = str(
+            response_channel_id or getattr(channel, "id", "")
+        )[:_DISCORD_RESULT_ID_LIMIT]
+        raw_response: Dict[str, Any] = {
+            "channel_id": channel_id,
+            "attachments": _serialize_discord_attachments(attachments),
+        }
+        if thread_id:
+            raw_response["thread_id"] = str(thread_id)[:_DISCORD_RESULT_ID_LIMIT]
+
+        normalized_message_id = (
+            str(message_id)[:_DISCORD_RESULT_ID_LIMIT]
+            if message_id is not None
+            else None
+        )
+        if normalized_message_id and channel_id:
+            self._last_self_message_id[channel_id] = normalized_message_id
+        return SendResult(
+            success=True,
+            message_id=normalized_message_id,
+            raw_response=raw_response,
+        )
+
     async def send(
         self,
         chat_id: str,
@@ -2832,27 +2943,20 @@ class DiscordAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="Not connected")
 
         try:
-            # Determine target channel: thread_id in metadata takes precedence.
-            thread_id = None
-            if metadata and metadata.get("thread_id"):
-                thread_id = metadata["thread_id"]
+            # Resolve every outbound Discord delivery through the same path so
+            # thread metadata has identical precedence for text and media.
+            channel, target_id, thread_id = await self._resolve_delivery_target(
+                chat_id, metadata
+            )
             nonconversational = _metadata_marks_nonconversational(metadata)
             final_delivery = bool(metadata and metadata.get("notify"))
 
-            if thread_id:
-                # Fetch the thread directly — threads are addressed by their own ID.
-                channel = self._client.get_channel(int(thread_id))
-                if not channel:
-                    channel = await self._client.fetch_channel(int(thread_id))
-                if not channel:
-                    return SendResult(success=False, error=f"Thread {thread_id} not found")
-            else:
-                # Get the parent channel
-                channel = self._client.get_channel(int(chat_id))
-                if not channel:
-                    channel = await self._client.fetch_channel(int(chat_id))
-                if not channel:
-                    return SendResult(success=False, error=f"Channel {chat_id} not found")
+            if not channel:
+                target_kind = "Thread" if thread_id else "Channel"
+                return SendResult(
+                    success=False,
+                    error=f"{target_kind} {target_id} not found",
+                )
 
             # Forum channels reject channel.send() — create a thread post instead.
             if self._is_forum_parent(channel):
@@ -3000,7 +3104,14 @@ class DiscordAdapter(BasePlatformAdapter):
                 logger.warning("[%s] %s", self.name, warning)
                 warnings.append(warning)
 
-        raw_response: Dict[str, Any] = {"message_ids": message_ids, "thread_id": thread_id}
+        raw_response: Dict[str, Any] = {
+            "message_ids": message_ids,
+            "channel_id": thread_id,
+            "thread_id": thread_id,
+            "attachments": _serialize_discord_attachments(
+                getattr(starter_msg, "attachments", None)
+            ),
+        }
         if warnings:
             raw_response["warnings"] = warnings
 
@@ -3064,10 +3175,10 @@ class DiscordAdapter(BasePlatformAdapter):
         starter_msg = getattr(thread, "message", None)
         message_id = str(getattr(starter_msg, "id", thread_id)) if starter_msg else thread_id
 
-        return SendResult(
-            success=True,
-            message_id=message_id,
-            raw_response={"thread_id": thread_id},
+        return self._message_send_result(
+            thread_channel,
+            starter_msg or {"id": message_id, "channel_id": thread_id},
+            thread_id=thread_id,
         )
 
     async def edit_message(
@@ -3294,6 +3405,7 @@ class DiscordAdapter(BasePlatformAdapter):
         file_path: str,
         caption: Optional[str] = None,
         file_name: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         """Send a local file as a Discord attachment.
 
@@ -3303,11 +3415,15 @@ class DiscordAdapter(BasePlatformAdapter):
         if not self._client:
             return SendResult(success=False, error="Not connected")
 
-        channel = self._client.get_channel(int(chat_id))
+        channel, target_id, thread_id = await self._resolve_delivery_target(
+            chat_id, metadata
+        )
         if not channel:
-            channel = await self._client.fetch_channel(int(chat_id))
-        if not channel:
-            return SendResult(success=False, error=f"Channel {chat_id} not found")
+            target_kind = "Thread" if thread_id else "Channel"
+            return SendResult(
+                success=False,
+                error=f"{target_kind} {target_id} not found",
+            )
 
         filename = file_name or os.path.basename(file_path)
         with open(file_path, "rb") as fh:
@@ -3319,7 +3435,7 @@ class DiscordAdapter(BasePlatformAdapter):
                     file=file,
                 )
             msg = await channel.send(content=caption if caption else None, file=file)
-        return SendResult(success=True, message_id=str(msg.id))
+        return self._message_send_result(channel, msg, thread_id=thread_id)
 
     async def send_multiple_images(
         self,
@@ -3327,20 +3443,19 @@ class DiscordAdapter(BasePlatformAdapter):
         images: List[Tuple[str, str]],
         metadata: Optional[Dict[str, Any]] = None,
         human_delay: float = 0.0,
-    ) -> None:
-        """Send a batch of images as a single Discord message with multiple attachments.
+    ) -> SendResult:
+        """Send image batches natively and return the final delivery metadata.
 
         Discord permits up to 10 file attachments per message. Batches are
         chunked accordingly. URL images are downloaded into memory and
-        uploaded as inline attachments (same pattern as ``send_image`` so
-        they render inline, not as bare links). Local files are opened
-        directly. On per-chunk failure the remaining images in that chunk
-        fall back to the base per-image loop.
+        uploaded as inline attachments. Local files are opened directly. On a
+        per-chunk failure, the remaining images in that chunk fall back to the
+        base per-image loop.
         """
         if not self._client:
-            return
+            return SendResult(success=False, error="Not connected")
         if not images:
-            return
+            return SendResult(success=False, error="No images to send")
 
         try:
             import discord as _discord_mod
@@ -3348,22 +3463,27 @@ class DiscordAdapter(BasePlatformAdapter):
             from urllib.parse import unquote as _unquote
         except Exception:  # pragma: no cover
             await super().send_multiple_images(chat_id, images, metadata, human_delay)
-            return
+            return SendResult(success=True)
 
         try:
-            channel = self._client.get_channel(int(chat_id))
+            channel, target_id, thread_id = await self._resolve_delivery_target(
+                chat_id, metadata
+            )
             if not channel:
-                channel = await self._client.fetch_channel(int(chat_id))
-            if not channel:
-                logger.warning("[%s] Channel %s not found for multi-image send", self.name, chat_id)
-                return
+                target_kind = "Thread" if thread_id else "Channel"
+                return SendResult(
+                    success=False,
+                    error=f"{target_kind} {target_id} not found",
+                )
         except Exception as e:
             logger.warning("[%s] Failed to resolve channel for multi-image send: %s", self.name, e)
             await super().send_multiple_images(chat_id, images, metadata, human_delay)
-            return
+            return SendResult(success=True)
 
-        CHUNK = 10
-        chunks = [images[i:i + CHUNK] for i in range(0, len(images), CHUNK)]
+        chunk_size = 10
+        chunks = [images[i:i + chunk_size] for i in range(0, len(images), chunk_size)]
+        send_results: List[SendResult] = []
+        warnings: List[str] = []
 
         for chunk_idx, chunk in enumerate(chunks):
             if human_delay > 0 and chunk_idx > 0:
@@ -3386,33 +3506,42 @@ class DiscordAdapter(BasePlatformAdapter):
                         if not is_safe_url(image_url):
                             logger.warning("[%s] Blocked unsafe image URL in batch", self.name)
                             continue
-                        # Download to BytesIO so it renders inline
+                        # Download to BytesIO so it renders inline.
                         try:
                             import aiohttp as _aiohttp
                             from gateway.platforms.base import resolve_proxy_url, proxy_kwargs_for_aiohttp
-                            _proxy = resolve_proxy_url(platform_env_var="DISCORD_PROXY")
-                            _sess_kw, _req_kw = proxy_kwargs_for_aiohttp(_proxy)
+                            proxy = resolve_proxy_url(platform_env_var="DISCORD_PROXY")
+                            session_kwargs, request_kwargs = proxy_kwargs_for_aiohttp(proxy)
                             if aiohttp_session is None:
-                                aiohttp_session = _aiohttp.ClientSession(**_sess_kw)
+                                aiohttp_session = _aiohttp.ClientSession(**session_kwargs)
                             async with aiohttp_session.get(
-                                image_url, timeout=_aiohttp.ClientTimeout(total=30), **_req_kw,
+                                image_url,
+                                timeout=_aiohttp.ClientTimeout(total=30),
+                                **request_kwargs,
                             ) as resp:
                                 if resp.status != 200:
                                     logger.warning(
                                         "[%s] Failed to download image (HTTP %d) in batch: %s",
-                                        self.name, resp.status, image_url[:80],
+                                        self.name,
+                                        resp.status,
+                                        image_url[:80],
                                     )
                                     continue
                                 data = await resp.read()
-                                ct = resp.headers.get("content-type", "image/png")
+                                content_type = resp.headers.get("content-type", "image/png")
                                 ext = "png"
-                                if "jpeg" in ct or "jpg" in ct:
+                                if "jpeg" in content_type or "jpg" in content_type:
                                     ext = "jpg"
-                                elif "gif" in ct:
+                                elif "gif" in content_type:
                                     ext = "gif"
-                                elif "webp" in ct:
+                                elif "webp" in content_type:
                                     ext = "webp"
-                                files.append(_discord_mod.File(_io.BytesIO(data), filename=f"image_{len(files)}.{ext}"))
+                                files.append(
+                                    _discord_mod.File(
+                                        _io.BytesIO(data),
+                                        filename=f"image_{len(files)}.{ext}",
+                                    )
+                                )
                         except Exception as dl_err:
                             logger.warning("[%s] Download failed for %s: %s", self.name, image_url[:80], dl_err)
                             continue
@@ -3420,34 +3549,72 @@ class DiscordAdapter(BasePlatformAdapter):
                 if not files:
                     continue
 
-                # Use the first caption if any (Discord only has one message body for the group)
                 content = captions[0] if captions else None
                 logger.info(
                     "[%s] Sending %d image(s) as single Discord message (chunk %d/%d)",
-                    self.name, len(files), chunk_idx + 1, len(chunks),
+                    self.name,
+                    len(files),
+                    chunk_idx + 1,
+                    len(chunks),
                 )
 
                 if self._is_forum_parent(channel):
-                    await self._forum_post_file(
+                    result = await self._forum_post_file(
                         channel,
                         content=(content or "").strip(),
                         files=files,
                     )
                 else:
-                    await channel.send(content=content, files=files)
+                    msg = await channel.send(content=content, files=files)
+                    result = self._message_send_result(
+                        channel, msg, thread_id=thread_id
+                    )
+                send_results.append(result)
             except Exception as e:
                 logger.warning(
                     "[%s] Multi-image Discord send failed (chunk %d/%d), falling back to per-image: %s",
-                    self.name, chunk_idx + 1, len(chunks), e,
+                    self.name,
+                    chunk_idx + 1,
+                    len(chunks),
+                    e,
                     exc_info=True,
                 )
-                await super().send_multiple_images(chat_id, chunk, metadata, human_delay=human_delay)
+                await super().send_multiple_images(
+                    chat_id, chunk, metadata, human_delay=human_delay
+                )
+                warnings.append(
+                    f"Batch {chunk_idx + 1}/{len(chunks)} used per-image fallback: {e}"
+                )
             finally:
                 if aiohttp_session is not None:
                     try:
                         await aiohttp_session.close()
                     except Exception:
                         pass
+
+        if not send_results:
+            if warnings:
+                return SendResult(
+                    success=True,
+                    raw_response={"warnings": warnings},
+                )
+            return SendResult(success=False, error="No deliverable images remained")
+
+        last_result = send_results[-1]
+        raw_response = dict(last_result.raw_response or {})
+        attachments: List[Dict[str, Any]] = []
+        for result in send_results:
+            result_raw = result.raw_response or {}
+            attachments.extend(result_raw.get("attachments") or [])
+        raw_response["attachments"] = _serialize_discord_attachments(attachments)
+        if warnings:
+            raw_response["warnings"] = warnings
+        return SendResult(
+            success=all(result.success for result in send_results),
+            message_id=last_result.message_id,
+            error=next((result.error for result in send_results if not result.success), None),
+            raw_response=raw_response,
+        )
 
     async def play_tts(
         self,
@@ -3480,11 +3647,15 @@ class DiscordAdapter(BasePlatformAdapter):
         try:
             import io
 
-            channel = self._client.get_channel(int(chat_id))
+            channel, target_id, thread_id = await self._resolve_delivery_target(
+                chat_id, metadata
+            )
             if not channel:
-                channel = await self._client.fetch_channel(int(chat_id))
-            if not channel:
-                return SendResult(success=False, error=f"Channel {chat_id} not found")
+                target_kind = "Thread" if thread_id else "Channel"
+                return SendResult(
+                    success=False,
+                    error=f"{target_kind} {target_id} not found",
+                )
 
             if not os.path.exists(audio_path):
                 return SendResult(success=False, error=f"Audio file not found: {audio_path}")
@@ -3544,12 +3715,16 @@ class DiscordAdapter(BasePlatformAdapter):
                     discord.http.Route("POST", "/channels/{channel_id}/messages", channel_id=channel.id),
                     form=form,
                 )
-                return SendResult(success=True, message_id=str(msg_data["id"]))
+                return self._message_send_result(
+                    channel, msg_data, thread_id=thread_id
+                )
             except Exception as voice_err:
                 logger.debug("Voice message flag failed, falling back to file: %s", voice_err)
                 file = discord.File(io.BytesIO(file_data), filename=filename)
                 msg = await channel.send(file=file)
-                return SendResult(success=True, message_id=str(msg.id))
+                return self._message_send_result(
+                    channel, msg, thread_id=thread_id
+                )
         except Exception as e:  # pragma: no cover - defensive logging
             logger.error("[%s] Failed to send audio, falling back to base adapter: %s", self.name, e, exc_info=True)
             return await super().send_voice(chat_id, audio_path, caption, reply_to, metadata=metadata)
@@ -4491,7 +4666,9 @@ class DiscordAdapter(BasePlatformAdapter):
     ) -> SendResult:
         """Send a local image file natively as a Discord file attachment."""
         try:
-            return await self._send_file_attachment(chat_id, image_path, caption)
+            return await self._send_file_attachment(
+                chat_id, image_path, caption, metadata=metadata
+            )
         except FileNotFoundError:
             return SendResult(success=False, error=f"Image file not found: {image_path}")
         except Exception as e:  # pragma: no cover - defensive logging
@@ -4517,11 +4694,15 @@ class DiscordAdapter(BasePlatformAdapter):
         try:
             import aiohttp
 
-            channel = self._client.get_channel(int(chat_id))
+            channel, target_id, thread_id = await self._resolve_delivery_target(
+                chat_id, metadata
+            )
             if not channel:
-                channel = await self._client.fetch_channel(int(chat_id))
-            if not channel:
-                return SendResult(success=False, error=f"Channel {chat_id} not found")
+                target_kind = "Thread" if thread_id else "Channel"
+                return SendResult(
+                    success=False,
+                    error=f"{target_kind} {target_id} not found",
+                )
 
             # Download the image and send as a Discord file attachment
             # (Discord renders attachments inline, unlike plain URLs)
@@ -4559,7 +4740,9 @@ class DiscordAdapter(BasePlatformAdapter):
                         content=caption if caption else None,
                         file=file,
                     )
-                    return SendResult(success=True, message_id=str(msg.id))
+                    return self._message_send_result(
+                        channel, msg, thread_id=thread_id
+                    )
 
         except ImportError:
             logger.warning(
@@ -4567,7 +4750,9 @@ class DiscordAdapter(BasePlatformAdapter):
                 self.name,
                 exc_info=True,
             )
-            return await super().send_image(chat_id, image_url, caption, reply_to)
+            return await super().send_image(
+                chat_id, image_url, caption, reply_to, metadata=metadata
+            )
         except Exception as e:  # pragma: no cover - defensive logging
             logger.error(
                 "[%s] Failed to send image attachment, falling back to URL: %s",
@@ -4575,7 +4760,9 @@ class DiscordAdapter(BasePlatformAdapter):
                 e,
                 exc_info=True,
             )
-            return await super().send_image(chat_id, image_url, caption, reply_to)
+            return await super().send_image(
+                chat_id, image_url, caption, reply_to, metadata=metadata
+            )
 
     async def send_animation(
         self,
@@ -4656,7 +4843,9 @@ class DiscordAdapter(BasePlatformAdapter):
     ) -> SendResult:
         """Send a local video file natively as a Discord attachment."""
         try:
-            return await self._send_file_attachment(chat_id, video_path, caption)
+            return await self._send_file_attachment(
+                chat_id, video_path, caption, metadata=metadata
+            )
         except FileNotFoundError:
             return SendResult(success=False, error=f"Video file not found: {video_path}")
         except Exception as e:  # pragma: no cover - defensive logging
@@ -4674,7 +4863,13 @@ class DiscordAdapter(BasePlatformAdapter):
     ) -> SendResult:
         """Send an arbitrary file natively as a Discord attachment."""
         try:
-            return await self._send_file_attachment(chat_id, file_path, caption, file_name=file_name)
+            return await self._send_file_attachment(
+                chat_id,
+                file_path,
+                caption,
+                file_name=file_name,
+                metadata=metadata,
+            )
         except FileNotFoundError:
             return SendResult(success=False, error=f"File not found: {file_path}")
         except Exception as e:  # pragma: no cover - defensive logging
@@ -8983,6 +9178,22 @@ async def _standalone_send(
         media_files = media_files or []
         last_data = None
         warnings = []
+        delivery_channel_id = str(thread_id or chat_id)[:_DISCORD_RESULT_ID_LIMIT]
+        result_attachments: List[Dict[str, Any]] = []
+
+        def _remember_delivery(data: Any) -> None:
+            nonlocal delivery_channel_id, result_attachments
+            if not isinstance(data, dict):
+                return
+            response_channel_id = data.get("channel_id")
+            if response_channel_id not in {None, ""}:
+                delivery_channel_id = str(response_channel_id)[
+                    :_DISCORD_RESULT_ID_LIMIT
+                ]
+            serialized = _serialize_discord_attachments(data.get("attachments"))
+            result_attachments = _serialize_discord_attachments(
+                [*result_attachments, *serialized]
+            )
 
         # Thread endpoint: Discord threads are channels; send directly to the thread ID.
         if thread_id:
@@ -9097,14 +9308,30 @@ async def _standalone_send(
                                 _DISCORD_STANDALONE_JSON_BODY_LIMIT_BYTES,
                             )
 
-                thread_id_created = data.get("id")
-                starter_msg_id = (data.get("message") or {}).get("id", thread_id_created)
+                thread_id_created = (
+                    str(data.get("id"))[:_DISCORD_RESULT_ID_LIMIT]
+                    if data.get("id") is not None
+                    else None
+                )
+                starter_data = data.get("message") or {}
+                starter_msg_id = starter_data.get("id", thread_id_created)
+                starter_channel_id = str(
+                    starter_data.get("channel_id") or thread_id_created or chat_id
+                )[:_DISCORD_RESULT_ID_LIMIT]
                 result = {
                     "success": True,
                     "platform": "discord",
                     "chat_id": chat_id,
+                    "channel_id": starter_channel_id,
                     "thread_id": thread_id_created,
-                    "message_id": starter_msg_id,
+                    "message_id": (
+                        str(starter_msg_id)[:_DISCORD_RESULT_ID_LIMIT]
+                        if starter_msg_id is not None
+                        else None
+                    ),
+                    "attachments": _serialize_discord_attachments(
+                        starter_data.get("attachments")
+                    ),
                 }
                 if warnings:
                     result["warnings"] = warnings
@@ -9126,6 +9353,7 @@ async def _standalone_send(
                         resp,
                         _DISCORD_STANDALONE_JSON_BODY_LIMIT_BYTES,
                     )
+                    _remember_delivery(last_data)
 
             # Send each media file as a separate multipart upload. When a
             # MEDIA:<path> caption was supplied, ride it as the message content
@@ -9149,6 +9377,7 @@ async def _standalone_send(
                                     last_data = await _standalone_read_json_limited(
                                         resp, _DISCORD_STANDALONE_JSON_BODY_LIMIT_BYTES,
                                     )
+                                    _remember_delivery(last_data)
                                     caption_pending = False
                         except Exception:
                             logger.warning("Discord caption-fallback send failed for missing media")
@@ -9179,6 +9408,7 @@ async def _standalone_send(
                                 resp,
                                 _DISCORD_STANDALONE_JSON_BODY_LIMIT_BYTES,
                             )
+                            _remember_delivery(last_data)
                 except Exception as e:
                     warning = _standalone_sanitize_error(f"Failed to send media {media_path}: {e}")
                     logger.error(warning)
@@ -9190,7 +9420,20 @@ async def _standalone_send(
                 return {"error": error, "warnings": warnings}
             return {"error": error}
 
-        result = {"success": True, "platform": "discord", "chat_id": chat_id, "message_id": last_data.get("id")}
+        result = {
+            "success": True,
+            "platform": "discord",
+            "chat_id": chat_id,
+            "channel_id": delivery_channel_id,
+            "message_id": (
+                str(last_data.get("id"))[:_DISCORD_RESULT_ID_LIMIT]
+                if last_data.get("id") is not None
+                else None
+            ),
+            "attachments": result_attachments,
+        }
+        if thread_id:
+            result["thread_id"] = str(thread_id)[:_DISCORD_RESULT_ID_LIMIT]
         if warnings:
             result["warnings"] = warnings
         return result
