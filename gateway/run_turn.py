@@ -2192,6 +2192,7 @@ class GatewayTurnMixin:
                 # Persist the coherent context+channel pair before execution: a crash during the
                 # human turn may be followed by an internal startup-resume on the next process.
                 await self._persist_prompt_pins(session_key, _run_start_session_id)
+            await self._record_task_intent_event(event=event, session_id=_run_start_session_id, session_key=session_key)
             agent_result = await self._run_agent(
                 message=message_text, context_prompt=prepared.context_prompt, history=history, source=_turn_source,
                 session_id=_run_start_session_id, session_key=session_key,
@@ -2206,6 +2207,7 @@ class GatewayTurnMixin:
                 persist_user_display_metadata={
                     "gateway_input_owner": prepared.persistence_owner,
                     **reply_expected_metadata(event.reply_expected), **diagnostic_metadata(event)},
+                task_intent_metadata=(getattr(event, "metadata", None) or {}).get("task_intent_message_metadata"),
                 message_type=event.message_type,
                 scheduled_heartbeat=bool(getattr(event, "_heartbeat_session_id", None)),
             )
@@ -4235,6 +4237,7 @@ class GatewayTurnMixin:
         reply_expected: Optional[bool] = None,
         scheduled_heartbeat: bool = False,
         title_user_message: Optional[str] = None,
+        task_intent_metadata: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Run the agent; returns the full run_conversation result dict.
 
@@ -4275,6 +4278,7 @@ class GatewayTurnMixin:
             persist_user_display_metadata=persist_user_display_metadata,
             scheduled_heartbeat=scheduled_heartbeat,
         )
+        turn_ctx.task_intent_metadata = task_intent_metadata
         _status_thread_metadata = self._run_agent_bind_turn_wiring(
             turn_ctx, turn_runner, source, event_message_id, disp._native_slack_task_cards,
         )

@@ -8,7 +8,7 @@ single-element lists so mutation stays visible to the outer body.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Callable, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 
 @dataclass
@@ -99,3 +99,4 @@ class TurnContext:
     _native_slack_task_cards: bool = False
     native_tool_start_callback: Optional[Callable] = None
     native_tool_complete_callback: Optional[Callable] = None
+    task_intent_metadata: Optional[Dict[str, Any]] = None

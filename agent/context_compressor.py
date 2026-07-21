@@ -4308,10 +4308,14 @@ Write only the summary body. Do not include any preamble or prefix."""
     @classmethod
     def _derive_auto_focus_topic(cls, messages: List[Dict[str, Any]]) -> Optional[str]:
         """Infer a compact focus hint from the most recent real user turns."""
+        from agent.conversation_compression import _is_real_user_message
+
         candidates: list[str] = []
         for msg in reversed(messages):
             # display_kind notices are operational traffic, not user intent.
             if msg.get("role") != "user" or cls._is_synthetic_compression_user_turn(msg) or msg.get("display_kind"):
+                continue
+            if not _is_real_user_message(msg):
                 continue
             text = _redact_compaction_text(_content_text_for_contains(msg.get("content")).strip())
             if not text:
@@ -4340,6 +4344,28 @@ Write only the summary body. Do not include any preamble or prefix."""
         for msg in reversed(messages):
             if msg.get("role") != "user" or not _is_real_user_message(msg):
                 continue
+            task_intent = msg.get("_task_intent")
+            if isinstance(task_intent, dict):
+                raw_text = task_intent.get("raw_text")
+                if isinstance(raw_text, str):
+                    raw_text = _redact_compaction_text(raw_text)
+                if (
+                    isinstance(raw_text, str)
+                    and raw_text
+                    and task_intent.get("synthetic") is not True
+                    and task_intent.get("source_kind")
+                    in {"direct_user", "direct_external_user"}
+                ):
+                    if len(raw_text) > _ACTIVE_TASK_MAX_CHARS:
+                        raw_text = (
+                            raw_text[: _ACTIVE_TASK_MAX_CHARS - 15]
+                            + " ...[truncated]"
+                        )
+                    return (
+                        "User asked (deterministic raw ingress):\n"
+                        f"{raw_text}\n"
+                        "Historical only; newer protected-tail messages after this summary win."
+                    )
             text = _redact_compaction_text(_content_text_for_contains(msg.get("content")).strip())
             if not text:
                 continue
