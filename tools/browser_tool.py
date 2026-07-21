@@ -76,6 +76,7 @@ from hermes_constants import (
 from utils import env_int, is_truthy_value
 from hermes_cli.config import DEFAULT_CONFIG, cfg_get
 from hermes_cli._subprocess_compat import windows_hide_flags
+from tools.environments.base import _child_oom_score_adj_kwargs
 
 
 def __getattr__(name: str):
@@ -1302,6 +1303,7 @@ def _run_chrome_fallback_command(
             proc = subprocess.Popen(
                 full, stdout=stdout_fd, stderr=stderr_fd,
                 stdin=subprocess.DEVNULL, env=browser_env,
+                **_child_oom_score_adj_kwargs(),
                 **_popen_extra,
             )
         finally:
@@ -2963,6 +2965,7 @@ def _run_browser_command(
                 stderr=stderr_fd,
                 stdin=subprocess.DEVNULL,
                 env=browser_env,
+                **_child_oom_score_adj_kwargs(),
                 **_popen_extra,
             )
         finally:

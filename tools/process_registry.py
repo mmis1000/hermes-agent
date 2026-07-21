@@ -43,6 +43,7 @@ import uuid
 from pathlib import Path
 
 _IS_WINDOWS = platform.system() == "Windows"
+from tools.environments.base import _child_oom_score_adj_kwargs
 from tools.environments.local import _find_shell, _resolve_safe_cwd, _sanitize_subprocess_env
 from hermes_cli._subprocess_compat import windows_hide_flags
 from dataclasses import dataclass, field
@@ -1049,6 +1050,7 @@ class ProcessRegistry:
                     cwd=session.cwd,
                     env=pty_env,
                     dimensions=(30, 120),
+                    **_child_oom_score_adj_kwargs(),
                 )
                 session.pid = pty_proc.pid
                 session.host_start_time = self._safe_host_start_time(session.pid)
@@ -1093,7 +1095,9 @@ class ProcessRegistry:
         # stdout is a pipe, hiding output from process(action="poll")).
         bg_env = _sanitize_subprocess_env(os.environ, env_vars)
         bg_env["PYTHONUNBUFFERED"] = "1"
-        _popen_kwargs = {"creationflags": windows_hide_flags()} if _IS_WINDOWS else {}
+        _popen_kwargs: Dict[str, Any] = (
+            {"creationflags": windows_hide_flags()} if _IS_WINDOWS else {}
+        )
 
         # Cgroup isolation (#70716): when running in the live, supervised
         # systemd gateway, wrap the worker in its own transient systemd
@@ -1153,6 +1157,7 @@ class ProcessRegistry:
             stderr=subprocess.STDOUT,
             stdin=subprocess.DEVNULL,
             start_new_session=popen_start_new_session,
+            **_child_oom_score_adj_kwargs(),
             **_popen_kwargs,
         )
 
