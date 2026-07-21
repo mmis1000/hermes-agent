@@ -19,7 +19,7 @@ from pathlib import Path
 from hermes_constants import get_process_hermes_home
 from tools.environments.base import BaseEnvironment
 from tools.environments.base_output import _pipe_stdin
-from hermes_cli._subprocess_compat import windows_hide_flags
+from hermes_cli._subprocess_compat import child_oom_score_adj_kwargs, windows_hide_flags
 from tools.environments.local_env_policy import (  # noqa: F401 — _HERMES_PROVIDER_ENV_BLOCKLIST stays importable from here
     _ALWAYS_STRIP_FOLDED, _ALWAYS_STRIP_KEYS, _HERMES_PROVIDER_ENV_BLOCKLIST, _HERMES_PROVIDER_ENV_FORCE_PREFIX,
     _is_hermes_internal_secret, _is_provider_env_blocklisted, _is_terminal_first_party_env,
@@ -1002,7 +1002,7 @@ class LocalEnvironment(BaseEnvironment):
             args, text=True, env=_make_run_env(self.env), encoding="utf-8", errors="replace",
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             stdin=subprocess.PIPE if stdin_data is not None else subprocess.DEVNULL,
-            start_new_session=True, cwd=self.cwd,
+            start_new_session=True, cwd=self.cwd, **child_oom_score_adj_kwargs(),
             **({"creationflags": windows_hide_flags()} if _IS_WINDOWS else {}))
         if not _IS_WINDOWS:
             with contextlib.suppress(ProcessLookupError):

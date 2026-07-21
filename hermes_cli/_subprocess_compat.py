@@ -26,6 +26,7 @@ __all__ = [
     "windows_detach_flags_without_breakaway",
     "windows_hide_flags",
     "windows_detach_popen_kwargs",
+    "child_oom_score_adj_kwargs",
     "bounded_git_probe",
     "bounded_probe_run",
     "selected_git_env",
@@ -250,6 +251,42 @@ def windows_detach_popen_kwargs() -> dict:
     if IS_WINDOWS:
         return {"creationflags": windows_detach_flags()}
     return {"start_new_session": True}
+
+
+def _child_oom_score_adj() -> int | None:
+    """``HERMES_CHILD_OOM_SCORE_ADJ`` (default 300) when it is a valid positive ``oom_score_adj``."""
+    try:
+        value = int(os.getenv("HERMES_CHILD_OOM_SCORE_ADJ", "300").strip())
+    except ValueError:
+        return None
+    return value if 1 <= value <= 1000 else None
+
+
+def child_oom_score_adj_kwargs(existing_child_setup=None) -> dict:
+    """Popen kwargs that make a Linux child easier for the OOM killer to reclaim than this process.
+
+    The positive ``oom_score_adj`` is written before exec, so grandchildren inherit it, and an existing
+    ``preexec_fn`` is composed rather than replaced. Other platforms, invalid values and ``/proc``
+    permission errors are no-ops. The callback only makes low-level ``os`` calls (post-fork safe).
+    """
+    value = _child_oom_score_adj() if sys.platform.startswith("linux") else None
+    if value is None:
+        return {"preexec_fn": existing_child_setup} if existing_child_setup else {}
+    encoded = str(value).encode("ascii")
+
+    def _set_child_oom_score_adj() -> None:
+        if existing_child_setup is not None:
+            existing_child_setup()
+        try:
+            fd = os.open("/proc/self/oom_score_adj", os.O_WRONLY)
+            try:
+                os.write(fd, encoded)
+            finally:
+                os.close(fd)
+        except OSError:
+            pass
+
+    return {"preexec_fn": _set_child_oom_score_adj}
 
 
 # Read-only probes must never lazy-fetch. In a partial (blobless/treeless) clone a missing object makes

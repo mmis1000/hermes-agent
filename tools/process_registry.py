@@ -26,7 +26,7 @@ _IS_WINDOWS = platform.system() == "Windows"
 # See #70716.
 _IS_LINUX = platform.system() == "Linux"
 from tools.environments.local import _find_shell, _resolve_safe_cwd, _sanitize_subprocess_env
-from hermes_cli._subprocess_compat import windows_hide_flags
+from hermes_cli._subprocess_compat import child_oom_score_adj_kwargs, windows_hide_flags
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Literal, NamedTuple, Optional
 
@@ -1276,7 +1276,7 @@ class ProcessRegistry(ProcessCheckpointMixin):
         # hang waiting for `q` — default them to cat, honoring any pager the user set.
         pty_env.setdefault("GIT_PAGER", "cat")
         pty_env.setdefault("PAGER", "cat")
-        pty_proc = _PtyProcessCls.spawn(pty_argv, cwd=session.cwd, env=pty_env, dimensions=(30, 120))
+        pty_proc = _PtyProcessCls.spawn(pty_argv, cwd=session.cwd, env=pty_env, dimensions=(30, 120), **child_oom_score_adj_kwargs())
         session.pid = pty_proc.pid
         session.host_start_time = self._safe_host_start_time(session.pid)
         session._pty = pty_proc
@@ -1331,7 +1331,7 @@ class ProcessRegistry(ProcessCheckpointMixin):
         proc = subprocess.Popen(
             spawn_argv, text=True, cwd=session.cwd, env=spawn_env, encoding="utf-8",
             errors="replace", stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
-            start_new_session=True, **_popen_kwargs)
+            start_new_session=True, **child_oom_score_adj_kwargs(), **_popen_kwargs)
         session.process = proc
         session.pid = proc.pid
         session.host_start_time = self._safe_host_start_time(session.pid)

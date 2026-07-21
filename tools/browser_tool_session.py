@@ -14,7 +14,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
-from hermes_cli._subprocess_compat import windows_hide_flags
+from hermes_cli._subprocess_compat import child_oom_score_adj_kwargs, windows_hide_flags
 from tools.browser_tool_origin import origin as _bt
 from tools import browser_tool_cdp as _cdp
 from tools import browser_tool_cloud as _cloud
@@ -232,7 +232,7 @@ def _popen_agent_browser(argv: List[str], env: Dict[str, str], socket_dir: str, 
             _si = subprocess.STARTUPINFO()
             _si.dwFlags |= subprocess.STARTF_USESTDHANDLES
             _popen_extra = {"creationflags": windows_hide_flags(), "close_fds": True, "startupinfo": _si}
-        return subprocess.Popen(argv, stdout=fds[0], stderr=fds[1], stdin=stdin, env=env, **_popen_extra)
+        return subprocess.Popen(argv, stdout=fds[0], stderr=fds[1], stdin=stdin, env=env, **_popen_extra, **child_oom_score_adj_kwargs())
     finally:
         for fd in fds:
             os.close(fd)

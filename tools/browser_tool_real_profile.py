@@ -13,6 +13,7 @@ import sys
 import time
 from typing import Optional, Tuple
 from agent.proxy_bypass import loopback_request_kwargs
+from hermes_cli._subprocess_compat import child_oom_score_adj_kwargs
 from tools.browser_tool_origin import origin_module as _origin
 from tools import browser_tool_cloud as _cloud
 from tools import browser_tool_install as _install
@@ -172,7 +173,7 @@ def _launch_real_profile_chrome(real_binary: str, copy_dir: str) -> Tuple[Option
         chrome_argv.append("--headless=new")
     try:
         chrome_proc = subprocess.Popen(chrome_argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                       stdin=subprocess.DEVNULL, start_new_session=True, env=browser_env)
+                                       stdin=subprocess.DEVNULL, start_new_session=True, env=browser_env, **child_oom_score_adj_kwargs())
     except (subprocess.SubprocessError, OSError) as e:
         return None, f"{_RP}the launch failed: {e}"
     _bt._real_profile_chrome_procs.append(chrome_proc)
