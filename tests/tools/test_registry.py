@@ -691,6 +691,7 @@ class TestDeregisterAuthorization:
             reg.deregister("protected")
         assert reg._tools.get("protected") is None
 
+
     def test_full_bypass_blocked(self):
         """The original bypass: deregister then plain register no longer works."""
         reg = self._reg()

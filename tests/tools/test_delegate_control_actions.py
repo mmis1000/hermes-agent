@@ -1,3 +1,4 @@
+import inspect
 """delegate_task(action=...) — model-facing live orchestration of subagents.
 
 Covers the control plane added to delegate_task: action='list' /
@@ -766,3 +767,9 @@ def test_control_action_not_blocked_at_spawn_cap():
     )
     # And spawns remain blocked afterwards — the control call didn't reset it
     assert ctl2.before_call("delegate_task", {"goal": "c"}).action == "block"
+
+
+def _dispatch_parent():
+    parent = _StubParent()
+    parent._delegate_depth = 0
+    return parent

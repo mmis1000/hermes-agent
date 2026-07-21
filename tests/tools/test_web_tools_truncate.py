@@ -42,6 +42,7 @@ class TestTruncation:
         assert truncated is False
 
 
+
     def test_truncation_stores_full_text_readable(self, tmp_path, monkeypatch):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
         body = "UNIQUE_MIDDLE_MARKER\n" + ("\n".join(f"row {i}" for i in range(5000)))

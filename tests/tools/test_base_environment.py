@@ -103,6 +103,7 @@ class TestBoundedOutputCollector:
 
 
 
+
 class TestAtomicSnapshotWrite:
     """Regression for #38249: concurrent terminal calls in one session both
     source AND rewrite the shared env snapshot. A non-atomic ``export -p >

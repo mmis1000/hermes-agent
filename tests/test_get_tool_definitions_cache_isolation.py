@@ -34,6 +34,7 @@ def _clear_cache():
 
 class TestQuietModeCacheIsolation:
 
+
     def test_first_uncached_call_returns_fresh_list(self):
         """The first quiet_mode call must not alias the cached object \u2014
         otherwise a caller mutating the returned list mutates the cache."""

@@ -749,3 +749,5 @@ registry.register(
     emoji="🔀",
     dynamic_schema_overrides=_build_dynamic_schema_overrides,
 )
+
+from tools.delegate_tool_registry import (interrupt_subagent_status, forward_pending_subagent_steers, _sanitize_live_value, redact_observable_text, _bounded_live_preview, _append_live_event, _append_live_text)

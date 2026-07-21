@@ -1966,6 +1966,7 @@ class TestHandleProcessRedaction:
         assert "sk-proj-AAAABBBBCCCCDDDDEEEEFFFFGGGG" not in entry["output_preview"]
         assert "curl" in entry["command"]
 
+
     def test_disabled_passes_through(self, monkeypatch):
         import agent.redact as _r
         monkeypatch.setattr(_r, "_REDACT_ENABLED", False)
