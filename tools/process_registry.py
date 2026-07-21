@@ -88,6 +88,130 @@ WATCH_GLOBAL_MAX_PER_WINDOW = 15
 WATCH_GLOBAL_WINDOW_SECONDS = 10
 WATCH_GLOBAL_COOLDOWN_SECONDS = 30
 
+_ASYNC_DELIVERY_TOKEN_KEY = "_async_delivery_claim_token"
+_ASYNC_DELIVERY_ACCEPTED_KEY = "_async_delivery_accepted"
+
+
+def prepare_notification_delivery(event: Dict[str, Any]) -> str:
+    """Return ``deliver``, ``defer``, or ``drop`` for one queued event.
+
+    A managed async completion is claimed through SQLite before any formatting
+    or injection. Private token/acceptance fields stay only on the in-process
+    event and let an acknowledgement failure retry bookkeeping without a second
+    user-visible injection.
+    """
+    if event.get("type") != "async_delegation":
+        return "deliver"
+
+    if event.get("event_kind") == "fallback":
+        return "deliver"
+    token = event.get(_ASYNC_DELIVERY_TOKEN_KEY)
+    if token and event.get(_ASYNC_DELIVERY_ACCEPTED_KEY):
+        if finish_notification_delivery(event, delivered=True):
+            return "drop"
+        try:
+            from tools.async_delegation import inspect_async_delivery_claim
+
+            status = inspect_async_delivery_claim(
+                str(event.get("delegation_id") or ""),
+                str(token),
+                run_id=str(event["run_id"]) if event.get("run_id") else None,
+            )
+        except Exception:
+            logger.debug("accepted delivery claim inspection failed", exc_info=True)
+            return "defer"
+        if status == "current":
+            return "defer"
+        # Downstream already accepted this event. If this exact token is no
+        # longer current, another authority completed/pruned it; never inject it.
+        event.pop(_ASYNC_DELIVERY_TOKEN_KEY, None)
+        event.pop(_ASYNC_DELIVERY_ACCEPTED_KEY, None)
+        return "drop"
+
+    if token:
+        try:
+            from tools.async_delegation import inspect_async_delivery_claim
+
+            status = inspect_async_delivery_claim(
+                str(event.get("delegation_id") or ""),
+                str(token),
+                run_id=str(event["run_id"]) if event.get("run_id") else None,
+            )
+        except Exception:
+            logger.debug("retained async delivery claim inspection failed", exc_info=True)
+            return "defer"
+        if status == "current":
+            return "deliver"
+        event.pop(_ASYNC_DELIVERY_TOKEN_KEY, None)
+        if status in {"held_by_wait", "delivering"}:
+            return "defer"
+        if status != "pending":
+            return "drop"
+
+    try:
+        from tools.async_delegation import claim_async_delivery
+
+        claim = claim_async_delivery(
+            str(event.get("delegation_id") or ""),
+            managed=bool(event.get("delivery_managed", False)),
+            run_id=str(event["run_id"]) if event.get("run_id") else None,
+        )
+    except Exception:
+        logger.debug("async delivery claim failed", exc_info=True)
+        return "defer"
+    status = claim.get("status")
+    if status == "claimed":
+        event[_ASYNC_DELIVERY_TOKEN_KEY] = claim["token"]
+        return "deliver"
+    if status == "legacy":
+        return "deliver"
+    if status in {"held", "not_ready"}:
+        return "defer"
+    return "drop"
+
+
+def finish_notification_delivery(event: Dict[str, Any], *, delivered: bool) -> bool:
+    """Commit/release the exact managed claim attached to ``event``."""
+    token = event.get(_ASYNC_DELIVERY_TOKEN_KEY)
+    if not token:
+        return False
+    if delivered:
+        # Set this before the fallible durable acknowledgement.
+        event[_ASYNC_DELIVERY_ACCEPTED_KEY] = True
+    effective_delivered = bool(delivered or event.get(_ASYNC_DELIVERY_ACCEPTED_KEY))
+    try:
+        from tools.async_delegation import finish_async_delivery
+
+        finished = finish_async_delivery(
+            str(event.get("delegation_id") or ""),
+            str(token),
+            delivered=effective_delivered,
+            run_id=str(event["run_id"]) if event.get("run_id") else None,
+        )
+    except Exception:
+        logger.debug("async delivery finish failed", exc_info=True)
+        return False
+    if finished:
+        event.pop(_ASYNC_DELIVERY_TOKEN_KEY, None)
+        event.pop(_ASYNC_DELIVERY_ACCEPTED_KEY, None)
+    return finished
+
+
+def commit_notification_delivery(event: Dict[str, Any], completion_queue: Any) -> bool:
+    """Acknowledge accepted delivery or queue a bookkeeping-only retry."""
+    if not event.get(_ASYNC_DELIVERY_TOKEN_KEY):
+        return True
+    committed = finish_notification_delivery(event, delivered=True)
+    if not committed:
+        completion_queue.put(event)
+    return committed
+
+
+def requeue_notification_delivery(event: Dict[str, Any], completion_queue: Any) -> None:
+    """Release this event's claim and requeue it for a future injection attempt."""
+    finish_notification_delivery(event, delivered=False)
+    completion_queue.put(event)
+
 
 # --- systemd cgroup isolation for gateway-spawned local executors ------------------
 # Under a systemd gateway with MemoryMax, local background commands inherit the gateway's
@@ -528,6 +652,7 @@ class ProcessSession:
     session_key: str = ""                       # Gateway session key (reset protection)
     pid: Optional[int] = None
     process: Optional[subprocess.Popen] = None  # Popen handle (local only)
+    kill_callback: Any = field(default=None, repr=False)
     env_ref: Any = None                         # Environment object (sandbox spawns)
     cwd: Optional[str] = None
     started_at: float = 0.0                     # time.time() of spawn
@@ -1203,6 +1328,74 @@ class ProcessRegistry(ProcessCheckpointMixin):
             owner_task_id=owner_task_id, session_key=session_key, cwd=cwd,
             parent_session_id=get_session_env("HERMES_SESSION_ID", ""),
             started_at=time.time(), **extra)
+
+    def adopt_foreground_process(
+        self,
+        process: Any,
+        *,
+        command: str,
+        task_id: str = "",
+        session_key: str = "",
+        cwd: Optional[str] = None,
+        env_ref: Any = None,
+        initial_output: str = "",
+        kill_callback: Any = None,
+        notify_on_complete: bool = True,
+    ) -> ProcessSession:
+        """Take ownership of an already-running foreground process handle."""
+        pid = getattr(process, "pid", None)
+        session = ProcessSession(
+            id=f"proc_{uuid.uuid4().hex[:12]}",
+            command=command,
+            task_id=task_id,
+            session_key=session_key,
+            pid=pid if isinstance(pid, int) else None,
+            process=process,
+            env_ref=env_ref,
+            kill_callback=kill_callback,
+            cwd=cwd,
+            started_at=time.time(),
+            host_start_time=(
+                self._safe_host_start_time(pid) if isinstance(pid, int) else None
+            ),
+            output_buffer=str(initial_output or "")[-MAX_OUTPUT_CHARS:],
+            notify_on_complete=bool(notify_on_complete),
+        )
+        with self._lock:
+            self._prune_if_needed()
+            self._running[session.id] = session
+        self._write_checkpoint()
+        return session
+
+    def update_adopted_output(
+        self, session: ProcessSession, output: str, chunk: str = ""
+    ) -> None:
+        with session._lock:
+            if session.exited:
+                return
+            session.output_buffer = str(output or "")[-session.max_output_chars :]
+        if chunk:
+            self._check_watch_patterns(session, chunk)
+            self._emit_output(session, chunk)
+
+    def finish_adopted_process(
+        self,
+        session: ProcessSession,
+        *,
+        output: str,
+        exit_code: Optional[int],
+        completion_reason: str = "exited",
+        termination_source: str = "",
+    ) -> None:
+        with session._lock:
+            if session.exited:
+                return
+            session.output_buffer = str(output or "")[-session.max_output_chars :]
+            session.exit_code = exit_code
+            session.completion_reason = completion_reason
+            session.termination_source = termination_source
+            session.exited = True
+        self._move_to_finished(session)
 
     @staticmethod
     def _env_temp_dir(env: Any) -> str:
@@ -1941,6 +2134,17 @@ class ProcessRegistry(ProcessCheckpointMixin):
         equality; non-owned events are re-queued for their owner. No filter consumes
         everything (legacy single-session) except restored delegation payloads (fail-closed)."""
         self.restore_completions()
+        try:
+            from tools.async_delegation import restore_stale_wait_completions
+
+            restore_stale_wait_completions(
+                self.completion_queue,
+                session_key=session_key or "",
+                owns_event=owns_event,
+            )
+        except Exception:
+            logger.debug("Could not recover stale delegation wait holds", exc_info=True)
+
         results: "list[tuple[dict, str]]" = []
         requeue: "list[dict]" = []
         # delegation.surface_child_process_notifications, read at most once per drain
@@ -1978,8 +2182,22 @@ class ProcessRegistry(ProcessCheckpointMixin):
                         "type=%s session_id=%s task_id=%s",
                         evt.get("type", "completion"), _evt_sid, _evt_task_id)
                     continue
-            if text := format_process_notification(evt):
+            delivery_action = prepare_notification_delivery(evt)
+            if delivery_action == "drop":
+                continue
+            if delivery_action == "defer":
+                requeue.append(evt)
+                continue
+            try:
+                text = format_process_notification(evt)
+                if not text:
+                    raise ValueError("notification formatter returned no text")
                 results.append((evt, text))
+            except Exception:
+                logger.debug("notification formatting failed", exc_info=True)
+                if evt.get(_ASYNC_DELIVERY_TOKEN_KEY):
+                    finish_notification_delivery(evt, delivered=False)
+                    requeue.append(evt)
         for evt in requeue:
             self.completion_queue.put(evt)
         return results
@@ -2307,6 +2525,9 @@ class ProcessRegistry(ProcessCheckpointMixin):
         """Deliver the kill via PTY, local Popen tree, sandbox exec or recovered host
         PID. Returns a final result dict when the kill cannot proceed (recycled/dead
         recovered PID, or no runtime handle), else None."""
+        if callable(session.kill_callback):
+            session.kill_callback()
+            return None
         if session._pty:
             try:
                 session._pty.terminate(force=True)
@@ -2801,6 +3022,24 @@ def _handle_process(args, **kw):
     if action in _SESSION_ACTIONS:
         if not session_id:
             return tool_error(f"session_id is required for {action}")
+        task_id = kw.get("task_id")
+        from tools.delegation_scope import attempt_scope_registry
+
+        caller_authority = attempt_scope_registry.get(task_id or "")
+        target_session = process_registry.get(session_id)
+        target_authority = (
+            attempt_scope_registry.get(target_session.task_id)
+            if target_session is not None
+            else None
+        )
+        if caller_authority is not None and caller_authority.state not in {"starting", "active"}:
+            return tool_error(
+                f"protected process authority is {caller_authority.state}"
+            )
+        if (caller_authority is not None or target_authority is not None) and (
+            target_session is None or target_session.task_id != task_id
+        ):
+            return tool_error("process is owned by another protected attempt")
         handler, redact = _SESSION_ACTIONS[action]
         result = handler(session_id, args)
         return json.dumps(_redact_process_result(result) if redact else result, ensure_ascii=False)

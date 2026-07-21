@@ -143,7 +143,11 @@ def _build_docker_env(*, image, cwd, timeout, cc, task_id, host_cwd, **_):
     session_scoped = (_docker_session_isolation_enabled() and task_id != "default"
                       and not _has_isolation_overrides(task_id))
     kwargs = {out: cc.get(key, default) for out, key, default in _DOCKER_KWARGS}
-    if session_scoped:
+    for key in ("trusted_mounts", "suppress_implicit_mounts", "shm_mb", "pids_limit",
+                "delegation_scope_id", "delegation_attempt_id", "trusted_mounts_validator"):
+        if key in cc:
+            kwargs[key] = cc[key]
+    if session_scoped or cc.get("suppress_implicit_mounts"):
         kwargs["persist_across_processes"] = False
     docker_env_obj = _DockerEnvironment(image=image, cwd=cwd, timeout=timeout, task_id=task_id, host_cwd=host_cwd,
                                         **_resources(cc), **kwargs)

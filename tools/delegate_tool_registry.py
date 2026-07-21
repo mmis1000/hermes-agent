@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import copy
+import re
 import logging
 import json
 import threading
 import time
 from typing import Any, Dict, List, Optional
 from agent.interrupt_compat import request_hard_interrupt
+from tools.delegate_tool_results import _stringify_tool_content
 from tools.registry import tool_error
 
 logger = logging.getLogger("tools.delegate_tool")  # log-record parity with the origin module
@@ -51,23 +54,88 @@ def _register_subagent(record: Dict[str, Any]) -> None:
     sid = record.get("subagent_id")
     if not sid:
         return
+    record.setdefault("events", [])
+    record.setdefault("assistant_text_tail", "")
+    record.setdefault("assistant_text_raw_tail", "")
     record.setdefault("accepting_steer", True)
+    durable_expected = (
+        "delegation_attempt_id" in record or "delegation_run_id" in record
+    )
+    delegation_id = None
+    try:
+        from tools.async_delegation import (
+            register_subagent_lifecycle,
+            take_pending_subagent_interrupt,
+        )
+
+        delegation_id = register_subagent_lifecycle(record)
+        # An exact durable attempt that fails validation must never replace the
+        # current live entry for the same stable logical child.
+        if durable_expected and delegation_id is None:
+            return
+    except Exception:
+        logger.debug("subagent/delegation association failed", exc_info=True)
+        if durable_expected:
+            return
+
     with _active_subagents_lock:
         _active_subagents[sid] = record
+    if delegation_id is not None:
+        pending, reason = take_pending_subagent_interrupt(sid)
+        if pending:
+            outcome = interrupt_subagent_status(sid, reason=reason)
+            if outcome != "interrupt_requested":
+                logger.warning(
+                    "queued interrupt for starting subagent %s resolved as %s",
+                    sid,
+                    outcome,
+                )
+        attempt_id = record.get("delegation_attempt_id")
+        if isinstance(attempt_id, str):
+            forward_pending_subagent_steers(sid, attempt_id)
 
-def _unregister_subagent(subagent_id: str, *, agent: Any = None) -> None:
-    """Drop the live record (exact agent identity when given) and keep a bounded attribution stub."""
+def _unregister_subagent(
+    subagent_id: str, attempt_id: Optional[str] = None, *, agent: Any = None
+) -> None:
+    # Archive before removal to close the live-to-durable observability gap.
     with _active_subagents_lock:
         record = _active_subagents.get(subagent_id)
-        if record is None or not (agent is None or record.get("agent") is agent):
-            return
-        _active_subagents.pop(subagent_id, None)
-        sid = record.get("subagent_id")
-        if not sid:
-            return
-        _recent_subagents[sid] = {k: record.get(k) for k in ("goal", "delegation_id", "owner_agent_session_id")}
-        while len(_recent_subagents) > _RECENT_SUBAGENTS_CAP:
-            _recent_subagents.pop(next(iter(_recent_subagents)), None)
+    if record is None or (agent is not None and record.get("agent") is not agent) or (
+        attempt_id is not None
+        and record.get("delegation_attempt_id") != attempt_id
+    ):
+        return
+    tail = {
+        "subagent_id": subagent_id,
+        "parent_id": record.get("parent_id"),
+        "depth": record.get("depth"),
+        "goal": record.get("goal"),
+        "model": record.get("model"),
+        "started_at": record.get("started_at"),
+        "status": record.get("status"),
+        "interrupt_reason": record.get("interrupt_reason"),
+        "tool_count": record.get("tool_count", 0),
+        "last_tool": record.get("last_tool", ""),
+        "events": copy.deepcopy(record.get("events") or []),
+        "assistant_text_tail": str(record.get("assistant_text_tail") or ""),
+        "last_activity_at": record.get("last_activity_at"),
+    }
+    for lifecycle_id in ("delegation_attempt_id", "delegation_run_id"):
+        if lifecycle_id in record:
+            tail[lifecycle_id] = record[lifecycle_id]
+    try:
+        from tools.async_delegation import archive_subagent_tail
+
+        archive_subagent_tail(subagent_id, tail)
+    except Exception:
+        logger.debug("subagent tail archival failed", exc_info=True)
+    finally:
+        with _active_subagents_lock:
+            if _active_subagents.get(subagent_id) is record:
+                _active_subagents.pop(subagent_id, None)
+                _recent_subagents[subagent_id] = {k: record.get(k) for k in ("goal", "delegation_id", "owner_agent_session_id")}
+                while len(_recent_subagents) > _RECENT_SUBAGENTS_CAP:
+                    _recent_subagents.pop(next(iter(_recent_subagents)))
 
 def _close_subagent_steering(subagent_id: str, agent: Any) -> Optional[str]:
     """Atomically close steer acceptance and drain its final durable artifact. ``steer_subagent`` holds the same
@@ -308,3 +376,206 @@ _CONTROL_OUTCOMES = {
         "message; re-delegate a follow-up task if more work is needed.",
     ),
 }
+
+_LIVE_EVENT_LIMIT = 64
+_LIVE_TEXT_CHAR_LIMIT = 8192
+_LIVE_PREVIEW_CHAR_LIMIT = 1200
+_TERMINAL_SUBAGENT_STATUSES = {"completed", "success", "error", "failed", "interrupted", "timeout"}
+
+def interrupt_subagent_status(subagent_id: str, reason: str = "") -> str:
+    """Request a cooperative stop and return an honest lifecycle outcome."""
+    with _active_subagents_lock:
+        record = _active_subagents.get(subagent_id)
+        if not record:
+            return "not_live"
+        current_status = str(record.get("status") or "").lower()
+        if current_status in _TERMINAL_SUBAGENT_STATUSES:
+            return "already_terminal"
+        if current_status == "interrupt_requested":
+            return "interrupt_requested"
+        agent = record.get("agent")
+        if agent is None:
+            return "interrupt_failed"
+        record["status"] = "interrupt_requested"
+        if reason:
+            record["interrupt_reason"] = reason
+    try:
+        agent.interrupt(reason or f"Interrupted via TUI ({subagent_id})")
+    except Exception as exc:
+        with _active_subagents_lock:
+            current = _active_subagents.get(subagent_id)
+            if current is not None and current.get("status") == "interrupt_requested":
+                current["status"] = "running"
+        logger.debug("interrupt_subagent(%s) failed: %s", subagent_id, exc)
+        return "interrupt_failed"
+    return "interrupt_requested"
+
+def forward_pending_subagent_steers(
+    subagent_id: str,
+    attempt_id: str,
+    *,
+    outcome_sink: Optional[Dict[str, Any]] = None,
+) -> int:
+    """Forward ordered durable mailbox items to one exact live attempt."""
+    if not subagent_id or not attempt_id:
+        return 0
+    with _active_subagents_lock:
+        record = _active_subagents.get(subagent_id)
+        if not record or record.get("delegation_attempt_id") != attempt_id:
+            return 0
+        agent = record.get("agent")
+    steer = getattr(agent, "steer", None)
+    request_durable = getattr(agent, "request_durable_steer", None)
+    request_defined = callable(getattr(type(agent), "request_durable_steer", None)) or callable(
+        getattr(agent, "__dict__", {}).get("request_durable_steer")
+    )
+    if not callable(steer) and not (request_defined and callable(request_durable)):
+        return 0
+
+    try:
+        from tools.async_delegation import _repository
+
+        repository = _repository()
+    except Exception:
+        return 0
+
+    forwarded = 0
+    while True:
+        pending = repository.pending_steers(attempt_id)
+        if not pending:
+            break
+        mailbox_id = str(pending[0]["mailbox_id"])
+        claimed = repository.claim_steer(attempt_id, mailbox_id)
+        if claimed.get("status") != "claimed":
+            break
+
+        def _ack(outcome: str, *, _mailbox_id: str = mailbox_id) -> None:
+            repository.resolve_steer(_mailbox_id, outcome)
+
+        if request_defined and callable(request_durable):
+            outcome = request_durable(
+                str(claimed.get("message") or ""),
+                mailbox_id=mailbox_id,
+                outcome_callback=_ack,
+                force=bool(claimed.get("force")),
+            )
+            outcome = outcome if isinstance(outcome, dict) else {"status": "rejected"}
+            if outcome_sink is not None:
+                outcome_sink[mailbox_id] = dict(outcome)
+            status = str(outcome.get("status") or "rejected")
+            accepted = status == "accepted"
+        else:
+            accepted = bool(
+                steer(
+                    str(claimed.get("message") or ""),
+                    mailbox_id=mailbox_id,
+                    outcome_callback=_ack,
+                )
+            )
+            status = "accepted" if accepted else "too_late_after_completion"
+        if not accepted:
+            if status in {"foreground_wait", "force_background_failed"}:
+                repository.resolve_steer(mailbox_id, status)
+                continue
+            repository.resolve_steer(mailbox_id, "too_late_after_completion")
+            break
+        repository.mark_steer_forwarded(mailbox_id)
+        forwarded += 1
+    return forwarded
+
+def _sanitize_live_value(value: Any) -> Any:
+    """Redact secret-bearing fields before serializing live-tail previews."""
+    if isinstance(value, dict):
+        sanitized = {}
+        for key, item in value.items():
+            key_text = str(key)
+            sanitized[key_text] = (
+                "[REDACTED]"
+                if _LIVE_SENSITIVE_KEY_RE.search(key_text)
+                else _sanitize_live_value(item)
+            )
+        return sanitized
+    if isinstance(value, (list, tuple)):
+        return [_sanitize_live_value(item) for item in value]
+    return value
+
+def redact_observable_text(value: Any) -> str:
+    """Force-redact model-facing delegation observations, failing closed."""
+    text = _stringify_tool_content(value)
+    try:
+        from agent.redact import redact_sensitive_text
+
+        redacted = redact_sensitive_text(text, force=True)
+        return _LIVE_BEARER_TOKEN_RE.sub("Bearer [REDACTED]", redacted)
+    except Exception:
+        logger.debug("observable text secret redaction failed", exc_info=True)
+        return "[REDACTION UNAVAILABLE]"
+
+def _bounded_live_preview(value: Any) -> str:
+    text = redact_observable_text(_sanitize_live_value(value))
+    if len(text) <= _LIVE_PREVIEW_CHAR_LIMIT:
+        return text
+    return text[:_LIVE_PREVIEW_CHAR_LIMIT] + "…"
+
+def _append_live_event(
+    subagent_id: Optional[str],
+    event: Dict[str, Any],
+    *,
+    attempt_id: Optional[str] = None,
+) -> None:
+    if not subagent_id:
+        return
+    with _active_subagents_lock:
+        record = _active_subagents.get(subagent_id)
+        if record is None or (
+            attempt_id is not None
+            and record.get("delegation_attempt_id") != attempt_id
+        ):
+            return
+        events = record.setdefault("events", [])
+        events.append(event)
+        if len(events) > _LIVE_EVENT_LIMIT:
+            del events[:-_LIVE_EVENT_LIMIT]
+        record["last_activity_at"] = event.get("timestamp") or time.time()
+
+def _append_live_text(
+    subagent_id: Optional[str], delta: Any, *, attempt_id: Optional[str] = None
+) -> None:
+    if not subagent_id or not delta:
+        return
+    text = _stringify_tool_content(delta)
+    with _active_subagents_lock:
+        record = _active_subagents.get(subagent_id)
+        if record is None or (
+            attempt_id is not None
+            and record.get("delegation_attempt_id") != attempt_id
+        ):
+            return
+        # Keep only a private bounded carry so split-delta credentials can be
+        # recognized. This field is excluded from snapshots and archives.
+        raw_combined = str(record.get("assistant_text_raw_tail") or "") + text
+        redacted = redact_observable_text(raw_combined)
+        record["assistant_text_tail"] = redacted[-_LIVE_TEXT_CHAR_LIMIT:]
+
+        carry_parts = []
+        carry_cursor = 0
+        for match in _LIVE_BEARER_TOKEN_RE.finditer(raw_combined):
+            carry_parts.append(raw_combined[carry_cursor : match.start()])
+            carry_parts.append(
+                "Bearer " if match.end() == len(raw_combined) else "Bearer [REDACTED]"
+            )
+            carry_cursor = match.end()
+        carry_parts.append(raw_combined[carry_cursor:])
+        safe_carry = "".join(carry_parts)
+        record["assistant_text_raw_tail"] = safe_carry[-_LIVE_TEXT_CHAR_LIMIT:]
+        record["last_activity_at"] = time.time()
+
+_LIVE_BEARER_TOKEN_RE = re.compile(r"(?i)Bearer\s+[^\s]+")
+
+_LIVE_CONTROL_ACTIONS = frozenset({"list", "steer", "stop"})
+
+_LIVE_SENSITIVE_KEY_RE = re.compile(
+    r"(?:authorization|proxy[-_]?authorization|api[-_]?key|access[-_]?token|"
+    r"refresh[-_]?token|id[-_]?token|token|secret|password|passwd|cookie|set[-_]?cookie)$",
+    re.IGNORECASE,
+)

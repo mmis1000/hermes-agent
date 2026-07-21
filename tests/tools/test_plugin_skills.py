@@ -72,6 +72,7 @@ class TestPluginSkillRegistry:
         assert pm.list_plugin_skills("myplugin") == ["bar", "baz", "foo"]
         assert pm.list_plugin_skills("other") == []
 
+
     def test_remove_plugin_skill(self, pm, tmp_path):
         md = tmp_path / "SKILL.md"
         md.write_text("---\nname: x\n---\n")

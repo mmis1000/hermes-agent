@@ -24,6 +24,9 @@ from gateway.session_context import set_session_vars
 from tools.process_registry import process_registry
 
 
+pytestmark = pytest.mark.usefixtures("admitted_delegate_route")
+
+
 @pytest.fixture(autouse=True)
 def _clean_queue_and_context(monkeypatch):
     monkeypatch.delenv("HERMES_SESSION_ID", raising=False)

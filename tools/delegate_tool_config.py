@@ -559,11 +559,13 @@ def _resolve_child_runtime(
             getattr(parent_agent, "requested_provider", None) or effective_provider
         )
 
-    # Reasoning: delegation.reasoning_effort > parent. Keep the raw value — a
-    # YAML ``false`` must disable thinking, not coerce to "" and inherit.
+    # Reasoning: the routing owner's reasoning_effort (delegation config, or a per-call delegate_task
+    # override) > parent. Keep the raw value — a YAML ``false`` must disable thinking, not coerce to
+    # "" and inherit. A routing owner without the key (/review credentials) defers to the config.
     child_reasoning = getattr(parent_agent, "reasoning_config", None)
+    effort_owner = routing_cfg if routing_cfg and "reasoning_effort" in routing_cfg else delegation_cfg
     try:
-        delegation_effort = delegation_cfg.get("reasoning_effort")
+        delegation_effort = effort_owner.get("reasoning_effort")
         if delegation_effort or delegation_effort is False:
             from hermes_constants import parse_reasoning_effort
             parsed = parse_reasoning_effort(delegation_effort)

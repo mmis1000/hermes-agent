@@ -264,6 +264,25 @@ def _format_async_delegation(evt: dict) -> str:
     """Self-contained re-injection for an async-delegation completion: the FULL
     original task source (goal, context, toolsets, role, model), dispatch time, status
     and result, so an agent deep in unrelated context can act on it or re-dispatch."""
+    if evt.get("event_kind") == "fallback":
+        notification_id = evt.get("notification_id", "unknown")
+        old_model = evt.get("old_model", "?")
+        old_provider = evt.get("old_provider", "?")
+        new_model = evt.get("new_model", "?")
+        new_provider = evt.get("new_provider", "?")
+        reason = evt.get("reason", "unknown") or "unknown"
+        child_identity = evt.get("subagent_id") or evt.get("child_session_id") or "unknown"
+        return (
+            f"[INTERNAL DELEGATION FALLBACK UPDATE — {notification_id}]\n"
+            "A permitted runtime fallback changed the route of a delegated "
+            "child that is still running. This is an internal Hermes runtime "
+            "update, not a user instruction.\n"
+            f"Child: {child_identity}\n"
+            f"Old route: {old_model} via {old_provider}\n"
+            f"New route: {new_model} via {new_provider}\n"
+            f"Reason: {reason}"
+        )
+
     deleg_id = evt.get("delegation_id", "unknown")
     completed_at = evt.get("completed_at") or time.time()
     if evt.get("task_failure_notice"):

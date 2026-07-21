@@ -11,10 +11,14 @@ the delegation call and the summary result, never the child's intermediate
 tool calls or reasoning.
 """
 
+import json
 import logging
 import time
+import uuid
 import weakref
+from types import SimpleNamespace
 from typing import Any, Dict, List, Optional
+from agent.delegation_policy import ExecutionProfile
 
 from tools.terminal_tool import set_approval_callback as _set_subagent_approval_cb  # noqa: F401  (used via _ChildRun.await_child)
 from utils import is_truthy_value
@@ -153,6 +157,8 @@ def _apply_child_compression_cap(child, delegation_cfg: dict) -> None:
         cc._apply_threshold_tokens_cap()
 
 
+_UNSET = object()
+
 def _build_child_agent(
     task_index: int,
     goal: str,
@@ -168,7 +174,14 @@ def _build_child_agent(
     override_api_key: Optional[str] = None,
     override_api_mode: Optional[str] = None,
     override_request_overrides: Optional[Dict[str, Any]] = None,
-
+    override_max_tokens: Optional[int] = None,
+    required_disabled_toolsets: Optional[List[str]] = None,
+    workspace_override: Optional[str] = None,
+    reasoning_config_override: Any = _UNSET,
+    fallback_model_override: Any = _UNSET,
+    provider_preferences_override: Optional[Dict[str, Any]] = None,
+    session_id_override: Optional[str] = None,
+    parent_session_id_override: Optional[str] = None,
     # ACP transport overrides from trusted delegation config.
     override_acp_command: Optional[str] = None,
     override_acp_args: Optional[List[str]] = None,
@@ -178,6 +191,8 @@ def _build_child_agent(
     routing_cfg: Optional[Dict[str, Any]] = None,
     # Legacy; accepted for wire compat but ignored (capability is depth-derived).
     role: str = "leaf",
+    resolved_scope: Any = None,
+    delegation_policy_override: Any = None,
 ):
     """Build (don't run) a child AIAgent on the main thread. override_* (from delegation config) replace parent
     inheritance so children can run on a different provider:model pair."""
@@ -194,14 +209,28 @@ def _build_child_agent(
     # the live registry; parent_id is set when THIS parent is itself a subagent.
     subagent_id = f"sa-{task_index}-{_uuid.uuid4().hex[:8]}"
     parent_subagent_id = getattr(parent_agent, "_subagent_id", None)
+    if not isinstance(parent_subagent_id, str):
+        parent_subagent_id = None
 
     # General delegation behavior (reasoning, compression, capabilities) stays
     # global. Only fallback policy follows the owner of a per-call route such
     # as auxiliary.review.
     delegation_cfg = _load_config()
     child_toolsets, child_disabled_toolsets = _resolve_child_toolsets(parent_agent, toolsets, effective_role)
+    child_disabled_toolsets = list(dict.fromkeys(child_disabled_toolsets + list(required_disabled_toolsets or [])))
+    child_delegation_policy = delegation_policy_override
+    if resolved_scope is not None:
+        from agent.delegation_policy import derive_child_policy
+        import model_tools
+        child_toolsets = [name for name in child_toolsets if name in resolved_scope.profile.allowed_toolsets or any(model_tools.get_toolset_for_tool(tool) == name for tool in resolved_scope.profile.allowed_tools)]
+        effective_policy = delegation_policy_override if delegation_policy_override is not None else parent_agent.delegation_policy
+        child_delegation_policy = derive_child_policy(effective_policy, None if effective_policy.visible_objects is None and not resolved_scope.reveal and not resolved_scope.visible_objects else resolved_scope.visible_objects, allowed_profiles={resolved_scope.profile_name})
+    scope_context = None
+    if resolved_scope is not None:
+        from tools.delegation_scope import format_effective_scope_context
+        scope_context = format_effective_scope_context(resolved_scope)
     child_prompt = _build_child_system_prompt(
-        goal, context, workspace_path=_resolve_workspace_hint(parent_agent), role=effective_role,
+        goal, context, workspace_path=workspace_override or _resolve_workspace_hint(parent_agent), effective_scope_context=scope_context, role=effective_role,
         max_spawn_depth=max_spawn, child_depth=child_depth,
     )
     parent_api_key = getattr(parent_agent, "api_key", None)
@@ -223,18 +252,29 @@ def _build_child_agent(
         override_acp_args=override_acp_args,
         routing_cfg=routing_cfg,
     )
+    if reasoning_config_override is not _UNSET:
+        rt["reasoning_config"] = _json_safe_copy(reasoning_config_override)
+    if fallback_model_override is not _UNSET:
+        rt["fallback_model"] = _json_safe_copy(fallback_model_override)
+    if override_max_tokens is not None:
+        rt["max_tokens"] = override_max_tokens
+    if session_id_override:
+        rt["session_id"] = session_id_override
+    if isinstance(provider_preferences_override, dict):
+        for key, target in {"allowed": "providers_allowed", "ignored": "providers_ignored", "order": "providers_order", "sort": "provider_sort", "require_parameters": "provider_require_parameters", "data_collection": "provider_data_collection", "openrouter_min_coding_score": "openrouter_min_coding_score"}.items():
+            rt[target] = _json_safe_copy(provider_preferences_override.get(key))
     if override_request_overrides is not None:
         # honored whenever set, incl. the inherit branch where
         # _resolve_delegation_credentials already merged OVER the parent's
         request_overrides = dict(override_request_overrides)
     else:
         request_overrides = {} if override_provider else dict(getattr(parent_agent, "request_overrides", {}) or {})
-    parent_sid = getattr(parent_agent, "session_id", None)
+    parent_sid = parent_session_id_override if parent_session_id_override is not None else getattr(parent_agent, "session_id", None)
     child_session_db = _open_child_session_db(parent_agent)
     with delegated_child_context():
         try:
             child = AIAgent(
-                **rt, max_iterations=max_iterations, prefill_messages=getattr(parent_agent, "prefill_messages", None),
+                **rt, delegation_policy=child_delegation_policy, max_iterations=max_iterations, prefill_messages=getattr(parent_agent, "prefill_messages", None),
                 enabled_toolsets=child_toolsets, disabled_toolsets=child_disabled_toolsets, quiet_mode=True,
                 ephemeral_system_prompt=child_prompt, log_prefix=f"[subagent-{task_index}]", platform="subagent",
                 side_agent=True,
@@ -264,6 +304,56 @@ def _build_child_agent(
     child._progress_identity_ref = child_session_ref
     child._delegate_depth, child._delegate_role = child_depth, effective_role  # post-degrade role
     child._subagent_id, child._parent_subagent_id = subagent_id, parent_subagent_id
+    child._subagent_goal = goal
+    child._parent_turn_id = getattr(parent_agent, "_current_turn_id", "") or ""
+    child._delegation_session_ref = child_session_ref
+    # Runtime-only callback: a permitted fallback must reach the orchestrating
+    # model through the routed internal notification rail, not only the child
+    # status/UI callbacks. Never include this closure in persisted metadata.
+    child._delegation_fallback_callback = _build_delegation_fallback_callback(
+        parent_agent,
+        subagent_id=subagent_id,
+        child_session_ref=child_session_ref,
+    )
+    # Reconstruction metadata is an explicit allowlist. Never persist API
+    # keys, base URLs, request overrides, ACP commands/args, or provider
+    # credential-pool state.
+    child._delegation_runtime_metadata = {
+        "child_session_id": child_session_ref["session_id"],
+        "parent_session_id": (
+            getattr(parent_agent, "session_id", None)
+            if isinstance(getattr(parent_agent, "session_id", None), str)
+            else None
+        ),
+        "parent_logical_id": parent_subagent_id,
+        "depth": child_depth,
+        "role": effective_role,
+        "model": rt.get("model") if isinstance(rt.get("model"), str) else None,
+        "provider": rt.get("provider") if isinstance(rt.get("provider"), str) else None,
+        "api_mode": rt.get("api_mode") if isinstance(rt.get("api_mode"), str) else None,
+        "enabled_toolsets": list(child_toolsets),
+        "disabled_toolsets": list(child_disabled_toolsets),
+        "workdir": workspace_override or _resolve_workspace_hint(parent_agent),
+        "max_iterations": max_iterations,
+        "max_tokens": rt.get("max_tokens") if isinstance(rt.get("max_tokens"), int) else None,
+        "reasoning_config": _json_safe_copy(rt.get("reasoning_config")),
+        "fallback_routes": _safe_fallback_routes(rt.get("fallback_model")),
+        "provider_preferences": {
+            "allowed": _json_safe_copy(rt.get("providers_allowed")),
+            "ignored": _json_safe_copy(rt.get("providers_ignored")),
+            "order": _json_safe_copy(rt.get("providers_order")),
+            "sort": _json_safe_copy(rt.get("provider_sort")),
+            "require_parameters": bool(rt.get("provider_require_parameters")),
+            "data_collection": (
+                rt.get("provider_data_collection")
+                if isinstance(rt.get("provider_data_collection"), str)
+                else ""
+            ),
+            "openrouter_min_coding_score": _json_safe_copy(
+                rt.get("openrouter_min_coding_score")
+            ),
+        },
+    }
     _apply_child_compression_cap(child, delegation_cfg)
     # Ownership chain for action=list/steer/stop; weakref so a finished parent
     # can be collected while a detached child record lingers in the registry.
@@ -294,11 +384,17 @@ def _build_child_agent(
             child_session_id=getattr(child, "session_id", None), child_subagent_id=subagent_id,
             child_role=effective_role, child_goal=goal,
         )
+    if resolved_scope is not None:
+        child.delegation_backing_registry = getattr(parent_agent, "delegation_backing_registry", None)
+    if child_delegation_policy is not None:
+        child.delegation_backing_registry = getattr(parent_agent, "delegation_backing_registry", None)
+        configure_protected_agent_tools(child, resolved_scope.profile)
     return child
 
 def _run_single_child(
     task_index: int, goal: str, child=None, parent_agent=None, *, owner_session_id: Optional[str] = None,
-    owner_transport: Any = None, owner_session_record: Any = None, **_kwargs,
+    owner_transport: Any = None, owner_session_record: Any = None,
+    conversation_history: Optional[List[Dict[str, Any]]] = None, resume_message: Optional[str] = None, **_kwargs,
 ) -> Dict[str, Any]:
     """Run a pre-built child agent (called from a worker thread) and return its result entry.
 
@@ -324,7 +420,10 @@ def _run_single_child(
         child, parent_agent, goal, owner_session_id=owner_session_id, owner_transport=owner_transport,
         owner_session_record=owner_session_record,
     )
-    run = _ChildRun(child, parent_agent, task_index, goal, _subagent_id, child_progress_cb, heartbeat=heartbeat)
+    run = _ChildRun(
+        child, parent_agent, task_index, goal, _subagent_id, child_progress_cb, heartbeat=heartbeat,
+        conversation_history=conversation_history, resume_message=resume_message,
+    )
     # Set when a timed-out Future still owns the child: closing it from this
     # thread before the worker settles races the conversation's finally path.
     _child_close_deferred = False
@@ -348,7 +447,16 @@ def _run_single_child(
         run.append_sibling_write_reminder(entry)
         run.account_background_processes(entry)
         run.emit_complete(result, entry, duration)
-        return run.attach_worktree(entry)
+        entry = run.attach_worktree(entry)
+        attempt_id = getattr(child, "_delegation_attempt_id", None)
+        if isinstance(attempt_id, str):
+            from tools.delegation_scope import attempt_scope_registry
+            cleanup_errors = attempt_scope_registry.cleanup(attempt_id)
+            if cleanup_errors:
+                entry["status"] = "error"
+                entry["exit_reason"] = "cleanup_error"
+                entry["error"] = "protected teardown failed: " + "; ".join(str(e) for e in cleanup_errors)
+        return entry
     except Exception as exc:
         # Close steer acceptance before any completion callback (see _merge_late_steer).
         _late_pending_steer = run.close_steering()
@@ -365,7 +473,7 @@ def _run_single_child(
 def _build_children(
     task_list: List[Dict[str, Any]], task_schemas: List[Optional[Dict[str, Any]]], creds: Dict[str, Any], *,
     top_role: str, max_iterations: int, parent_agent, routing_cfg: Dict[str, Any],
-    live_deleg_id: Optional[str], live_writers: list, task_images: Optional[List[Optional[List[str]]]] = None,
+    live_deleg_id: Optional[str], live_writers: list, resolved_scope: Any = None, task_images: Optional[List[Optional[List[str]]]] = None,
 ) -> tuple[List[tuple], Optional[str]]:
     """Build every child on the main thread (construction is not thread-safe);
     ``(children, None)`` or ``([], error)`` on an explicit-pin preflight failure."""
@@ -378,6 +486,7 @@ def _build_children(
         "override_acp_command": creds.get("command"),
         "override_acp_args": creds.get("args"),
         "routing_cfg": routing_cfg,
+        "resolved_scope": resolved_scope,
     }
     children = []
     for i, t in enumerate(task_list):
@@ -392,8 +501,17 @@ def _build_children(
                 model=creds["model"], max_iterations=max_iterations, task_count=len(task_list),
                 parent_agent=parent_agent, role=_normalize_role(t.get("role") or top_role), **overrides,
             )
-        except ValueError as exc:
-            return [], str(exc)
+        except Exception as exc:
+            for _, _, built in children:
+                try:
+                    built.close()
+                except Exception:
+                    logger.debug("child rollback close failed", exc_info=True)
+            if resolved_scope is not None:
+                return [], f"protected child construction failed: {exc}"
+            if isinstance(exc, ValueError):
+                return [], str(exc)
+            raise
         if _task_schema is not None:
             with _quiet("Could not attach output schema to child %d", i):
                 child._delegate_output_schema = _task_schema
@@ -442,7 +560,11 @@ def delegate_task(
     max_iterations: Optional[int] = None, role: Optional[str] = None, background: Optional[bool] = None,
     output_schema: Optional[Dict[str, Any]] = None, images: Optional[List[str]] = None, action: Optional[str] = None,
     subagent_id: Optional[str] = None, message: Optional[str] = None, parent_agent=None,
+    delegation_id: Optional[str] = None, attempt_id: Optional[str] = None, run_id: Optional[str] = None,
+    timeout_seconds: Optional[float] = None, limit: Optional[int] = None, cascade: Optional[bool] = None, reason: Optional[str] = None, force: Optional[bool] = None, detail: Optional[bool] = None,
     credentials_cfg: Optional[Dict[str, Any]] = None,
+    profile: Optional[str] = None, workdir: Optional[str] = None, reveal: Optional[list] = None,
+    model: Optional[str] = None, provider: Optional[str] = None, reasoning_effort: Optional[str] = None,
 ) -> str:
     """Spawn child agents (single ``goal`` or ``tasks=[...]`` batch) or control running ones. ``action``
     list/steer/stop run synchronously and bypass the pause gate, depth limit and async dispatch. ``role`` is legacy
@@ -452,8 +574,8 @@ def delegate_task(
         return tool_error("delegate_task requires a parent agent context.")
 
     normalized_action = (action or "").strip().lower()
-    if normalized_action in _CONTROL_ACTIONS:
-        return _handle_control_action(normalized_action, subagent_id, message, parent_agent)
+    if normalized_action in _MERGED_CONTROL_ACTIONS:
+        return _route_delegate_control_action(normalized_action, parent_agent=parent_agent, subagent_id=subagent_id, message=message, delegation_id=delegation_id, attempt_id=attempt_id, run_id=run_id, timeout_seconds=timeout_seconds, limit=limit, cascade=cascade, reason=reason, force=force, detail=detail)
     if normalized_action and normalized_action != "spawn":
         return tool_error(f"Unknown action '{action}'. Use spawn (default), list, steer, or stop.")
 
@@ -490,13 +612,19 @@ def delegate_task(
     # credentials_cfg (internal callers only, e.g. /review → auxiliary.review) is
     # a per-call routing owner shaped like the delegation config section. Keep
     # the route and its fallback policy together through child construction.
-    routing_cfg = credentials_cfg if credentials_cfg is not None else cfg
-    try:
-        creds = _resolve_delegation_credentials(routing_cfg, parent_agent)
-    except ValueError as exc:
-        # Explicit-pin preflight failures (e.g. pinned delegation.command missing from PATH) refuse the
-        # spawn loudly (#80450).
-        return tool_error(str(exc))
+    routing_cfg = dict(credentials_cfg if credentials_cfg is not None else cfg)
+    if model is not None:
+        routing_cfg["model"] = model
+    if provider is not None:
+        routing_cfg["provider"] = provider
+        for key in ("base_url", "api_key", "api_mode"):
+            routing_cfg.pop(key, None)
+    if reasoning_effort is not None:
+        from hermes_constants import parse_reasoning_effort
+        parsed_reasoning = parse_reasoning_effort(reasoning_effort)
+        if parsed_reasoning is None:
+            return tool_error(f"Unknown delegation reasoning_effort '{reasoning_effort}'.")
+        routing_cfg["reasoning_effort"] = reasoning_effort
     max_children = _get_max_concurrent_children()
     task_list, err = _normalize_task_list(goal, context, tasks, output_schema, top_role, max_children)
     if not err:
@@ -509,25 +637,138 @@ def delegate_task(
     if err:
         return tool_error(err)
 
+    # Atomic, side-effect-free authority preflight for the complete invocation.
+    # Preserve the ordinary path exactly when all protected fields are
+    # omitted; otherwise validation must finish before credentials, transcripts,
+    # children, sessions, executors, containers, or durable dispatch state.
+    from agent.delegation_policy import DelegationSessionPolicy
+
+    candidate_policy = getattr(parent_agent, "delegation_policy", None)
+    delegation_policy = (
+        candidate_policy
+        if isinstance(candidate_policy, DelegationSessionPolicy)
+        else None
+    )
+    if (
+        delegation_policy is None
+        and profile is None
+        and workdir is None
+        and reveal is None
+    ):
+        resolved_scope = None
+    else:
+        from tools.delegation_scope import resolve_invocation_scope
+        from tools.terminal_tool import _get_env_config
+
+        try:
+            inherited_network = _get_env_config().get("docker_network", True)
+            resolved_scope = resolve_invocation_scope(
+                delegation_policy,
+                profile,
+                workdir,
+                reveal,
+                backing_registry=getattr(
+                    parent_agent, "delegation_backing_registry", None
+                ),
+                inherited_network=inherited_network,
+            )
+        except (TypeError, ValueError) as exc:
+            return tool_error(str(exc))
+
+    # Credential resolution can consult provider state, so it deliberately
+    # occurs only after the complete shared scope has passed preflight.
+    try:
+        creds = _resolve_delegation_credentials(routing_cfg, parent_agent)
+    except ValueError as exc:
+        return tool_error(str(exc))
+
+    try:
+        _admit_delegation_route(creds, parent_agent)
+    except ValueError as exc:
+        return tool_error(str(exc))
     overall_start = time.monotonic()
     # Live transcripts: cache/delegation/live/<id>/task-<n>.log per task, a side channel with zero effect on message
     # content or prompt caching. Best-effort: on failure live_paths is empty and delegation proceeds.
     from tools.delegation_live_log import create_live_transcripts
-    live_deleg_id, live_writers, live_paths = create_live_transcripts(
-        task_list, context, model=creds.get("model"), provider=creds.get("provider")
-    )
+    live_deleg_id, live_writers, live_paths = None, [], []
+    if resolved_scope is None:
+        live_deleg_id, live_writers, live_paths = create_live_transcripts(
+            task_list, context, model=creds.get("model"), provider=creds.get("provider")
+        )
     _announce_batch(parent_agent, len(task_list), live_deleg_id)
     origin = _capture_origin()
 
     children, err = _build_children(
         task_list, task_schemas, creds, top_role=top_role, max_iterations=default_max_iter, parent_agent=parent_agent,
-        routing_cfg=routing_cfg, live_deleg_id=live_deleg_id, live_writers=live_writers, task_images=task_images,
+        routing_cfg=routing_cfg, live_deleg_id=live_deleg_id, live_writers=live_writers, resolved_scope=resolved_scope, task_images=task_images,
     )
     if err:
         return tool_error(err)
+    protected_attempt_ids: Dict[str, str] = {}
+    protected_authority_by_logical_id: Dict[str, Dict[str, Any]] = {}
+    protected_attempt_registry = None
+    if resolved_scope is not None:
+        from tools import delegation_scope as _delegation_scope
+        from tools import terminal_tool as _terminal_tool
+
+        protected_attempt_registry = _delegation_scope.attempt_scope_registry
+        reserved_ids: List[str] = []
+        try:
+            for _i, _t, child in children:
+                logical_id = getattr(child, "_subagent_id", None)
+                if not isinstance(logical_id, str) or not logical_id:
+                    raise ValueError("protected child is missing its logical identity")
+                authority = protected_attempt_registry.reserve(
+                    resolved_scope,
+                    logical_id,
+                    backing_registry=getattr(
+                        parent_agent, "delegation_backing_registry", None
+                    ),
+                )
+                attempt_id = authority.attempt_id
+                reserved_ids.append(attempt_id)
+                protected_attempt_registry.prepare_idmapped_reveals(attempt_id)
+
+                _delegation_scope.configure_protected_attempt_environment(attempt_id)
+                protected_attempt_ids[logical_id] = attempt_id
+                child._delegation_attempt_id = attempt_id
+                child._delegation_scope_id = authority.scope_id
+                child._current_task_id = attempt_id
+                child.resolved_attempt_authority = authority
+                serialized_authority = _delegation_scope.serialize_delegation_authority(
+                    resolved_scope,
+                    enabled_toolsets=tuple(
+                        getattr(child, "enabled_toolsets", None) or ()
+                    ),
+                    disabled_toolsets=tuple(
+                        getattr(child, "disabled_toolsets", None) or ()
+                    ),
+                    scope_id=authority.scope_id,
+                    attempt_id=attempt_id,
+                    parent_attempt_id=getattr(
+                        parent_agent, "_delegation_attempt_id", None
+                    ),
+                )
+                protected_authority_by_logical_id[logical_id] = serialized_authority
+                _delegation_scope.log_delegation_authority_event(
+                    "attempt_prepared", serialized_authority
+                )
+        except Exception as exc:
+            protected_attempt_registry.rollback(reserved_ids)
+            for _i, _t, child in children:
+                try:
+                    child.close()
+                except Exception:
+                    pass
+            return tool_error(f"protected attempt registration failed: {exc}")
+
+
+    if resolved_scope is not None:
+        live_deleg_id, live_writers, live_paths = create_live_transcripts(task_list, context)
     batch = _Batch(
         task_list, children, parent_agent, creds, context, top_role, max_children,
         live_deleg_id, live_writers, live_paths, *origin, overall_start,
+        protected_attempt_ids=protected_attempt_ids, protected_authority_by_logical_id=protected_authority_by_logical_id,
     )
     return _run_batch(batch, background)
 
@@ -631,7 +872,7 @@ def _build_dynamic_schema_overrides() -> dict:
 def _p(type_: str, description: str, **extra) -> dict:
     return {"type": type_, **extra, "description": description}
 
-DELEGATE_TASK_SCHEMA = {
+DELEGATE_TASK_SCHEMA: Dict[str, Any] = {
     "name": "delegate_task",
     # description / tasks.description are placeholders: the real text is built per get_definitions() call by
     # _build_dynamic_schema_overrides() so the model sees the user's actual max_concurrent_children / max_spawn_depth.
@@ -643,6 +884,10 @@ DELEGATE_TASK_SCHEMA = {
     "parameters": {
         "type": "object",
         "properties": {
+            'profile': {'type': 'string', 'description': 'Execution profile selected from the profiles admitted for this agent.'},
+            'workdir': {'type': 'string', 'description': 'Canonical absolute working directory inside the selected execution profile.'},
+            'reveal': {'type': 'array', 'items': {'type': 'object', 'properties': {'path': {'type': 'string'}, 'mode': {'type': 'string', 'enum': ['ro', 'rw']}}, 'required': ['path', 'mode'], 'additionalProperties': False}, 'description': 'Visible objects explicitly requested from the parent/session ceiling.'},
+
             # The handler also accepts the legacy single-goal shape (top-level `goal`/`context`/`output_schema`),
             # wrapped into a one-entry batch at dispatch, and a per-task `role` (legacy, ignored: capability is
             # depth-derived). Both unadvertised on purpose (old transcripts only); do not re-add. No maxItems — the
@@ -734,6 +979,8 @@ def _strip_model_hidden_task_fields(tasks: Any) -> Any:
     return [{k: v for k, v in t.items() if k not in _MODEL_HIDDEN_TASK_FIELDS} if isinstance(t, dict) else t for t in tasks]
 
 
+DELEGATE_TASK_SCHEMA["parameters"]["properties"].update({'action': {'type': 'string', 'enum': ['spawn', 'list', 'status', 'tail', 'wait', 'steer', 'resume', 'interrupt', 'stop', 'abandon'], 'description': "Default 'spawn' (omit for normal delegation). Live orchestration without a delegation_id: 'list' shows this conversation's live children; 'steer' queues course-correction text (subagent_id + message); 'stop' ends one child early (subagent_id). Durable lifecycle on the same tool: 'status', 'tail', 'wait', 'resume', 'interrupt', 'abandon' require the handle returned by spawn. 'stop' with a delegation_id is an alias for interrupt. Control actions return immediately; goal/tasks are ignored when action is not spawn."}, 'delegation_id': {'type': 'string', 'description': 'Handle returned by a spawn. Required for status/tail/wait/resume/interrupt/abandon; omitted for live list/steer/stop.'}, 'attempt_id': {'type': 'string', 'description': 'Exact historical attempt selector; accepted only by tail.'}, 'run_id': {'type': 'string', 'description': 'Exact execution run selector; accepted only by wait.'}, 'timeout_seconds': {'type': 'number', 'description': 'Bounded wait duration; default 30 seconds. Zero checks immediately.'}, 'limit': {'type': 'integer', 'description': 'Recent events returned by tail; default 20.'}, 'cascade': {'type': 'boolean', 'description': 'Interrupt descendants of the delegation or selected child branch. Defaults true.'}, 'reason': {'type': 'string', 'description': 'Optional audit reason for interrupt or abandon.'}, 'force': {'type': 'boolean', 'description': 'For steer only: move supported foreground waits to background before delivering the guidance.'}})
+
 registry.register(
     name="delegate_task",
     toolset="delegation",
@@ -741,11 +988,698 @@ registry.register(
     handler=lambda args, **kw: delegate_task(
         goal=args.get("goal"), context=args.get("context"), tasks=_strip_model_hidden_task_fields(args.get("tasks")),
         max_iterations=args.get("max_iterations"), role=args.get("role"),
+        model=args.get("model"), provider=args.get("provider"), reasoning_effort=args.get("reasoning_effort"),
         background=_model_background_value(args, kw.get("parent_agent")), output_schema=args.get("output_schema"),
         images=args.get("images"), action=args.get("action"), subagent_id=args.get("subagent_id"), message=args.get("message"),
+        profile=args.get("profile"), workdir=args.get("workdir"), reveal=args.get("reveal"),
+        **{key: args.get(key) for key in ("delegation_id", "attempt_id", "run_id", "timeout_seconds", "limit", "cascade", "reason", "force", "detail")},
         parent_agent=kw.get("parent_agent"),
     ),
     check_fn=check_delegate_requirements,
     emoji="🔀",
     dynamic_schema_overrides=_build_dynamic_schema_overrides,
 )
+
+from tools.delegate_tool_registry import (interrupt_subagent_status, forward_pending_subagent_steers, _sanitize_live_value, redact_observable_text, _bounded_live_preview, _append_live_event, _append_live_text)
+
+
+def _qualified_protected_tool_names(
+    candidate_names: set[str],
+    allowed_profile_toolsets: set[str],
+    qualified_mcp_servers: frozenset[str],
+    allowed_profile_tools: frozenset[str] | set[str] | tuple[str, ...] = frozenset(),
+) -> set[str]:
+    """Apply profile toolset/exact-tool and MCP-server qualification admission."""
+
+    import model_tools
+    from tools.mcp_tool import get_mcp_tool_server_qualification
+
+    admitted: set[str] = set()
+    for name in candidate_names:
+        toolset = model_tools.get_toolset_for_tool(name)
+        if toolset not in allowed_profile_toolsets and name not in allowed_profile_tools:
+            continue
+        if _is_mcp_toolset_name(toolset or ""):
+            server = get_mcp_tool_server_qualification(name)
+            if server not in qualified_mcp_servers:
+                continue
+        admitted.add(name)
+    return admitted
+
+from tools.delegate_tool_toolsets import _is_mcp_toolset_name
+
+
+def configure_protected_agent_tools(
+    agent: Any,
+    profile: ExecutionProfile,
+) -> frozenset[str]:
+    """Pin a positive tool snapshot for any protected agent attempt.
+
+    Protected agents are normally built with Tool Search's bridge replacing
+    the deferrable tools. The bridge itself is not a profile capability; it is
+    only a carrier for the profile-authorized deferred names. Rebuild the
+    model-facing view from the pre-assembly tool list so the carrier survives
+    without widening its catalog.
+    """
+
+    import model_tools
+    from tools import tool_search
+    from tools.mcp_tool import get_mcp_tool_server_qualification
+
+    enabled_toolsets = getattr(agent, "enabled_toolsets", None)
+    disabled_toolsets = getattr(agent, "disabled_toolsets", None)
+    original_defs = list(
+        model_tools.get_tool_definitions(
+            enabled_toolsets=enabled_toolsets,
+            disabled_toolsets=disabled_toolsets,
+            quiet_mode=True,
+            skip_tool_search_assembly=True,
+            delegation_policy=getattr(agent, "delegation_policy", None),
+        )
+        or []
+    )
+    current_defs = list(getattr(agent, "tools", None) or [])
+    candidate_names = {
+        item.get("function", {}).get("name")
+        for item in original_defs + current_defs
+        if isinstance(item, dict)
+        and item.get("function", {}).get("name")
+        not in tool_search.BRIDGE_TOOL_NAMES
+    }
+    candidate_names.update(
+        name
+        for name in getattr(agent, "valid_tool_names", set())
+        if name not in tool_search.BRIDGE_TOOL_NAMES
+    )
+    protected_names = _qualified_protected_tool_names(
+        candidate_names,
+        set(profile.allowed_toolsets),
+        profile.qualified_mcp_servers,
+        profile.allowed_tools,
+    )
+
+    # Keep the authoritative unassembled schemas for deferred tools, while
+    # allowing post-build injected tools to survive when they were already in
+    # the agent's current view. A later duplicate replaces the earlier schema
+    # but keeps deterministic source order.
+    source_defs = []
+    source_by_name = {}
+    for item in original_defs + current_defs:
+        if not isinstance(item, dict):
+            continue
+        name = (item.get("function") or {}).get("name")
+        if (
+            not name
+            or name in tool_search.BRIDGE_TOOL_NAMES
+            or name not in protected_names
+        ):
+            continue
+        if name not in source_by_name:
+            source_defs.append(item)
+        source_by_name[name] = item
+    source_defs = [
+        source_by_name[item["function"]["name"]]
+        for item in source_defs
+    ]
+
+    protected_deferred_names = frozenset(
+        name
+        for item in original_defs
+        for name in [(item.get("function") or {}).get("name")]
+        if name in protected_names and tool_search.is_deferrable_tool_name(name)
+    )
+    assembly = tool_search.assemble_tool_defs(
+        source_defs,
+        # Activation no longer depends on context length; using the fallback
+        # listing budget avoids a second provider metadata probe during setup.
+        context_length=None,
+        config=tool_search.load_config(),
+    )
+    protected_tools = assembly.tool_defs
+    visible_names = {
+        item["function"]["name"]
+        for item in protected_tools
+        if isinstance(item, dict) and item.get("function", {}).get("name")
+    }
+    snapshot = frozenset(protected_names)
+    carriers = (
+        tool_search.BRIDGE_TOOL_NAMES if assembly.activated else frozenset()
+    )
+    setattr(agent, "tools", protected_tools)
+    setattr(agent, "valid_tool_names", visible_names)
+    setattr(agent, "_protected_tool_snapshot", snapshot)
+    setattr(agent, "_protected_deferred_tool_snapshot", protected_deferred_names)
+    setattr(agent, "_protected_bridge_tool_snapshot", carriers)
+    setattr(
+        agent,
+        "_protected_qualified_mcp_servers",
+        frozenset(profile.qualified_mcp_servers),
+    )
+    setattr(
+        agent,
+        "_protected_mcp_tool_provenance",
+        {
+            name: provenance
+            for name in protected_names
+            if (provenance := get_mcp_tool_server_qualification(name)) is not None
+        },
+    )
+    return snapshot
+
+from agent.delegation_policy import ExecutionProfile
+
+
+def _route_delegate_control_action(
+    action: str,
+    *,
+    parent_agent: Any,
+    subagent_id: Optional[str] = None,
+    message: Optional[str] = None,
+    delegation_id: Optional[str] = None,
+    attempt_id: Optional[str] = None,
+    run_id: Optional[str] = None,
+    timeout_seconds: Optional[float] = None,
+    limit: Optional[int] = None,
+    cascade: Optional[bool] = None,
+    reason: Optional[str] = None,
+    force: Optional[bool] = None,
+    detail: Optional[bool] = None,
+) -> str:
+    """Route a control action to the live tree or the durable lifecycle plane."""
+    has_delegation_id = bool(str(delegation_id or "").strip())
+    live_compatible = action in _LIVE_CONTROL_ACTIONS or (
+        action == "interrupt" and not has_delegation_id and bool(str(subagent_id or "").strip())
+    )
+    if live_compatible and not has_delegation_id:
+        live_action = "stop" if action == "interrupt" else action
+        live = _handle_control_action(live_action, subagent_id, message, parent_agent)
+        if action != "list":
+            return live
+        # Merge the durable session list onto the live-tree snapshot so
+        # action='list' covers both live children and durable records.
+        live_payload = json.loads(live)
+        try:
+            from tools.delegation_control import delegation_control
+
+            durable = json.loads(
+                delegation_control(action="list", parent_agent=parent_agent)
+            )
+            live_payload["delegations"] = durable.get("delegations") or []
+            live_payload["status"] = durable.get("status") or "ok"
+        except Exception:
+            live_payload["delegations"] = []
+            live_payload["status"] = "ok"
+        return json.dumps(live_payload, ensure_ascii=False)
+
+    from tools.delegation_control import delegation_control
+
+    durable_action = "interrupt" if action == "stop" else action
+    return delegation_control(
+        action=durable_action,
+        delegation_id=delegation_id,
+        subagent_id=subagent_id,
+        attempt_id=attempt_id,
+        run_id=run_id,
+        timeout_seconds=timeout_seconds,
+        limit=limit,
+        cascade=cascade,
+        reason=reason,
+        message=message,
+        force=force,
+        detail=detail,
+        parent_agent=parent_agent,
+    )
+
+_LIVE_CONTROL_ACTIONS = frozenset({"list", "steer", "stop"})
+_MERGED_CONTROL_ACTIONS = frozenset({"list", "status", "tail", "wait", "steer", "resume", "interrupt", "stop", "abandon"})
+
+
+def _build_delegation_fallback_callback(
+    parent_agent,
+    *,
+    subagent_id: str = "",
+    child_session_ref: Optional[Dict[str, str]] = None,
+):
+    """Build the narrow model-facing fallback notification for a child.
+
+    The existing routed async-delegation queue lets the CLI/TUI/gateway deliver
+    an internal continuation turn with explicit provenance instead of pretending
+    the update is user input.  This is intentionally the same rail for active
+    and idle parents.
+    """
+    if parent_agent is None:
+        return None
+
+    def _route_context():
+        session_key = str(
+            getattr(parent_agent, "_gateway_session_key", "") or ""
+        ).strip()
+        origin_ui_session_id = ""
+        origin_session_id = ""
+        try:
+            from gateway.session_context import get_session_env
+
+            origin_ui_session_id = str(
+                get_session_env("HERMES_UI_SESSION_ID", "") or ""
+            ).strip()
+            platform = str(
+                get_session_env("HERMES_SESSION_PLATFORM", "") or ""
+            ).strip()
+            if platform == "api_server":
+                origin_session_id = str(
+                    get_session_env("HERMES_SESSION_CHAT_ID", "") or ""
+                ).strip()
+            if not session_key:
+                from tools.approval import get_current_session_key
+
+                session_key = str(get_current_session_key(default="") or "").strip()
+        except Exception:
+            pass
+        if not session_key:
+            session_key = str(getattr(parent_agent, "session_id", "") or "").strip()
+        return {
+            "session_key": session_key,
+            "origin_ui_session_id": origin_ui_session_id,
+            "origin_session_id": origin_session_id,
+            "parent_session_id": str(
+                getattr(parent_agent, "session_id", "") or ""
+            ).strip(),
+        }
+
+    def _notify(old_model, old_provider, new_model, new_provider, reason=None):
+        reason_value = getattr(reason, "value", None) or str(reason or "unknown")
+        warning = (
+            "[Delegation runtime warning] A permitted fallback activated while "
+            "the child was running. "
+            f"Old route: {old_model} via {old_provider}. "
+            f"New route: {new_model} via {new_provider}. "
+            f"Reason: {reason_value}."
+        )
+
+        route = _route_context()
+        if not route["session_key"] and not route["origin_session_id"]:
+            logger.debug(
+                "Dropping unroutable delegation fallback warning instead of "
+                "sending it to an unrelated session"
+            )
+            return False
+        event = {
+            "type": "async_delegation",
+            "event_kind": "fallback",
+            "internal": True,
+            "source": "hermes.delegation_runtime",
+            "delivery_managed": False,
+            "notification_id": f"fallback_{uuid.uuid4().hex}",
+            **route,
+            "status": "running",
+            "old_model": str(old_model or ""),
+            "old_provider": str(old_provider or ""),
+            "new_model": str(new_model or ""),
+            "new_provider": str(new_provider or ""),
+            "reason": reason_value,
+            "message": warning,
+            "subagent_id": str(subagent_id or ""),
+            "child_session_id": str(
+                (child_session_ref or {}).get("session_id") or ""
+            ),
+            "delegation_id": str(
+                (child_session_ref or {}).get("delegation_id") or ""
+            ),
+            "run_id": str((child_session_ref or {}).get("run_id") or ""),
+        }
+        try:
+            from tools.process_registry import process_registry
+
+            process_registry.completion_queue.put(event)
+            return True
+        except Exception:
+            logger.debug(
+                "Delegation fallback warning queue delivery failed", exc_info=True
+            )
+            return False
+
+    return _notify
+
+
+def _delegation_route_for_admission(creds: dict, parent_agent) -> dict:
+    """Resolve the exact route that ``_build_child_agent`` will receive."""
+    model = str(creds.get("model") or getattr(parent_agent, "model", "") or "").strip()
+    provider = str(
+        creds.get("provider") or getattr(parent_agent, "provider", "") or ""
+    ).strip()
+    base_url = creds.get("base_url")
+    if not base_url:
+        from tools.delegate_tool_config import _inherit_parent_endpoint
+
+        base_url, _ = _inherit_parent_endpoint(
+            parent_agent, getattr(parent_agent, "base_url", None), None
+        )
+    api_key = creds.get("api_key")
+    if not api_key:
+        api_key = getattr(parent_agent, "api_key", None)
+        if not api_key:
+            client_kwargs = getattr(parent_agent, "_client_kwargs", None)
+            if isinstance(client_kwargs, dict):
+                api_key = client_kwargs.get("api_key")
+    if callable(api_key) and not isinstance(api_key, str):
+        # Runtime providers such as Entra ID and MiniMax OAuth intentionally
+        # expose a zero-argument token provider. Materialize that selected
+        # credential for the admission probe; never turn it into ``None`` or
+        # allow the catalog helper to resolve an ambient account instead.
+        try:
+            from agent.azure_identity_adapter import materialize_bearer_for_http
+
+            api_key = materialize_bearer_for_http(api_key)
+        except Exception as exc:
+            raise ValueError(
+                "Delegation admission rejected: the selected route credential "
+                f"could not be resolved ({exc}); ambient credential fallback is "
+                "not permitted."
+            ) from exc
+    elif api_key is not None and not isinstance(api_key, str):
+        raise ValueError(
+            "Delegation admission rejected: the selected route credential has an "
+            "unsupported type; ambient credential fallback is not permitted."
+        )
+    api_mode = creds.get("api_mode") or getattr(parent_agent, "api_mode", None)
+    return {
+        "model": model,
+        "provider": provider,
+        "base_url": base_url,
+        # Validation probes accept string credentials. Supported callable
+        # providers are materialized above; any unsupported value is rejected.
+        "api_key": api_key if isinstance(api_key, str) else None,
+        "api_mode": api_mode,
+    }
+
+
+def _admit_delegation_route(creds: dict, parent_agent) -> dict:
+    """Admit an exact route from the shared cache, then one live resolve."""
+    route = _delegation_route_for_admission(creds, parent_agent)
+    model = route["model"]
+    provider = route["provider"]
+    if not model or not provider:
+        raise ValueError(
+            "Delegation admission rejected: the exact provider/model route is "
+            f"unavailable (provider={provider or '<unset>'!r}, "
+            f"model={model or '<unset>'!r})."
+        )
+
+    from hermes_cli.models import normalize_provider
+
+    normalized_provider = normalize_provider(provider)
+
+    def _reject(detail: str) -> None:
+        raise ValueError(
+            f"Delegation admission rejected for model {model!r} via provider "
+            f"{provider!r}: {detail}"
+        )
+
+    def _contains(catalog) -> bool:
+        if not catalog:
+            return False
+        values = {
+            str(item).strip()
+            for item in catalog
+            if isinstance(item, str) and item.strip()
+        }
+        if normalized_provider == "gemini":
+            values = {
+                value[len("models/") :] if value.startswith("models/") else value
+                for value in values
+            }
+        return model in values or (
+            normalized_provider in {"minimax", "minimax-cn", "minimax-oauth"}
+            and model.lower() in {value.lower() for value in values}
+        )
+
+    def _resolve_catalog(*, force_refresh: bool = False, cache_only: bool = False):
+        """Resolve one provider catalog through the shared two-tier flow."""
+        from hermes_cli.models import cached_fetch_api_models, cached_provider_model_ids
+
+        if normalized_provider == "custom" or normalized_provider.startswith("custom:"):
+            return cached_fetch_api_models(
+                route["api_key"],
+                route["base_url"],
+                api_mode=route["api_mode"],
+                force_refresh=force_refresh,
+                cache_only=cache_only,
+                require_verified=True,
+            ) or []
+        return cached_provider_model_ids(
+            provider,
+            force_refresh=force_refresh,
+            cache_only=cache_only,
+            require_verified=True,
+            api_key=route["api_key"],
+            base_url=route["base_url"],
+            api_mode=route["api_mode"],
+        )
+
+    try:
+        cached = _resolve_catalog(cache_only=True)
+        if _contains(cached):
+            return route
+        live = _resolve_catalog(force_refresh=True)
+    except Exception as exc:
+        _reject(f"selected provider/account catalog verification failed ({exc}).")
+
+    if _contains(live):
+        return route
+    if live:
+        _reject("the exact model is not present in the selected provider catalog.")
+    _reject("the selected provider/account catalog is unavailable; no child was started.")
+
+
+def prepare_resumed_child_session(bundle: Dict[str, Any]) -> Dict[str, str]:
+    """Validate a hydration bundle and allocate a distinct child segment.
+
+    This deliberately does not create the SQLite row. The standard AIAgent
+    persistence path creates/enriches it with the effective current runtime
+    configuration before the first resumed turn is stored.
+    """
+    if not isinstance(bundle, dict):
+        raise ValueError("missing subagent resume bundle")
+    prior = bundle.get("prior_child_session_id")
+    owner = bundle.get("parent_session_id")
+    history = bundle.get("history")
+    metadata = bundle.get("reconstruction_metadata")
+    if (
+        not isinstance(prior, str)
+        or not prior
+        or not isinstance(owner, str)
+        or not owner
+        or not isinstance(history, list)
+        or not history
+        or not isinstance(metadata, dict)
+        or metadata.get("parent_session_id") != owner
+    ):
+        raise ValueError("incomplete subagent resume bundle")
+    return {
+        "session_id": f"{time.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}",
+        "parent_session_id": prior,
+        "delegate_from": owner,
+    }
+
+
+def build_resumed_child_agent(
+    *,
+    bundle: Dict[str, Any],
+    logical_id: str,
+    goal: str,
+    parent_agent,
+    continuation: Optional[Dict[str, str]] = None,
+    resolved_scope: Any = None,
+    authority_tools: Optional[Dict[str, Any]] = None,
+):
+    """Reconstruct a child using persisted non-secret policy and live credentials."""
+    metadata = dict(bundle.get("reconstruction_metadata") or {})
+    if resolved_scope is not None:
+        if not isinstance(authority_tools, dict):
+            raise ValueError("protected resume tool snapshot is unavailable")
+        metadata["enabled_toolsets"] = list(
+            authority_tools.get("enabled_toolsets") or []
+        )
+        metadata["disabled_toolsets"] = list(
+            authority_tools.get("disabled_toolsets") or []
+        )
+    model = str(metadata.get("model") or "").strip()
+    provider = str(metadata.get("provider") or "").strip()
+    if not model or not provider:
+        raise ValueError("saved child provider/model is unavailable")
+    continuation = continuation or prepare_resumed_child_session(bundle)
+    # Re-resolve credentials and approval policy from current authorized config;
+    # no persisted secret is ever accepted from the resume bundle.
+    credentials = _resolve_delegation_credentials(
+        {"provider": provider, "model": model}, parent_agent
+    )
+    runtime_parent = parent_agent
+    if runtime_parent is None:
+        from hermes_state import SessionDB
+
+        # Durable resume must work after a gateway restart, where the original
+        # parent AIAgent object no longer exists and native tool adapters may not
+        # expose the newly-created controller object. Rebuild only the non-secret
+        # policy surface consumed by _build_child_agent; credentials above were
+        # resolved fresh from the active provider configuration.
+        runtime_parent = SimpleNamespace(
+            session_id=continuation["delegate_from"],
+            _session_db=SessionDB(),
+            model=model,
+            provider=credentials.get("provider") or provider,
+            base_url=credentials.get("base_url"),
+            api_key=credentials.get("api_key"),
+            api_mode=credentials.get("api_mode"),
+            _client_kwargs={
+                key: value
+                for key, value in {
+                    "base_url": credentials.get("base_url"),
+                    "api_key": credentials.get("api_key"),
+                }.items()
+                if value
+            },
+            _delegate_depth=max(0, int(metadata.get("depth") or 1) - 1),
+            _subagent_id=metadata.get("parent_logical_id"),
+            enabled_toolsets=list(metadata.get("enabled_toolsets") or []),
+            disabled_toolsets=list(metadata.get("disabled_toolsets") or []),
+            valid_tool_names=[],
+            reasoning_config=_json_safe_copy(metadata.get("reasoning_config")),
+            _fallback_chain=_json_safe_copy(metadata.get("fallback_routes")) or [],
+            acp_command=credentials.get("command"),
+            acp_args=list(credentials.get("args") or []),
+        )
+    delegation_policy_override = None
+    if resolved_scope is not None:
+        from agent.delegation_policy import DelegationSessionPolicy
+
+        delegation_policy_override = DelegationSessionPolicy(
+            profile_required=True,
+            allow_profile_none=False,
+            allowed_profiles={resolved_scope.profile_name},
+            profile_snapshots={resolved_scope.profile_name: resolved_scope.profile},
+            visible_objects=resolved_scope.visible_objects,
+            protected_prefixes=(),
+        )
+    child = _build_child_agent(
+        task_index=0,
+        goal=goal,
+        context=None,
+        toolsets=list(metadata.get("enabled_toolsets") or []),
+        model=model,
+        max_iterations=int(metadata.get("max_iterations") or 50),
+        task_count=1,
+        parent_agent=runtime_parent,
+        override_provider=credentials.get("provider"),
+        override_base_url=credentials.get("base_url"),
+        override_api_key=credentials.get("api_key"),
+        override_api_mode=credentials.get("api_mode"),
+        override_request_overrides=credentials.get("request_overrides"),
+        override_max_tokens=(
+            metadata.get("max_tokens")
+            if isinstance(metadata.get("max_tokens"), int)
+            else credentials.get("max_output_tokens")
+        ),
+        override_acp_command=credentials.get("command"),
+        override_acp_args=credentials.get("args"),
+        required_disabled_toolsets=list(metadata.get("disabled_toolsets") or []),
+        workspace_override=(
+            str(resolved_scope.workdir)
+            if resolved_scope is not None
+            else metadata.get("workdir")
+        ),
+        reasoning_config_override=metadata.get("reasoning_config"),
+        fallback_model_override=list(metadata.get("fallback_routes") or []),
+        provider_preferences_override=metadata.get("provider_preferences"),
+        session_id_override=continuation["session_id"],
+        parent_session_id_override=continuation["parent_session_id"],
+        role=str(metadata.get("role") or "leaf"),
+        resolved_scope=resolved_scope,
+        delegation_policy_override=delegation_policy_override,
+    )
+
+    owner = continuation["delegate_from"]
+    prior = continuation["parent_session_id"]
+    session_id = continuation["session_id"]
+    parent_logical_id = metadata.get("parent_logical_id")
+    child.session_id = session_id
+    child._parent_session_id = prior
+    child._subagent_id = logical_id
+    child._parent_subagent_id = (
+        parent_logical_id if isinstance(parent_logical_id, str) else None
+    )
+    if isinstance(metadata.get("depth"), int):
+        child._delegate_depth = metadata["depth"]
+    child._delegate_role = str(metadata.get("role") or "leaf")
+    child._subagent_goal = goal
+    session_ref = {"session_id": session_id}
+    child._delegation_session_ref = session_ref
+    child._delegation_runtime_metadata = {
+        **metadata,
+        "child_session_id": session_id,
+        "parent_session_id": owner,
+        "enabled_toolsets": list(getattr(child, "enabled_toolsets", None) or []),
+        "disabled_toolsets": list(getattr(child, "disabled_toolsets", None) or []),
+        "reasoning_config": _json_safe_copy(
+            getattr(child, "reasoning_config", metadata.get("reasoning_config"))
+        ),
+        "fallback_routes": _json_safe_copy(
+            getattr(child, "_fallback_chain", metadata.get("fallback_routes"))
+        ),
+    }
+    if getattr(child, "_session_init_model_config", None) is not None:
+        child._session_init_model_config["_delegate_from"] = owner
+
+    # Rebuild the callback because the initial builder generated a throwaway
+    # logical/session identity before this exact resumed identity was known.
+    child_progress_cb = _build_child_progress_callback(
+        0,
+        goal,
+        runtime_parent,
+        1,
+        subagent_id=logical_id,
+        parent_id=child._parent_subagent_id,
+        depth=max(0, int(getattr(child, "_delegate_depth", 1)) - 1),
+        model=model,
+        toolsets=list(getattr(child, "enabled_toolsets", None) or []),
+        session_ref=session_ref,
+    )
+    child.tool_progress_callback = child_progress_cb
+    child._delegation_fallback_callback = _build_delegation_fallback_callback(
+        runtime_parent,
+        subagent_id=logical_id,
+        child_session_ref=session_ref,
+    )
+    if child_progress_cb:
+        def _resumed_thinking(text: str) -> None:
+            if text:
+                child_progress_cb("_thinking", text)
+
+        child.thinking_callback = _resumed_thinking
+    return child
+
+
+def _json_safe_copy(value: Any) -> Any:
+    """Return a detached JSON value or ``None`` for runtime-only objects."""
+    try:
+        return json.loads(json.dumps(value))
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _safe_fallback_routes(value: Any) -> List[Dict[str, str]]:
+    """Persist named fallback routes without credentials or endpoint details."""
+    items = value if isinstance(value, list) else [value]
+    routes: List[Dict[str, str]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        provider = item.get("provider")
+        model = item.get("model")
+        if not isinstance(provider, str) or not isinstance(model, str):
+            continue
+        route = {"provider": provider, "model": model}
+        api_mode = item.get("api_mode")
+        if isinstance(api_mode, str):
+            route["api_mode"] = api_mode
+        routes.append(route)
+    return routes

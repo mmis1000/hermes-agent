@@ -15,6 +15,7 @@ import re
 import sys
 import threading
 import time
+from collections.abc import Mapping
 from collections import deque
 from contextlib import suppress
 from datetime import datetime
@@ -156,6 +157,66 @@ def _custom_provider_runtime_ids(value: Any) -> set[str]:
     if not normalized:
         return set()
     return {normalized, f"custom:{normalized}"}
+
+
+def _admit_standard_delegation_policy(explicit_policy):
+    """Snapshot operator-owned filesystem isolation for a standard session."""
+
+    if explicit_policy is not None:
+        return explicit_policy
+
+    from hermes_cli.config import load_config_readonly
+
+    config = load_config_readonly()
+    delegation = config.get("delegation", {})
+    if not isinstance(delegation, Mapping):
+        return None
+    isolation = delegation.get("filesystem_isolation", {})
+    if not isinstance(isolation, Mapping):
+        raise ValueError("delegation.filesystem_isolation must be a mapping")
+    enabled = isolation.get("enabled", False)
+    if not isinstance(enabled, bool):
+        raise ValueError("delegation.filesystem_isolation.enabled must be a boolean")
+    if not enabled:
+        return None
+
+    from agent.delegation_policy import DelegationSessionPolicy
+    from tools.delegation_scope import parse_execution_profiles
+
+    profiles = parse_execution_profiles(delegation)
+    raw_allowed = isolation.get("allowed_profiles")
+    if not isinstance(raw_allowed, list) or not raw_allowed:
+        raise ValueError(
+            "delegation.filesystem_isolation.allowed_profiles must be a non-empty list"
+        )
+    if not all(
+        isinstance(name, str) and name and name == name.strip()
+        for name in raw_allowed
+    ):
+        raise ValueError(
+            "delegation.filesystem_isolation.allowed_profiles must contain canonical strings"
+        )
+    if len(raw_allowed) != len(set(raw_allowed)):
+        raise ValueError(
+            "delegation.filesystem_isolation.allowed_profiles must not contain duplicates"
+        )
+    unknown = sorted(set(raw_allowed).difference(profiles))
+    if unknown:
+        raise ValueError(
+            "delegation.filesystem_isolation.allowed_profiles contains unknown profiles: "
+            + ", ".join(unknown)
+        )
+    snapshots = {name: profiles[name] for name in raw_allowed}
+    # The top-level session is not sandboxed, so neither is an unprofiled child:
+    # only a profiled spawn is restricted to its profile and reveals.
+    return DelegationSessionPolicy(
+        profile_required=False,
+        allow_profile_none=True,
+        allowed_profiles=frozenset(raw_allowed),
+        profile_snapshots=snapshots,
+        visible_objects=None,
+        protected_prefixes=(),
+    )
 
 
 def _build_codex_gpt5_autoraise_notice(
@@ -532,7 +593,7 @@ _CONTROL_STATE: Dict[str, Any] = {
     "_supports_active_turn_redirect": True,
     # /steer: the drain hook appends the note to the last tool result after the current
     # batch — no interrupt, no new user turn (role alternation preserved).
-    "_pending_steer": None,
+    "_pending_steer": None, "_pending_steer_envelopes": [],
     "_pending_steer_lock": threading.Lock,
     # Active-turn redirect: keep the valid turn prefix, cancel only the in-flight request,
     # rebuild the tail with the correction. Drained at a role-safe boundary.
@@ -688,6 +749,8 @@ def _init_prompt_cache_config(agent):
 
 
 def _init_turn_state(agent, run_budget_seconds):
+    from tools.foreground_wait import ForegroundWaitRegistry
+    agent._foreground_waits = ForegroundWaitRegistry()
     _set_defaults(agent, _TURN_STATE)
     # Wall-clock run budget per turn: constructor arg wins, else agent.run_budget_seconds
     # (in _apply_agent_section). None = fully off (no clock reads, injection, or capping).
@@ -1127,6 +1190,7 @@ def _load_tools(agent, enabled_toolsets, disabled_toolsets):
     agent.tools = model_tools.get_tool_definitions(
         enabled_toolsets=enabled_toolsets, disabled_toolsets=disabled_toolsets,
         quiet_mode=agent.quiet_mode,
+        delegation_policy=getattr(agent, "delegation_policy", None),
     )
     # A finite -q run has no later session to learn for: no skill authoring tool (agent/oneshot_footprint.py).
     from agent.oneshot_footprint import prune_oneshot_tools
@@ -2409,9 +2473,18 @@ def init_agent(
     requested_provider: str = None, capabilities: Optional[Dict[str, bool]] = None, cwd: Optional[str] = None,
     side_agent: bool = False, memory_manager=None,
     tool_result_metadata_callback: Optional[Callable[..., dict]] = None,
+    delegation_policy=None,
 ):
     _install_safe_stdio()
 
+    agent.delegation_policy = _admit_standard_delegation_policy(delegation_policy)
+    if agent.delegation_policy is not None:
+        from tools.delegation_scope import BackingObjectRegistry
+        agent.delegation_backing_registry = BackingObjectRegistry()
+    else:
+        agent.delegation_backing_registry = None
+    agent.resolved_invocation_scope = None
+    agent._delegation_scope = None
     _params = locals()
     for _name in _PASSTHROUGH_PARAMS:
         setattr(agent, _name, _params[_name])

@@ -109,6 +109,75 @@ def _ic_signal_tool_workers(agent, active: bool, **kw) -> None:
             pass
 
 
+# Steer queue: ordered envelopes ``{"text", "mailbox_id", "outcome_callback"}``; ``_pending_steer`` mirrors
+# their joined text for text-only readers.
+def _steer_queue(agent) -> list:
+    """The live envelope list (caller holds the lock). ``__init__``-less test stubs may carry only the
+    plain ``_pending_steer`` text; it is materialized once as an untracked envelope."""
+    queue = getattr(agent, "_pending_steer_envelopes", None)
+    if isinstance(queue, list):
+        return queue
+    text = getattr(agent, "_pending_steer", None)
+    agent._pending_steer_envelopes = queue = [_steer_envelope(text)] if text else []
+    return queue
+
+
+def _set_steer_queue(agent, queue: list) -> None:
+    """Install ``queue`` and refresh the text mirror (caller holds the lock)."""
+    agent._pending_steer_envelopes = queue
+    agent._pending_steer = steer_envelope_text(queue)
+
+
+def _steer_envelope(text: str, mailbox_id: Optional[str] = None, outcome_callback=None) -> dict:
+    return {
+        "text": text,
+        "mailbox_id": mailbox_id if isinstance(mailbox_id, str) else None,
+        "outcome_callback": outcome_callback if callable(outcome_callback) else None,
+    }
+
+
+def steer_envelope_text(envelopes: list) -> Optional[str]:
+    """Newline-joined text of ``envelopes``; None when there is none."""
+    return "\n".join(str(item.get("text") or "") for item in envelopes if item.get("text")) or None
+
+
+def ack_steer_envelopes(envelopes: list, outcome: str) -> None:
+    """Report ``outcome`` to each tracked envelope; a failing callback never breaks delivery."""
+    for envelope in envelopes:
+        callback = envelope.get("outcome_callback")
+        if callable(callback):
+            try:
+                callback(outcome)
+            except Exception:
+                logger.debug("steer outcome callback failed", exc_info=True)
+
+
+def drain_steer_envelopes(agent) -> list:
+    """Take every queued envelope, leaving the queue and its text mirror empty."""
+    with _ic_lock(agent, "_pending_steer_lock"):
+        queue = list(_steer_queue(agent))
+        _set_steer_queue(agent, [])
+    return queue
+
+
+def requeue_steer_envelopes(agent, envelopes: list) -> None:
+    """Put drained ``envelopes`` back ahead of anything queued since, keeping delivery order."""
+    if not envelopes:
+        return
+    with _ic_lock(agent, "_pending_steer_lock"):
+        _set_steer_queue(agent, list(envelopes) + _steer_queue(agent))
+
+
+def _clear_pending_steer(agent, outcome: str) -> None:
+    ack_steer_envelopes(drain_steer_envelopes(agent), outcome)
+
+
+def _remove_steer_envelope(agent, mailbox_id: str) -> None:
+    """Retract one tracked envelope after a failed forced handoff."""
+    with _ic_lock(agent, "_pending_steer_lock"):
+        _set_steer_queue(agent, [item for item in _steer_queue(agent) if item.get("mailbox_id") != mailbox_id])
+
+
 class InterruptControlMixin:
     """interrupt()/hard_interrupt()/clear_interrupt()/steer()/redirect() (see module docstring)."""
 
@@ -139,6 +208,8 @@ class InterruptControlMixin:
         )
 
         def _publish_interrupt_state() -> None:
+            if hard_cancel:
+                _clear_pending_steer(self, "superseded_by_interrupt")
             self._interrupt_requested = True
             self._interrupt_message = message
             self._tool_interrupt_reason = tool_interrupt_reason
@@ -243,20 +314,52 @@ class InterruptControlMixin:
             # Hard stop only (see docstring). The comment that used to run unconditionally here
             # claimed a hard interrupt supersedes the steer — but nothing gated this wipe on
             # hard_cancel, so a soft clear dropped a live user message with no trace.
-            with _ic_lock(self, "_pending_steer_lock"):
-                self._pending_steer = None
+            _clear_pending_steer(self, "superseded_by_interrupt")
         return True
 
-    def steer(self, text: str) -> bool:
+    def steer(self, text: str, *, mailbox_id: Optional[str] = None, outcome_callback=None) -> bool:
         """Queue user text for delivery as its own user row after the current tool batch finishes (no
-        interrupt); multiple calls concatenate with newlines. Returns False for empty text."""
-        if not text or not text.strip():
+        interrupt); multiple calls concatenate with newlines. Returns False for empty text. A tracked
+        ``mailbox_id`` steer is refused once an interrupt is pending, and ``outcome_callback(outcome)``
+        reports how its envelope resolved (``injected``, ``superseded_by_interrupt``, ...)."""
+        if not isinstance(text, str) or not text.strip():
             return False
-        cleaned = text.strip()
+        envelope = _steer_envelope(text.strip(), mailbox_id, outcome_callback)
         with _ic_lock(self, "_pending_steer_lock"):
-            existing = _ic_slot(self, "_pending_steer_lock", "_pending_steer")
-            self._pending_steer = (existing + "\n" + cleaned) if existing else cleaned
+            if envelope["mailbox_id"] and getattr(self, "_interrupt_requested", False):
+                ack_steer_envelopes([envelope], "superseded_by_interrupt")
+                return False
+            queue = _steer_queue(self)
+            queue.append(envelope)
+            _set_steer_queue(self, queue)
         return True
+
+    def request_durable_steer(self, text: str, *, mailbox_id: str, outcome_callback, force: bool = False) -> dict:
+        """Queue a tracked steer, optionally handing foreground waits off to the background first."""
+        waits = getattr(self, "_foreground_waits", None)
+        active = waits.snapshot() if waits is not None else []
+        wait_kinds = sorted({slot.kind for slot in active})
+        if active and not force:
+            if callable(outcome_callback):
+                outcome_callback("foreground_wait")
+            return {"status": "foreground_wait", "wait_kinds": wait_kinds}
+
+        if not self.steer(text, mailbox_id=mailbox_id, outcome_callback=outcome_callback):
+            return {"status": "too_late_after_completion", "wait_kinds": wait_kinds}
+        if not active:
+            return {"status": "accepted", "wait_kinds": []}
+
+        result = waits.request_background(active)
+        if result.get("status") != "backgrounded":
+            _remove_steer_envelope(self, mailbox_id)
+            if callable(outcome_callback):
+                outcome_callback("force_background_failed")
+            return {
+                "status": "force_background_failed",
+                "wait_kinds": result.get("wait_kinds") or wait_kinds,
+                "errors": result.get("errors") or ["foreground handoff failed"],
+            }
+        return {"status": "accepted", "wait_kinds": result.get("wait_kinds") or wait_kinds}
 
     def redirect(self, text: str) -> bool:
         """Redirect the active turn without converting it into a new task: during a model request only that
@@ -330,8 +433,5 @@ class InterruptControlMixin:
         return text
 
     def _drain_pending_steer(self) -> Optional[str]:
-        """Return the pending steer text (if any) and clear the slot; None when nothing is pending."""
-        with _ic_lock(self, "_pending_steer_lock"):
-            text = _ic_slot(self, "_pending_steer_lock", "_pending_steer")
-            self._pending_steer = None
-        return text
+        """Return the pending steer text (if any) and clear the queue; None when nothing is pending."""
+        return steer_envelope_text(drain_steer_envelopes(self))

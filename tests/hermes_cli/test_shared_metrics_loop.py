@@ -14,6 +14,11 @@ from hermes_cli.observability.shared_metrics import SharedMetricsStore
 from hermes_constants import reset_hermes_home_override, set_hermes_home_override
 from tests.hermes_cli.test_relay_shared_metrics_runtime import direct_runtime  # noqa: F401
 
+
+pytestmark = pytest.mark.usefixtures("admitted_delegate_route")
+
+
+
 _LOOP_METRICS = {
     "hermes.memory.op.count", "hermes.curator.run.count", "hermes.delegation.run.count",
     "hermes.execution_backend.count",

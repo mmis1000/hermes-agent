@@ -9,6 +9,7 @@ the subagent.steer gateway RPC that fronts the helper.
 """
 
 import threading
+import pytest
 from unittest.mock import MagicMock
 
 from tools.delegate_tool import (
@@ -16,6 +17,9 @@ from tools.delegate_tool import (
     _unregister_subagent,
     steer_subagent,
 )
+
+
+pytestmark = pytest.mark.usefixtures("admitted_delegate_route")
 
 
 class _StubAgent:

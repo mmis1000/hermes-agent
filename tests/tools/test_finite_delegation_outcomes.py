@@ -18,6 +18,9 @@ from tools.delegate_tool_child_run import _attach_child
 from tools.process_registry import process_registry
 
 
+pytestmark = pytest.mark.usefixtures("admitted_delegate_route")
+
+
 class _Parent(InterruptControlMixin, SimpleNamespace):
     pass
 

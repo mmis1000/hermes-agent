@@ -51,6 +51,28 @@ def test_cwd_only_override_collapses_to_default():
         terminal_tool.clear_task_env_overrides("acp-session-abc")
 
 
+def test_delegation_scope_override_keeps_physical_attempt_isolated():
+    terminal_tool.register_task_env_overrides(
+        "attempt-protected",
+        {"cwd": "/workspace", "delegation_scope_id": "scope-protected"},
+    )
+    try:
+        assert (
+            terminal_tool._resolve_container_task_id("attempt-protected")
+            == "attempt-protected"
+        )
+    finally:
+        terminal_tool.clear_task_env_overrides("attempt-protected")
+
+
+def test_ordinary_task_is_not_a_protected_environment(monkeypatch):
+    created = []
+    monkeypatch.setattr(terminal_tool, "_create_environment", lambda **kwargs: created.append(kwargs))
+
+    assert terminal_tool.acquire_protected_environment("ordinary-child", timeout=45) is None
+    assert created == []
+
+
 def test_env_type_override_keeps_own_id():
     """env_type is an isolation key — must trigger per-task container."""
     terminal_tool.register_task_env_overrides(
@@ -300,3 +322,217 @@ def test_shared_key_ignored_outside_persistent_docker(monkeypatch):
         assert terminal_tool._resolve_container_task_id(None) == "session:sess-A"
     finally:
         clear_session_vars(tokens)
+
+
+def test_protected_acquisition_materializes_only_resolved_profile_and_reveals(monkeypatch):
+    from pathlib import PurePosixPath
+    from unittest.mock import MagicMock
+    from agent.delegation_policy import AccessMode, BackingObjectRef, ExecutionProfile, VisibleObjectGrant
+    from tools.delegation_scope import (
+        BackingObjectRecord,
+        BackingObjectRegistry,
+        ResolvedInvocationScope,
+        attempt_scope_registry,
+        execution_profile_hash,
+    )
+
+    profile = ExecutionProfile(
+        name="protected", backend="docker", image="repo/protected@sha256:deadbeef",
+        default_workdir=PurePosixPath("/workspace"), allowed_toolsets=frozenset({"terminal"}),
+        network="none", cpu=2.0, memory_mb=1024, shm_mb=128, pids_limit=48,
+    )
+    scope = ResolvedInvocationScope(
+        profile_name=profile.name, profile_hash=execution_profile_hash(profile), profile=profile,
+        workdir=PurePosixPath("/workspace"), reveal=(),
+        visible_objects=(VisibleObjectGrant(
+            visible_path=PurePosixPath("/visible/data"), mode=AccessMode.RO,
+            backing=BackingObjectRef(object_id="obj-1", kind="host_path", identity="/trusted/data", revision="rev-1"),
+            object_type="directory",
+        ),),
+    )
+    grant = scope.visible_objects[0]
+    backing_registry = BackingObjectRegistry({
+        grant.backing.object_id: BackingObjectRecord(grant.backing, grant.object_type)
+    })
+    authority = attempt_scope_registry.reserve(
+        scope,
+        "logical-1",
+        attempt_id="attempt-protected-acquire",
+        backing_registry=backing_registry,
+    )
+    create = MagicMock(return_value=object())
+    monkeypatch.setattr(terminal_tool, "_get_env_config", lambda: {
+        "env_type": "local", "cwd": "/ambient", "timeout": 60,
+        "lifetime_seconds": 300, "docker_volumes": ["/ambient:/ambient"],
+        "docker_extra_args": ["--privileged"],
+    })
+    monkeypatch.setattr(terminal_tool, "_create_environment", create)
+    monkeypatch.setattr(terminal_tool, "_start_cleanup_thread", lambda: None)
+    monkeypatch.setattr(terminal_tool, "_active_environments", {})
+    monkeypatch.setattr(terminal_tool, "_last_activity", {})
+    monkeypatch.setattr(terminal_tool, "_task_env_overrides", {})
+    monkeypatch.setattr(terminal_tool, "_creation_locks", {})
+
+    try:
+        terminal_tool.register_task_env_overrides(authority.attempt_id, {
+            "env_type": "docker", "docker_image": profile.image, "cwd": "/workspace",
+            "delegation_scope_id": authority.scope_id,
+        })
+        terminal_tool.acquire_protected_environment(authority.attempt_id)
+    finally:
+        terminal_tool.clear_task_env_overrides(authority.attempt_id)
+        attempt_scope_registry.cleanup(authority.attempt_id)
+
+    kwargs = create.call_args.kwargs
+    assert (kwargs["env_type"], kwargs["image"], kwargs["cwd"]) == (
+        "docker", profile.image, "/workspace"
+    )
+    container_config = kwargs["container_config"]
+    backing_validator = container_config.pop("trusted_mounts_validator")
+    assert callable(backing_validator)
+    assert container_config == {
+        "container_cpu": 2.0, "container_memory": 1024, "container_disk": 0,
+        "container_persistent": False, "docker_network": False,
+        "docker_persist_across_processes": False, "suppress_implicit_mounts": True,
+        "trusted_mounts": [{"kind": "host_path", "source": "/trusted/data", "target": "/visible/data", "mode": "ro"}],
+        "shm_mb": 128, "pids_limit": 48,
+        "delegation_scope_id": authority.scope_id,
+        "delegation_attempt_id": authority.attempt_id,
+    }
+
+
+def test_protected_acquisition_uses_attempt_prepared_mount_source(monkeypatch):
+    from pathlib import PurePosixPath
+    from unittest.mock import MagicMock
+    from agent.delegation_policy import AccessMode, BackingObjectRef, ExecutionProfile, VisibleObjectGrant
+    from tools.delegation_scope import (
+        BackingObjectRecord,
+        BackingObjectRegistry,
+        ResolvedInvocationScope,
+        attempt_scope_registry,
+        execution_profile_hash,
+    )
+
+    grant = VisibleObjectGrant(
+        "/visible/data",
+        AccessMode.RW,
+        BackingObjectRef("obj-mapped", "host_path", "/trusted/data", "rev-1"),
+        "directory",
+    )
+    profile = ExecutionProfile(
+        "protected",
+        "docker",
+        "repo/protected@sha256:deadbeef",
+        PurePosixPath("/workspace"),
+        frozenset({"terminal"}),
+        network="none",
+        runtime_identity=(10001, 10001),
+    )
+    scope = ResolvedInvocationScope(
+        profile.name,
+        execution_profile_hash(profile),
+        profile,
+        PurePosixPath("/workspace"),
+        (),
+        (grant,),
+    )
+    authority = attempt_scope_registry.reserve(
+        scope,
+        "logical-mapped",
+        attempt_id="attempt-protected-mapped",
+        backing_registry=BackingObjectRegistry(
+            {grant.backing.object_id: BackingObjectRecord(grant.backing, "directory")}
+        ),
+    )
+    authority.prepared_mount_sources[grant.backing.object_id] = "/private/mapped"
+    create = MagicMock(return_value=object())
+    monkeypatch.setattr(terminal_tool, "_get_env_config", lambda: {
+        "env_type": "local", "cwd": "/ambient", "timeout": 60,
+        "lifetime_seconds": 300,
+    })
+    monkeypatch.setattr(terminal_tool, "_create_environment", create)
+    monkeypatch.setattr(terminal_tool, "_start_cleanup_thread", lambda: None)
+    monkeypatch.setattr(terminal_tool, "_active_environments", {})
+    monkeypatch.setattr(terminal_tool, "_last_activity", {})
+    monkeypatch.setattr(terminal_tool, "_task_env_overrides", {})
+    monkeypatch.setattr(terminal_tool, "_creation_locks", {})
+
+    try:
+        terminal_tool.register_task_env_overrides(authority.attempt_id, {
+            "env_type": "docker", "docker_image": profile.image, "cwd": "/workspace",
+            "delegation_scope_id": authority.scope_id,
+        })
+        terminal_tool.acquire_protected_environment(authority.attempt_id)
+    finally:
+        terminal_tool.clear_task_env_overrides(authority.attempt_id)
+        attempt_scope_registry.cleanup(authority.attempt_id)
+
+    trusted_mounts = create.call_args.kwargs["container_config"]["trusted_mounts"]
+    assert trusted_mounts == [
+        {
+            "kind": "host_path",
+            "source": "/private/mapped",
+            "target": "/visible/data",
+            "mode": "rw",
+        }
+    ]
+
+
+def test_protected_acquisition_revalidates_backing_revision_before_creation(monkeypatch):
+    from pathlib import PurePosixPath
+    from unittest.mock import MagicMock
+    from agent.delegation_policy import AccessMode, BackingObjectRef, ExecutionProfile, VisibleObjectGrant
+    from tools.delegation_scope import (
+        BackingObjectRecord, ResolvedInvocationScope, attempt_scope_registry,
+        execution_profile_hash,
+    )
+
+    backing = BackingObjectRef("obj-race", "host_path", "/trusted/race", "rev-1")
+    grant = VisibleObjectGrant(PurePosixPath("/visible/race"), AccessMode.RO, backing, "directory")
+    profile = ExecutionProfile(
+        "protected", "docker", "repo/protected@sha256:deadbeef", "/workspace",
+        frozenset({"terminal"}),
+    )
+    scope = ResolvedInvocationScope(
+        profile.name, execution_profile_hash(profile), profile,
+        PurePosixPath("/workspace"), (), (grant,),
+    )
+
+    class MutableRegistry:
+        current = BackingObjectRecord(backing, "directory")
+
+        def get(self, _object_id):
+            return self.current
+
+    registry = MutableRegistry()
+    authority = attempt_scope_registry.reserve(
+        scope, "logical-race", attempt_id="attempt-race", backing_registry=registry
+    )
+    create = MagicMock(return_value=object())
+    monkeypatch.setattr(terminal_tool, "_get_env_config", lambda: {
+        "env_type": "docker", "docker_image": profile.image, "cwd": "/workspace",
+        "timeout": 60, "lifetime_seconds": 300,
+    })
+    monkeypatch.setattr(terminal_tool, "_create_environment", create)
+    monkeypatch.setattr(terminal_tool, "_start_cleanup_thread", lambda: None)
+    monkeypatch.setattr(terminal_tool, "_active_environments", {})
+    monkeypatch.setattr(terminal_tool, "_last_activity", {})
+    monkeypatch.setattr(terminal_tool, "_task_env_overrides", {})
+    monkeypatch.setattr(terminal_tool, "_creation_locks", {})
+    terminal_tool.register_task_env_overrides(authority.attempt_id, {
+        "env_type": "docker", "docker_image": profile.image, "cwd": "/workspace",
+        "delegation_scope_id": authority.scope_id,
+    })
+    registry.current = BackingObjectRecord(
+        BackingObjectRef("obj-race", "host_path", "/trusted/race", "rev-2"),
+        "directory",
+    )
+
+    try:
+        with pytest.raises(ValueError, match="backing.*changed"):
+            terminal_tool.acquire_protected_environment(authority.attempt_id)
+    finally:
+        terminal_tool.clear_task_env_overrides(authority.attempt_id)
+        attempt_scope_registry.cleanup(authority.attempt_id)
+
+    create.assert_not_called()

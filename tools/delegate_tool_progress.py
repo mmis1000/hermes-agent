@@ -1,6 +1,7 @@
 """Child progress relay, console formatting and child system-prompt construction for delegate_task."""
 
 from __future__ import annotations
+import time
 
 import logging
 import enum
@@ -176,7 +177,7 @@ _NESTED_CHILDREN_NOTE = (
 )
 
 def _build_child_system_prompt(
-    goal: str, context: Optional[str] = None, *, workspace_path: Optional[str] = None, role: str = "leaf",
+    goal: str, context: Optional[str] = None, *, effective_scope_context: Optional[str] = None, workspace_path: Optional[str] = None, role: str = "leaf",
     max_spawn_depth: int = 2, child_depth: int = 1,
 ) -> str:
     """Focused system prompt for a child agent. role='orchestrator' appends a delegation-capability block (modeled on
@@ -188,7 +189,9 @@ def _build_child_system_prompt(
     parts = ["You are a focused subagent working on a specific delegated task."]
     if context and context.strip():
         parts.append(f"\nCONTEXT:\n{context}")
-    if workspace_path and str(workspace_path).strip():
+    if effective_scope_context:
+        parts.append("\n" + effective_scope_context)
+    elif workspace_path and str(workspace_path).strip():
         parts.append(
             "\nWORKSPACE PATH:\n"
             f"{workspace_path}\n"
@@ -410,6 +413,17 @@ class _ChildProgressRelay:
                 self._flush()
 
     def __call__(self, event_type, tool_name: str = None, preview: str = None, args=None, **kwargs):
+        from tools.delegate_tool_registry import _append_live_text, _append_live_event, _bounded_live_preview
+        attempt_id = self.session_ref.get("attempt_id")
+        if self.subagent_id:
+            with _active_subagents_lock:
+                record = _active_subagents.get(self.subagent_id)
+                if attempt_id and record and record.get("delegation_attempt_id") != attempt_id:
+                    return
+            if event_type == "subagent.text":
+                _append_live_text(self.subagent_id, preview, attempt_id=attempt_id)
+            elif event_type in ("tool.started", "tool.completed"):
+                _append_live_event(self.subagent_id, {"type": event_type, "tool": tool_name or "", "arguments_preview": _bounded_live_preview(args if args is not None else preview), "timestamp": time.time()}, attempt_id=attempt_id)
         key = _normalize_event(event_type)
         method = None if key is None else _EVENT_HANDLERS.get(key, "_on_tool_started")
         if method is not None:
@@ -424,7 +438,7 @@ def _build_child_progress_callback(
     progress callback — the child then runs with no progress callback at all (zero behavior change)."""
     spinner = getattr(parent_agent, "_delegate_spinner", None)
     parent_cb = getattr(parent_agent, "tool_progress_callback", None)
-    if not spinner and not parent_cb:
+    if not spinner and not parent_cb and not subagent_id:
         return None
     if session_ref is not None:
         # Not an identity kwarg (underscore-prefixed, never relayed); only scopes the batch ordinal.

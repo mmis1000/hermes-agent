@@ -17,7 +17,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from tools.delegate_tool import _summarize_tool_arguments, delegate_task
+from tools.delegate_tool import delegate_task
 from hermes_cli import plugins
 
 
@@ -41,6 +41,7 @@ def _make_parent(depth: int = 0, session_id: str = "parent-1"):
     parent.tool_progress_callback = None
     parent.thinking_callback = None
     parent._memory_manager = None
+    parent.delegation_policy = None
     parent.session_id = session_id
     return parent
 
@@ -66,6 +67,7 @@ def _stub_child_builder(monkeypatch):
         child._credential_pool = None
         return child
 
+    monkeypatch.setattr("tools.delegate_tool._admit_delegation_route", lambda *a: None)
     monkeypatch.setattr(
         "tools.delegate_tool._build_child_agent", _fake_build_child,
     )
@@ -99,7 +101,7 @@ class TestSingleTask:
                 "duration_seconds": 5.0,
                 "_child_role": "analyst",
             }
-            delegate_task(goal="do X", parent_agent=_make_parent())
+            delegate_task(goal="complete task X", parent_agent=_make_parent())
 
         assert len(captured) == 1
         payload = captured[0]
@@ -127,7 +129,7 @@ class TestSingleTask:
                 "summary": "x", "api_calls": 1, "duration_seconds": 0.1,
                 "_child_role": None,
             }
-            delegate_task(goal="go", parent_agent=_make_parent())
+            delegate_task(goal="complete requested work", parent_agent=_make_parent())
 
         assert dispatch_threads and all(t is main_thread for t in dispatch_threads)
         cb_thread = captured[0]["_thread"]
@@ -143,7 +145,7 @@ class TestSingleTask:
                 "_child_role": None,
             }
             delegate_task(
-                goal="go",
+                goal="complete requested work",
                 parent_agent=_make_parent(session_id="sess-xyz"),
             )
 
@@ -220,7 +222,8 @@ class TestBatchMode:
 
 
 class TestPayloadShape:
-    def test_includes_redacted_tool_call_history(self):
+    @pytest.mark.parametrize("shared_finalizer", [False, True])
+    def test_includes_redacted_tool_call_history(self, shared_finalizer):
         captured = _register_capturing_hook()
 
         with patch("tools.delegate_tool._run_single_child") as mock_run:
@@ -247,8 +250,15 @@ class TestPayloadShape:
                     "result": "secret output",
                 }],
             }
-            delegate_task(goal="do X", parent_agent=_make_parent())
+            if shared_finalizer:
+                from tools.delegate_tool_results import _finalize_child_results
+                _finalize_child_results(
+                    [mock_run.return_value], [{"goal": "do X"}], [], _make_parent(),
+                )
+            else:
+                delegate_task(goal="complete task X", parent_agent=_make_parent())
 
+        assert len(captured) == 1
         assert captured[0]["tool_call_history"] == [{
             "tool_name": "write_file",
             "tool_input": {
@@ -277,7 +287,7 @@ class TestPayloadShape:
                 "summary": "x", "api_calls": 1, "duration_seconds": 0.1,
                 "_child_role": "leaf",
             }
-            raw = delegate_task(goal="do X", parent_agent=_make_parent())
+            raw = delegate_task(goal="complete task X", parent_agent=_make_parent())
 
         parsed = json.loads(raw)
         assert "results" in parsed

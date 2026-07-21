@@ -372,7 +372,10 @@ def _memoized_search(provider, query: str, limit: int) -> dict:
     return slice_search_response(response_data, limit)
 
 
-async def web_extract_tool(urls: List[Any], format: str = None, char_limit: Optional[int] = None) -> str:
+async def web_extract_tool(
+    urls: List[Any], format: str = None, char_limit: Optional[int] = None,
+    task_id: Optional[str] = None,
+) -> str:
     """Extract clean page content (no LLM) from URLs via the configured backend.
 
     Pages over ``char_limit`` (default web.extract_char_limit or 15000) are head+tail truncated with a footer
@@ -419,7 +422,7 @@ async def web_extract_tool(urls: List[Any], format: str = None, char_limit: Opti
         debug_call_data["pages_extracted"] = len(results)
         debug_call_data["original_response_size"] = len(json.dumps({"results": results}))
         debug_call_data["processing_applied"].append("truncate_and_store")
-        _truncate_results(results, _effective_char_limit(char_limit), debug_call_data)
+        _truncate_results(results, _effective_char_limit(char_limit), debug_call_data, task_id=task_id)
         trimmed = _trim_results(results)
         result_json = (
             json.dumps({"results": trimmed}, indent=2, ensure_ascii=False) if trimmed
@@ -550,6 +553,7 @@ registry.register(
     handler=lambda args, **kw: web_extract_tool(
         args.get("urls", [])[:5] if isinstance(args.get("urls"), list) else [], "markdown",
         char_limit=args.get("char_limit"),
+        task_id=kw.get("task_id"),
     ),
     check_fn=check_web_api_key, requires_env=_web_requires_env(), is_async=True, emoji="📄",
     max_result_size_chars=100_000,

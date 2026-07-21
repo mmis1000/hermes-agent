@@ -300,14 +300,21 @@ def cleanup_vm(task_id: str, *, force_remove: bool = False):
     directly, so persist-mode idle envs are likewise no-op'd; only the orphan
     reaper at next startup reclaims them.
     """
-    env = _unregister_env(task_id)
-    _clear_file_ops_cache(task_id)
+    from tools.process_registry import process_registry
+    process_registry.kill_all(task_id=task_id)
+    from tools.terminal_tool import _active_environments, _env_lock
+    with _env_lock:
+        env = _active_environments.get(task_id)
     if env is None:
         return
-    _teardown_env(
-        env, task_id, force_remove=force_remove,
-        done_msg="Manually cleaned up environment for task: %s",
-    )
+    if force_remove:
+        _cleanup_env(env, force_remove=True)
+        _unregister_env(task_id)
+        _clear_file_ops_cache(task_id)
+    else:
+        _unregister_env(task_id)
+        _clear_file_ops_cache(task_id)
+        _teardown_env(env, task_id, force_remove=False)
 
 
 def _evict_environment_for_task(task_id: Optional[str]) -> None:

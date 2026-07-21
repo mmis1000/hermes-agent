@@ -516,6 +516,10 @@ def _reset_server_error(server_name: str) -> None:
 _parallel_safe_servers: set = set()
 # registry tool name -> raw server name (the generated name is lossy; never re-parse it).
 _mcp_tool_server_names: Dict[str, str] = {}
+# Exact config keys captured at registration time. Unlike the sanitized map
+# above, this map is an operator-owned qualification identity and must not
+# collapse distinct server keys such as ``safe-server`` and ``safe_server``.
+_mcp_tool_server_qualifications: Dict[str, str] = {}
 
 # Dedicated event loop in a background daemon thread; _lock guards the loop handles, _servers,
 # the status maps and the PID ledgers.
@@ -694,3 +698,20 @@ _MCP_DISCOVERY_LOCK_RETRY_DELAY_S = 0.5
 # Waiter budget (max_retries * delay) must outlast the pass ceiling: 320 s > 300 s.
 _MCP_DISCOVERY_LOCK_MAX_RETRIES = int(
     _MCP_DISCOVERY_PASS_MAX_SEC / _MCP_DISCOVERY_LOCK_RETRY_DELAY_S) + 20
+
+
+def get_mcp_tool_server_qualification(tool_name: str) -> Optional[str]:
+    """Return atomically published operator provenance for an MCP tool."""
+
+    from tools.registry import registry
+
+    entry = registry.get_entry(tool_name)
+    if entry is None or not entry.toolset.startswith("mcp-"):
+        return None
+    provenance = entry.operator_provenance
+    return provenance if isinstance(provenance, str) else None
+
+from tools.mcp_tool_agent import refresh_agent_mcp_tools
+
+from tools.mcp_tool_discovery import _discover_and_register_server, is_mcp_tool_parallel_safe
+from tools.mcp_tool_registration import _register_server_tools, _forget_mcp_tool_server

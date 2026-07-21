@@ -56,6 +56,10 @@ def _bound_json_error_result(result: str) -> str:
     return json.dumps(payload, ensure_ascii=False)
 
 
+class ToolProvenanceCollisionError(ValueError):
+    """Raised when two operator identities claim one sanitized MCP tool name."""
+
+
 def _is_registry_register_call(node: ast.AST) -> bool:
     """True when *node* is a ``registry.register(...)`` call expression."""
     if not isinstance(node, ast.Expr) or not isinstance(node.value, ast.Call):
@@ -194,6 +198,7 @@ class ToolEntry:
     max_result_size_chars: int | float | None = None
     # Zero-arg callable whose dict is shallow-merged onto the schema at every get_definitions()
     # — for fields tracking runtime config (delegate_task's description reflects limits).
+    operator_provenance: Optional[str] = None
     dynamic_schema_overrides: Optional[Callable] = None
 
 
@@ -668,7 +673,7 @@ class ToolRegistry:
         check_fn: Callable = None, requires_env: list = None, is_async: bool = False,
         description: str = "", emoji: str = "", max_result_size_chars: int | float | None = None,
         dynamic_schema_overrides: Callable = None, override: bool = False,
-        scope: Optional[str] = None):
+        scope: Optional[str] = None, operator_provenance: Optional[str] = None):
         """Register a tool (called at import time by each tool file). ``override=True`` is an
         explicit opt-in for plugins replacing a built-in implementation (e.g. a headed-Chrome
         browser backend); without it, cross-toolset shadowing is rejected."""
@@ -692,6 +697,8 @@ class ToolRegistry:
         with self._lock:
             target = self._slot(scope, create=True)
             existing = self._lookup(name, scope)
+            if (existing and existing.toolset.startswith("mcp-") and toolset.startswith("mcp-") and existing.operator_provenance != operator_provenance and not (existing.operator_provenance is None and existing.toolset == toolset)):
+                raise ToolProvenanceCollisionError(f"MCP tool {name!r} already belongs to operator server {existing.operator_provenance!r}; refusing ambiguous owner {operator_provenance!r}")
             plugin_override_denied = (
                 owner is not None and not self._plugin_override_allowed(scope, owner))
             shadows_global = (
@@ -733,7 +740,7 @@ class ToolRegistry:
                 requires_env=requires_env or [], is_async=is_async,
                 description=description or schema.get("description", ""), emoji=emoji,
                 max_result_size_chars=max_result_size_chars,
-                dynamic_schema_overrides=dynamic_schema_overrides)
+                dynamic_schema_overrides=dynamic_schema_overrides, operator_provenance=operator_provenance)
             # Availability is derived per-tool (_toolset_has_exposable_tools), so this map no
             # longer gates a toolset; it still feeds get_toolset_requirements ->
             # TOOLSET_REQUIREMENTS["check_fn"], which banner.py reads (presence only,

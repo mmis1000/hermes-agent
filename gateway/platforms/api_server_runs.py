@@ -502,6 +502,9 @@ class _RunLaunch:
     browser_control_transport_family: Any
     turn_author: Optional[Dict[str, Any]] = None  # memory-attribution label only; grants nothing
 
+    protected_execution: Any = None
+    protected_attempt_id: Optional[str] = None
+
     @property
     def approval_session_key(self) -> str:
         # Isolated per run: session ids are conversation scopes, not authorization namespaces.
@@ -686,6 +689,15 @@ async def _handle_runs(self, request: "web.Request", *, _api_server) -> "web.Res
     limited = self._concurrency_limited_response()
     if limited is not None:
         return limited
+    protected_execution = None
+    if "execution" in body:
+        try:
+            from agent.agent_init import _admit_standard_delegation_policy
+            from tools.delegation_scope import admit_trusted_run_execution
+            from tools.terminal_tool import _get_env_config
+            protected_execution = admit_trusted_run_execution(_admit_standard_delegation_policy(None), body["execution"], inherited_network=_get_env_config().get("docker_network", True))
+        except (TypeError, ValueError) as exc:
+            return _json_error(_openai_error, str(exc), code="invalid_execution", status=400)
     run_id = f"run_{uuid.uuid4().hex}"
     self._run_owners[run_id] = self._run_idempotency_scope(request)
     # Same precedence as /v1/responses: body session_id > response chain > X-Hermes-Session-Key
@@ -739,6 +751,8 @@ async def _handle_runs(self, request: "web.Request", *, _api_server) -> "web.Res
         browser_control_principal=_api_server._api_request_browser_control_principal.get(),
         browser_control_transport_family=_api_server._api_request_browser_control_transport_family.get(),
         turn_author=turn_author)
+    run = launch
+    run.protected_execution = protected_execution
     self._activate_admitted_request()
     # A canonical Bot Chat that a Desktop holds live is that Desktop's to run: executing here would
     # be a second writer beside its lease (#114959). The owner's mailbox takes the turn and its
@@ -829,10 +843,15 @@ def _run_agent_sync(self, run: _RunLaunch, agent, approval_notify, *, _api_serve
             author_kwargs = {"turn_author": run.turn_author} if run.turn_author is not None else {}
             r = agent.run_conversation(
                 user_message=run.user_message, conversation_history=run.conversation_history,
-                task_id=effective_task_id, **author_kwargs)
+                task_id=getattr(run, "protected_attempt_id", None) or effective_task_id, **author_kwargs)
         finally:
             # Clear ownership now so a later stop can't reap work this run left running.
             _api_server._clear_turn_process_ownership(agent)
+            if run.protected_attempt_id:
+                from tools.delegation_scope import attempt_scope_registry
+                errors = attempt_scope_registry.cleanup(run.protected_attempt_id)
+                if errors:
+                    raise RuntimeError("protected root cleanup failed: " + "; ".join(str(e) for e in errors))
             self._memory_sessions.checkin(agent)
             # Declared-conversation binding, same precedence gate as _run_agent.
             if run.declared_selected:
@@ -957,10 +976,25 @@ async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
         if run_id in self._stopping_run_ids:
             _finish("cancelled")
             return
+        protected = getattr(run, "protected_execution", None)
+        if protected is not None:
+            from tools.delegation_scope import attempt_scope_registry, configure_protected_attempt_environment
+            authority = attempt_scope_registry.reserve(protected.invocation_scope, run_id, attempt_id=f"runs_root_{run_id}", backing_registry=protected.backing_registry)
+            run.protected_attempt_id = authority.attempt_id
+            attempt_scope_registry.prepare_idmapped_reveals(authority.attempt_id)
+            configure_protected_attempt_environment(authority.attempt_id)
+            attempt_scope_registry.activate(authority.attempt_id, run_id=run_id)
+            run.agent_kwargs["delegation_policy"] = protected.policy
         with self._profile_scope(run.request_profile):
             agent = self._create_agent(
                 stream_delta_callback=_text_cb, tool_progress_callback=self._make_run_event_callback(run_id, loop),
                 interim_assistant_callback=_interim_cb, **run.agent_kwargs)
+        if protected is not None:
+            from tools.delegate_tool import configure_protected_agent_tools
+            agent.skill_scope_task_id = run.protected_attempt_id
+            agent.delegation_backing_registry = protected.backing_registry
+            agent.resolved_invocation_scope = protected.invocation_scope
+            configure_protected_agent_tools(agent, protected.invocation_scope.profile)
         self._active_run_agents[run_id] = agent
         approval_notify = _make_approval_notify(self, run, _api_server=_api_server)
         result, usage, served_runtime = await _submit_api_worker(

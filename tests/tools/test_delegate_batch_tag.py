@@ -14,6 +14,9 @@ import tools.delegate_tool_progress as dt_progress
 from tools.delegate_tool import _build_child_progress_callback, format_batch_tag
 
 
+pytestmark = pytest.mark.usefixtures("admitted_delegate_route")
+
+
 @pytest.fixture(autouse=True)
 def _fresh_ordinals(monkeypatch):
     # The ordinal table is bound in delegate_tool_progress (format_batch_tag's home).

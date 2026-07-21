@@ -175,7 +175,8 @@ def _fetch_models_from_api(access_token: str, base_url: Optional[str] = None) ->
         logger.debug("Failed to fetch Codex models from API: %s", exc)
         return []
 
-    return _finalize_codex_models(_ranked_slugs(entries))
+    live = _ranked_slugs(entries)
+    return _catalog_result(_finalize_codex_models(live), live=True, verified_models=_add_context_variants(live))
 
 
 def _read_default_model(codex_home: Path) -> Optional[str]:
@@ -214,8 +215,19 @@ def get_codex_model_ids(access_token: Optional[str] = None, base_url: Optional[s
     if access_token:
         api_models = _fetch_models_from_api(access_token, base_url=base_url)
         if api_models:
-            return _finalize_codex_models(api_models)
+            return _catalog_result(_finalize_codex_models(api_models), live=True,
+                                   verified_models=getattr(api_models, "verified_models", api_models))
     default_model = _read_default_model(codex_home)
-    return _finalize_codex_models(_drop_undiscovered_astra(_dedupe([
+    return _catalog_result(_finalize_codex_models(_drop_undiscovered_astra(_dedupe([
         *([default_model] if default_model else []), *_read_cache_models(codex_home),
-        *DEFAULT_CODEX_MODELS])))
+        *DEFAULT_CODEX_MODELS]))), live=False)
+
+
+def _catalog_result(models: List[str], *, live: bool, verified_models=None) -> List[str]:
+    """Keep the list API while preserving whether IDs came from live discovery."""
+    try:
+        from hermes_cli.models import ProviderModelCatalog
+
+        return ProviderModelCatalog(models, verified_models=(models if verified_models is None else verified_models) if live else ())
+    except Exception:
+        return models

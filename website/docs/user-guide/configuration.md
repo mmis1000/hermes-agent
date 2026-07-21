@@ -167,6 +167,48 @@ You can also set `providers.<id>.stale_timeout_seconds` for the non-streaming st
 
 Leaving these unset keeps the legacy defaults (`HERMES_API_TIMEOUT=1800`s, `HERMES_API_CALL_STALE_TIMEOUT=90`s, native Anthropic 900s). The non-streaming stale detector is auto-disabled for local endpoints when left implicit and can scale upward for very large contexts. Not currently wired for AWS Bedrock (both `bedrock_converse` and AnthropicBedrock SDK paths use boto3 with its own timeout configuration). See the commented example in [`cli-config.yaml.example`](https://github.com/NousResearch/hermes-agent/blob/main/cli-config.yaml.example).
 
+## Long-running Gateway Turns
+
+A gateway turn normally receives `agent.max_turns` model/tool iterations (default
+`90`). If useful work reaches that limit without failing or being interrupted,
+Hermes runs a bounded, tool-free continuation review. The review either approves
+another pass or asks the user; malformed or failed reviews conservatively ask the
+user. Real queued user messages always run before a synthetic continuation.
+
+```yaml
+agent:
+  max_turns: 90
+  max_iteration_auto_continue_chain: 8
+```
+
+`max_iteration_auto_continue_chain` limits the number of additional reviewed
+passes after the original pass. Each pass is reviewed independently; the setting
+does not blindly multiply the iteration budget. Set it to `0` to disable automatic
+continuation. The original user goal is carried forward verbatim and synthetic
+continuation messages are marked so they cannot replace that goal.
+
+This behavior applies to gateway sessions. A direct CLI invocation still ends when
+its own iteration budget is exhausted.
+
+## Linux Child-process OOM Priority
+
+On Linux, Hermes gives supported tool, terminal/background-process, and browser
+children a default `oom_score_adj` of `300`. A positive score makes disposable
+child workloads more likely to be killed before the long-lived Hermes parent when
+the kernel is under memory pressure. The adjustment is inherited by daemon
+grandchildren and is a no-op on unsupported platforms or when `/proc` disallows
+the write.
+
+Set the environment variable on the Hermes CLI or gateway process to override it:
+
+```bash
+HERMES_CHILD_OOM_SCORE_ADJ=500 hermes chat   # valid range: 1..1000
+HERMES_CHILD_OOM_SCORE_ADJ=0 hermes chat     # disable the adjustment
+```
+
+For a gateway service, put the variable in the service environment and restart the
+gateway. This is a process environment setting, not a `config.yaml` key.
+
 ## Update Behavior
 
 ### Background checks

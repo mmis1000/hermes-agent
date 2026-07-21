@@ -1434,3 +1434,9 @@ def real_bash() -> str:
             if candidate.exists():
                 return str(candidate)
     return found or "bash"
+
+
+@pytest.fixture
+def admitted_delegate_route(monkeypatch):
+    """For dispatch tests that are not about route admission: accept the delegation route as verified."""
+    monkeypatch.setattr("tools.delegate_tool._admit_delegation_route", lambda *_args: None)

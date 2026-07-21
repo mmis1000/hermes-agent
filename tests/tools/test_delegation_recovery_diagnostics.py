@@ -35,13 +35,14 @@ def child(**kw):
 def build(**kw):
     c = MagicMock()
     c._delegate_role = "leaf"
-    c._subagent_id = "diagnostic-child"
+    c._subagent_id = f"diagnostic-child-{kw['task_index']}"  # logical ids are unique per child
     return c
 creds = dict(model="m", provider=None, base_url=None, api_key=None,
              api_mode=None, command=None, args=None)
 dt._build_child_agent = build
 dt._run_single_child = child
 dt._resolve_delegation_credentials = lambda *a, **k: creds
+dt._admit_delegation_route = lambda *a: None
 if os.environ['REPRO_MISSING'] == '1':
     import tools.delegation_live_log as live
     original = live.create_live_transcripts

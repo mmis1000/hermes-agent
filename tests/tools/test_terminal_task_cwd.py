@@ -2,6 +2,7 @@
 
 import json
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import tools.terminal_tool as terminal_tool
 
@@ -42,6 +43,36 @@ def test_foreground_command_uses_registered_task_cwd_for_existing_environment(mo
     assert result["exit_code"] == 0
     assert len(calls) == 1 and calls[0][0] == "pwd"
     assert calls[0][1] | {"timeout": 60, "cwd": "/workspace/acp", "bounded_capture": True} == calls[0][1]
+
+
+def test_terminal_uses_central_task_environment_acquisition(monkeypatch):
+    """An ordinary task asks for a protected environment first, then uses its ordinary one."""
+    class FakeEnv:
+        env = {}
+        cwd = "/default"
+
+        def execute(self, _command, **_kwargs):
+            return {"output": "ok", "returncode": 0}
+
+    env = FakeEnv()
+    asked = MagicMock(return_value=None)
+    monkeypatch.setattr(terminal_tool, "acquire_protected_environment", asked)
+    monkeypatch.setattr(terminal_tool, "_active_environments", {"default": env})
+    monkeypatch.setattr(terminal_tool, "_last_activity", {})
+    monkeypatch.setattr(terminal_tool, "_session_cwd", {})
+    monkeypatch.setattr(terminal_tool, "_get_env_config", lambda: _minimal_terminal_config())
+    monkeypatch.setattr(
+        terminal_tool,
+        "_check_all_guards",
+        lambda command, env_type, **kwargs: {"approved": True},
+    )
+
+    result = json.loads(
+        terminal_tool.terminal_tool(command="pwd", task_id="ordinary-child")
+    )
+
+    assert result["exit_code"] == 0
+    asked.assert_called_once_with("ordinary-child", timeout=60)
 
 
 def test_explicit_workdir_still_wins_over_registered_task_cwd(monkeypatch):

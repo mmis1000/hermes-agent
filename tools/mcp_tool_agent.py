@@ -120,6 +120,46 @@ def refresh_agent_mcp_tools(
     new_names = {_def_name(t) for t in new_defs}
     # Post-build families re-appended on LOCALS only; live attributes untouched until publish.
     staged_engine_names = _reinject_post_build_tools(agent, new_defs, new_names)
+    from tools.mcp_tool import get_mcp_tool_server_qualification
+    from tools.registry import registry
+    # Protected children carry an admission-time positive snapshot. Registry
+    # generations, MCP reconnects, plugins, and post-build injectors may narrow
+    # that surface but may never add names that were not classified and pinned
+    # at admission.
+    protected_snapshot = getattr(agent, "_protected_tool_snapshot", None)
+    if protected_snapshot is not None:
+        allowed_names = set(protected_snapshot)
+        allowed_names.update(getattr(agent, "_protected_bridge_tool_snapshot", frozenset()))
+        qualified_servers = getattr(
+            agent, "_protected_qualified_mcp_servers", frozenset()
+        )
+        expected_mcp_provenance = getattr(
+            agent, "_protected_mcp_tool_provenance", {}
+        )
+
+        def _qualified(item: dict) -> bool:
+            name = item.get("function", {}).get("name")
+            if name not in allowed_names:
+                return False
+            server = get_mcp_tool_server_qualification(name)
+            expected_server = expected_mcp_provenance.get(name)
+            if expected_server is not None:
+                return server == expected_server and server in qualified_servers
+            toolset = registry.get_toolset_for_tool(name) if isinstance(name, str) else None
+            is_mcp = server is not None or bool(
+                isinstance(toolset, str) and toolset.startswith("mcp-")
+            )
+            return not is_mcp or server in qualified_servers
+
+        new_defs = [
+            item for item in new_defs if _qualified(item)
+        ]
+        new_names = {
+            item["function"]["name"] for item in new_defs
+        }
+        staged_engine_names.intersection_update(allowed_names)
+
+
     _reinject_authorized_dynamic_tools(agent, new_defs, new_names)
     # Registry membership is read OUTSIDE ``_agent_tools_lock``: taking ``registry._lock``
     # under the tools lock would be the first nesting of the two.

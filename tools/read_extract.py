@@ -20,6 +20,7 @@ import tempfile
 import threading
 import time
 import zipfile
+from io import BytesIO
 from pathlib import Path
 from typing import Any, Callable, Iterator, Optional
 from xml.etree import ElementTree as ET
@@ -417,6 +418,10 @@ def _extract_notebook(path: str, *, display_path: Optional[str] = None) -> str:
             nb = json.load(fh)
     except (OSError, ValueError, json.JSONDecodeError) as exc:
         raise ExtractionError(f"Not a valid notebook: {exc}") from exc
+    return _render_notebook(nb, display_path=display_path or path)
+
+
+def _render_notebook(nb, *, display_path="notebook") -> str:
     if not isinstance(nb, dict):
         raise ExtractionError("Notebook root is not an object")
     raw_cells = nb.get("cells")
@@ -431,7 +436,7 @@ def _extract_notebook(path: str, *, display_path: Optional[str] = None) -> str:
         raise ExtractionError("Notebook contains no cells")
     # Backend bytes are parsed through a disposable host copy; recovery commands
     # must instead name the original notebook in the user's filesystem.
-    nb_name = display_path if display_path is not None else path
+    nb_name = display_path
     counts = dict.fromkeys(_CELL_LABELS, 0)
     out: list[str] = []
     for jq_pointer, cell in cells:

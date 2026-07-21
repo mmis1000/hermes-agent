@@ -88,6 +88,24 @@ def test_tool_call_chunk_renders_default_chrome():
     assert "ls -la" in lines[0]
 
 
+def test_delegation_tool_chrome_shows_action_and_message():
+    from agent.display import build_tool_preview
+
+    lines = []
+    d = GatewayEventDispatcher(
+        _base_adapter(), _FakeSink(),
+        enqueue_tool_line=lines.append, tool_mode="all", preview_max_len=80,
+    )
+    args = {"action": "steer", "message": "Focus on lifecycle tests"}
+    d.dispatch(ToolCallChunk(
+        tool_name="delegate_task",
+        preview=build_tool_preview("delegate_task", args),
+        args=args,
+    ))
+    assert len(lines) == 1
+    assert 'delegate_task: "steer: Focus on lifecycle tests"' in lines[0]
+
+
 def test_new_mode_dedups_same_tool():
     lines = []
     d = GatewayEventDispatcher(

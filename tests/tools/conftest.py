@@ -163,3 +163,54 @@ def disable_lazy_stt_install():
     """
     with patch("tools.transcription_tools._try_lazy_install_stt", return_value=False):
         yield
+
+
+# New delegate_task admission is intentionally strict: launch-path fixtures
+# must state which exact route/account catalog is verified.  Keep that test
+# authority local to tests/tools instead of weakening production admission or
+# allowing an exploratory child run.  The admission regression tests override
+# these patches with their own cache/live outcomes.
+_VERIFIED_PROVIDER_MODELS = {
+    "openrouter": {
+        "anthropic/claude-sonnet-4",
+        "anthropic/claude-opus-4",
+        "anthropic/claude-opus-4.8",
+        "google/gemini-2.5-flash",
+        "google/gemini-3-flash-preview",
+        "gpt-4o-mini",
+    },
+    "openai-codex": {"gpt-5.6-luna"},
+    "nous": {"hermes-4-405b", "anthropic/claude-opus-4.8"},
+    "minimax": {"minimax/m2"},
+    "test": {"test-model"},
+    "test-provider": {"test-model"},
+    "mock-provider": {"m"},
+    "provider-safe": {"model-safe"},
+}
+
+
+def _verified_provider_catalog(provider, *args, **kwargs):
+    return list(_VERIFIED_PROVIDER_MODELS.get(str(provider or "").strip().lower(), ()))
+
+
+def _verified_custom_catalog(api_key=None, base_url=None, *args, **kwargs):
+    return [
+        "qwen2.5-coder",
+        "claude-opus-4-6",
+        "deepseek-v4-pro-CEER",
+        "model-safe",
+    ]
+
+
+@pytest.fixture(autouse=True)
+def _verified_delegate_route(monkeypatch):
+    """Give launch-path delegation fixtures an explicit verified mock route."""
+    monkeypatch.setattr(
+        "hermes_cli.models.cached_provider_model_ids",
+        _verified_provider_catalog,
+    )
+    monkeypatch.setattr(
+        "hermes_cli.models.cached_fetch_api_models",
+        _verified_custom_catalog,
+    )
+    yield
