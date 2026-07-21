@@ -879,6 +879,12 @@ def _build_replay_entry(
             elif not _rval:
                 continue
             entry[_rkey] = _rval
+    elif role == "user" and msg.get("_iteration_control_synthetic"):
+        # Keep the source marker attached to synthetic iteration-control turns.
+        # Task-intent and continuation reviewers use it to avoid treating this
+        # runtime instruction as a fresh real-user goal.
+        entry["_iteration_control_synthetic"] = True
+        entry["task_intent_source"] = "iteration_control"
     if preserve_timestamp:
         ts = msg.get("timestamp")
         if ts:
@@ -19088,6 +19094,93 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             "response_previewed": _stream_consumer is not None and bool(full_response),
         }
 
+    def _judge_iteration_budget_exhaustion(
+        self,
+        *,
+        result: Dict[str, Any],
+        raw_goal: str,
+        model: str,
+        main_runtime: Dict[str, Any],
+    ):
+        """Run the small, toolless max-iteration continuation reviewer."""
+
+        from agent.auxiliary_client import call_llm
+        from gateway.iteration_continuation import judge_iteration_exhaustion
+
+        return judge_iteration_exhaustion(
+            result=result,
+            raw_goal=raw_goal,
+            llm_call=call_llm,
+            model=model,
+            main_runtime=main_runtime,
+        )
+
+    async def _request_iteration_continuation_confirmation(
+        self,
+        *,
+        source: SessionSource,
+        session_key: str,
+        reason: str,
+        event_message_id: Optional[str] = None,
+    ) -> bool:
+        """Ask whether an exhausted task should receive another iteration pass."""
+
+        import uuid
+
+        from tools import clarify_gateway as clarify
+
+        adapter = self._adapter_for_source(source)
+        if adapter is None:
+            return False
+
+        clarify_id = uuid.uuid4().hex[:10]
+        question = (
+            "The agent reached its per-turn iteration limit and the safety "
+            "review could not approve automatic continuation. Continue the "
+            f"same task?\n\nReview: {reason}"
+        )
+        choices = ["Continue", "Stop"]
+        clarify.register(
+            clarify_id=clarify_id,
+            session_key=session_key or "",
+            question=question,
+            choices=choices,
+        )
+        try:
+            pause_typing = getattr(adapter, "pause_typing_for_chat", None)
+            if callable(pause_typing):
+                pause_typing(source.chat_id)
+            metadata = self._thread_metadata_for_source(source, event_message_id)
+            send_result = await adapter.send_clarify(
+                chat_id=source.chat_id,
+                question=question,
+                choices=choices,
+                clarify_id=clarify_id,
+                session_key=session_key or "",
+                metadata=metadata,
+            )
+            if not getattr(send_result, "success", False):
+                clarify.clear_session(session_key or "")
+                return False
+            timeout = float(clarify.get_clarify_timeout())
+            response = await self._run_in_executor_with_context(
+                clarify.wait_for_response,
+                clarify_id,
+                timeout,
+            )
+        except asyncio.CancelledError:
+            clarify.clear_session(session_key or "")
+            raise
+        except Exception:
+            clarify.clear_session(session_key or "")
+            logger.warning(
+                "Iteration continuation confirmation failed for session %s",
+                session_key or "?",
+                exc_info=True,
+            )
+            return False
+        return str(response or "").strip().casefold() == "continue"
+
     # ------------------------------------------------------------------
 
     async def _run_agent(
@@ -19106,6 +19199,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
         task_intent_metadata: Optional[Dict[str, Any]] = None,
+        persist_user_metadata: Optional[Dict[str, Any]] = None,
+        _continuation_depth: int = 0,
+        _raw_task_goal: Optional[str] = None,
+        _notify_started_at: Optional[float] = None,
     ) -> Dict[str, Any]:
         """Profile-scoping wrapper around the agent run.
 
@@ -19125,6 +19222,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
                 task_intent_metadata=task_intent_metadata,
+                persist_user_metadata=persist_user_metadata,
+                _continuation_depth=_continuation_depth,
+                _raw_task_goal=_raw_task_goal,
+                _notify_started_at=_notify_started_at,
             )
 
         profile_home = self._resolve_profile_home_for_source(source)
@@ -19137,6 +19238,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
                 task_intent_metadata=task_intent_metadata,
+                persist_user_metadata=persist_user_metadata,
+                _continuation_depth=_continuation_depth,
+                _raw_task_goal=_raw_task_goal,
+                _notify_started_at=_notify_started_at,
             )
 
     def _profile_name_for_source(self, source: SessionSource) -> Optional[str]:
@@ -19259,6 +19364,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
         task_intent_metadata: Optional[Dict[str, Any]] = None,
+        persist_user_metadata: Optional[Dict[str, Any]] = None,
+        _continuation_depth: int = 0,
+        _raw_task_goal: Optional[str] = None,
+        _notify_started_at: Optional[float] = None,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -19272,6 +19381,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         This is run in a thread pool to not block the event loop.
         Supports interruption via new messages.
         """
+        raw_task_goal = (
+            _raw_task_goal
+            if isinstance(_raw_task_goal, str)
+            else str(message or "")
+        )
         # ---- Proxy mode: delegate to remote API server ----
         if self._get_proxy_url():
             return await self._run_agent_via_proxy(
@@ -21087,6 +21201,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # message so stale guidance never replays as user-authored text.
             _persist_user_message_override: Optional[Any] = persist_user_message
             _persist_user_timestamp_override: Optional[float] = persist_user_timestamp
+            _persist_user_metadata_override: Optional[Dict[str, Any]] = persist_user_metadata
 
             # Prepend pending model switch note so the model knows about the switch
             _pending_notes = getattr(self, '_pending_model_notes', {})
@@ -21276,6 +21391,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _conversation_kwargs["moa_config"] = moa_config
                 if _persist_user_timestamp_override is not None:
                     _conversation_kwargs["persist_user_timestamp"] = _persist_user_timestamp_override
+                if _persist_user_metadata_override is not None:
+                    _conversation_kwargs["persist_user_metadata"] = _persist_user_metadata_override
                 agent._pending_task_intent_metadata = (
                     dict(task_intent_metadata)
                     if isinstance(task_intent_metadata, dict)
@@ -21711,7 +21828,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         )
         if _long_running_mode == "off":
             _NOTIFY_INTERVAL = None
-        _notify_start = time.time()
+        _notify_start = (
+            _notify_started_at
+            if isinstance(_notify_started_at, (int, float))
+            else time.time()
+        )
 
         async def _notify_long_running():
             if _NOTIFY_INTERVAL is None:
@@ -22351,6 +22472,111 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     channel_prompt=next_channel_prompt,
                 )
                 return _preserve_queued_followup_history_offset(result, followup_result)
+
+            # A real queued follow-up always wins over a synthetic continuation.
+            # Only review a clean iteration-budget stop after the pending-message
+            # drain above has found nothing to process.
+            _turn_exit_reason = str((result or {}).get("turn_exit_reason") or "")
+            try:
+                from gateway.iteration_continuation import (
+                    DEFAULT_MAX_CONTINUATION_CHAIN,
+                    IterationContinuationVerdict,
+                    build_iteration_continuation,
+                )
+
+                _chain_limit = int(
+                    agent_cfg_local.get(
+                        "max_iteration_auto_continue_chain",
+                        DEFAULT_MAX_CONTINUATION_CHAIN,
+                    )
+                )
+            except (TypeError, ValueError):
+                _chain_limit = DEFAULT_MAX_CONTINUATION_CHAIN
+            _chain_limit = max(0, _chain_limit)
+
+            if (
+                result
+                and _turn_exit_reason.startswith("max_iterations_reached(")
+                and not result.get("failed")
+                and not result.get("interrupted")
+                and not self._draining
+                and _continuation_depth < _chain_limit
+            ):
+                _agent_for_review = agent_holder[0]
+                _review_model = str(
+                    getattr(_agent_for_review, "model", None)
+                    or (response or {}).get("model")
+                    or ""
+                )
+                _review_runtime = {
+                    "model": getattr(_agent_for_review, "model", None),
+                    "provider": getattr(_agent_for_review, "provider", None),
+                    "base_url": getattr(_agent_for_review, "base_url", None),
+                    "api_key": getattr(_agent_for_review, "api_key", None),
+                    "api_mode": getattr(_agent_for_review, "api_mode", None),
+                }
+                try:
+                    verdict = await self._run_in_executor_with_context(
+                        lambda: self._judge_iteration_budget_exhaustion(
+                            result=result,
+                            raw_goal=raw_task_goal,
+                            model=_review_model,
+                            main_runtime=_review_runtime,
+                        )
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Iteration continuation review failed for session %s: %s",
+                        session_key or "?",
+                        exc,
+                    )
+                    verdict = IterationContinuationVerdict(
+                        "ask_user",
+                        f"continuation review failed: {type(exc).__name__}",
+                    )
+
+                user_approved = False
+                if getattr(verdict, "decision", None) == "ask_user":
+                    user_approved = await self._request_iteration_continuation_confirmation(
+                        source=source,
+                        session_key=session_key or "",
+                        reason=str(getattr(verdict, "reason", "review was inconclusive")),
+                        event_message_id=event_message_id,
+                    )
+                should_continue = (
+                    getattr(verdict, "decision", None) == "auto_continue"
+                    or user_approved
+                )
+                if should_continue:
+                    continuation = build_iteration_continuation(
+                        raw_goal=raw_task_goal,
+                        user_approved=user_approved,
+                    )
+                    updated_history = result.get("messages", history)
+                    await self._refresh_agent_cache_message_count(
+                        session_key,
+                        result.get("session_id") or session_id,
+                    )
+                    continuation_result = await self._run_agent(
+                        message=continuation.prompt,
+                        context_prompt=context_prompt,
+                        history=updated_history,
+                        source=source,
+                        session_id=result.get("session_id") or session_id,
+                        session_key=session_key,
+                        run_generation=run_generation,
+                        _interrupt_depth=_interrupt_depth,
+                        event_message_id=None,
+                        channel_prompt=channel_prompt,
+                        persist_user_metadata=continuation.persist_metadata,
+                        _continuation_depth=_continuation_depth + 1,
+                        _raw_task_goal=continuation.raw_goal,
+                        _notify_started_at=_notify_start,
+                    )
+                    return _preserve_queued_followup_history_offset(
+                        response,
+                        continuation_result,
+                    )
         finally:
             # Stop progress sender, interrupt monitor, and notification task
             if progress_task:
