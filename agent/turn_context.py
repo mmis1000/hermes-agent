@@ -648,6 +648,12 @@ def build_turn_context(
     # event time. Preserve either value and cover any legacy unstamped handoff.
     stamp_message_timestamp(user_msg, timestamp=persist_user_timestamp)
 
+    task_intent_metadata = getattr(agent, "_pending_task_intent_metadata", None)
+    if isinstance(task_intent_metadata, dict) and task_intent_metadata:
+        # Internal provenance sidecar: persisted with the clean user row and
+        # stripped by transport sanitizers before any provider request.
+        user_msg["_task_intent"] = dict(task_intent_metadata)
+
     # Hydrate todo store from conversation history.
     if conversation_history and not agent._todo_store.has_items():
         agent._hydrate_todo_store(conversation_history)
