@@ -84,6 +84,10 @@ _ACTIVE_STATES = {"running", "finalizing", "interrupt_requested"}
 _TERMINAL_DELIVERY_STATES = {"delivered", "consumed", "suppressed"}
 _NONTERMINAL_DELIVERY_STATES = {"pending", "held_by_wait", "delivering"}
 _WAIT_POLL_SECONDS = 0.05
+# Public lifecycle waits are capped at 300 seconds. Keep the durable hold lease
+# longer than that bound so a live waiter cannot be pre-empted, while a process
+# that dies mid-wait cannot strand the result forever.
+_WAIT_HOLD_STALE_SECONDS = 360.0
 
 
 def _notify_state_change() -> None:
@@ -349,6 +353,7 @@ def restore_undelivered_completions(target_queue) -> int:
     results seconds after boot (#64484).
     """
     recover_abandoned_delegations()
+    recover_stale_wait_holds()
     with _DB_LOCK, _connect() as conn:
         rows = conn.execute(
             """SELECT delegation_id, event_json FROM async_delegations
@@ -504,6 +509,29 @@ def claim_completion_delivery(delegation_id: str, claim_id: str) -> bool:
     return changed
 
 
+def recover_stale_wait_holds(delegation_id: Optional[str] = None) -> int:
+    """Release wait holds whose owning process can no longer be trusted alive."""
+    now = time.time()
+    cutoff = now - _WAIT_HOLD_STALE_SECONDS
+    where_id = " AND delegation_id=?" if delegation_id else ""
+    params: tuple[Any, ...] = (
+        (now, cutoff, delegation_id) if delegation_id else (now, cutoff)
+    )
+    with _DB_LOCK, _connect() as conn:
+        cur = conn.execute(
+            """UPDATE async_delegations SET delivery_state='pending',
+                      delivery_claim=NULL, delivery_claimed_at=NULL, updated_at=?
+               WHERE delivery_state='held_by_wait'
+                 AND (delivery_claimed_at IS NULL OR delivery_claimed_at < ?)"""
+            + where_id,
+            params,
+        )
+        changed = cur.rowcount
+    if changed:
+        _notify_state_change()
+    return changed
+
+
 def claim_event_delivery(evt: Dict[str, Any], consumer: str) -> Optional[str]:
     """Claim a durable delegation event; non-durable events need no token."""
     if evt.get("type") != "async_delegation":
@@ -528,6 +556,7 @@ def claim_async_delivery(delegation_id: str, *, managed: bool = False) -> Dict[s
     and processes; a wait hold, consumption, suppression, or prior delivery
     can never be bypassed by an in-memory queue copy.
     """
+    recover_stale_wait_holds(delegation_id)
     with _DB_LOCK, _connect() as conn:
         row = conn.execute(
             """SELECT state, delivery_state, event_json FROM async_delegations
@@ -705,6 +734,7 @@ def wait_for_delegation(
     claim_id = f"wait:{__import__('os').getpid()}:{uuid.uuid4().hex}"
     owns_hold = False
 
+    recover_stale_wait_holds(delegation_id)
     while True:
         snapshot = get_async_delegation(delegation_id, session_key=session_key)
         if snapshot is None:
