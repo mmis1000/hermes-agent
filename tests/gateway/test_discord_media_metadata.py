@@ -1,4 +1,5 @@
 import inspect
+import sys
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -186,8 +187,12 @@ async def test_send_remote_image_routes_to_thread(tmp_path):
         headers={"content-type": "image/png"},
         read=AsyncMock(return_value=b"png"),
     )
+    fake_aiohttp = SimpleNamespace(
+        ClientSession=MagicMock(return_value=_aiohttp_session(response)),
+        ClientTimeout=lambda **kwargs: kwargs,
+    )
     with patch("plugins.platforms.discord.adapter.is_safe_url", return_value=True), \
-         patch("aiohttp.ClientSession", return_value=_aiohttp_session(response)):
+         patch.dict(sys.modules, {"aiohttp": fake_aiohttp}):
         result = await adapter.send_image(
             chat_id="9001",
             image_url="https://images.example.test/plan.png",
