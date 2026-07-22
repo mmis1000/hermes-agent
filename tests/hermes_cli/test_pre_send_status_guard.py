@@ -269,3 +269,36 @@ def test_status_guard_fails_open_on_judge_error():
     assert decision is not None
     assert decision.allowed is True
     assert decision.fallback_reason == "status guard failed open"
+
+
+def test_redaction_failure_never_exposes_raw_payload(monkeypatch):
+    import builtins
+    import json
+    from types import SimpleNamespace
+
+    from hermes_cli.pre_send_status_guard import (
+        active_task_payload_from_goal,
+        build_status_guard_payload,
+    )
+
+    secret = "PRIVATE_SENTINEL_DO_NOT_SEND"
+    original_import = builtins.__import__
+
+    def blocked_redact_import(name, *args, **kwargs):
+        if name == "agent.redact":
+            raise ImportError("redaction unavailable")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", blocked_redact_import)
+    active_task = active_task_payload_from_goal(
+        SimpleNamespace(status="active", task_contract=secret, subgoals=[secret])
+    )
+    payload = build_status_guard_payload(
+        candidate_response=secret,
+        active_task=active_task,
+        messages=[_assistant_tool_call(1, "terminal", secret)],
+    )
+
+    serialized = json.dumps(payload)
+    assert secret not in serialized
+    assert "[redacted: unavailable]" in serialized
