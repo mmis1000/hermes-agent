@@ -1323,7 +1323,11 @@ class ProcessRegistry:
         try:
             from tools.async_delegation import restore_stale_wait_completions
 
-            restore_stale_wait_completions(self.completion_queue)
+            restore_stale_wait_completions(
+                self.completion_queue,
+                session_key=session_key or "",
+                owns_event=owns_event,
+            )
         except Exception:
             logger.debug("Could not recover stale delegation wait holds", exc_info=True)
 

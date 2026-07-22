@@ -112,6 +112,40 @@ def test_duplicate_async_queue_replay_injects_once(monkeypatch, isolated_registr
     adapter.handle_message.assert_awaited_once()
 
 
+def test_gateway_idle_watcher_restores_only_gateway_routable_wait_holds(
+    monkeypatch, isolated_registry,
+):
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    runner = _runner(adapter)
+    _stop_after_sleeps(monkeypatch, runner, count=2)
+
+    from tools import async_delegation
+
+    restored = []
+
+    def _restore(target_queue, *, session_key="", owns_event=None):
+        assert session_key == ""
+        assert owns_event is not None
+        routed = _async_event("deleg_gateway_owned")
+        unroutable = _async_event("deleg_cli_owned")
+        unroutable["session_key"] = "20260711_unparseable_ui_session"
+        assert owns_event(routed) is True
+        assert owns_event(unroutable) is False
+        routed["restored"] = True
+        target_queue.put(routed)
+        restored.append(routed["delegation_id"])
+        return 1
+
+    monkeypatch.setattr(
+        async_delegation, "restore_stale_wait_completions", _restore
+    )
+
+    asyncio.run(runner._async_delegation_watcher(interval=0))
+
+    assert restored == ["deleg_gateway_owned"]
+    adapter.handle_message.assert_awaited_once()
+
+
 def test_unroutable_async_event_is_not_requeued_forever(
     monkeypatch, isolated_registry,
 ):

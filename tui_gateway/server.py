@@ -9861,10 +9861,20 @@ def _notification_poller_loop(
     poller requeues events owned by another live session and drops addressed
     events whose owner is gone; ownerless legacy notifications remain global.
     """
+    from tools.async_delegation import restore_stale_wait_completions
     from tools.process_registry import process_registry, format_process_notification
 
     _emitted = set()  # dedup re-queued events so same completion isn't emitted 50 times while session is busy
     while not stop_event.is_set() and not session.get("_finalized"):
+        try:
+            restore_stale_wait_completions(
+                process_registry.completion_queue,
+                owns_event=lambda evt: _session_owns_notification_event(
+                    sid, session, evt
+                ),
+            )
+        except Exception:
+            logger.debug("Could not recover stale delegation wait holds", exc_info=True)
         try:
             evt = process_registry.completion_queue.get(timeout=0.5)
         except Exception:

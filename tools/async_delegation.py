@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import sqlite3
 import threading
 import time
@@ -353,7 +354,6 @@ def restore_undelivered_completions(target_queue) -> int:
     results seconds after boot (#64484).
     """
     recover_abandoned_delegations()
-    recover_stale_wait_holds()
     with _DB_LOCK, _connect() as conn:
         rows = conn.execute(
             """SELECT delegation_id, event_json FROM async_delegations
@@ -370,36 +370,60 @@ def restore_undelivered_completions(target_queue) -> int:
     return len(rows)
 
 
-def restore_stale_wait_completions(target_queue) -> int:
-    """Atomically requeue terminal results abandoned by a crashed waiter.
+def restore_stale_wait_completions(
+    target_queue,
+    *,
+    session_key: str = "",
+    owns_event: Optional[Callable[[Dict[str, Any]], bool]] = None,
+) -> int:
+    """Requeue expired wait holds only for a consumer that can own them.
 
-    Startup restoration cannot recover a wait hold that has not expired yet.
-    Notification drains call this lightweight scan so the result is published
-    once the lease expires, without re-enqueuing unrelated pending rows.
+    Foreign consumers leave the durable row untouched. An authorised consumer
+    atomically claims the expired hold before enqueueing it, so another process
+    cannot publish the same result and a busy local queue cannot grow duplicate
+    restored copies.
     """
-    now = time.time()
-    cutoff = now - _WAIT_HOLD_STALE_SECONDS
+    cutoff = time.time() - _WAIT_HOLD_STALE_SECONDS
     with _DB_LOCK, _connect() as conn:
         rows = conn.execute(
-            """UPDATE async_delegations
-                  SET delivery_state='pending', delivery_claim=NULL,
-                      delivery_claimed_at=NULL, updated_at=?
+            """SELECT delegation_id, event_json FROM async_delegations
                 WHERE state NOT IN ('running','finalizing','interrupt_requested')
                   AND delivery_state='held_by_wait'
                   AND (delivery_claimed_at IS NULL OR delivery_claimed_at < ?)
                   AND event_json IS NOT NULL
-            RETURNING delegation_id, event_json""",
-            (now, cutoff),
+                ORDER BY completed_at, delegation_id""",
+            (cutoff,),
         ).fetchall()
-    for _delegation_id, payload in rows:
+
+    restored = 0
+    for delegation_id, payload in rows:
         evt = json.loads(payload)
-        if isinstance(evt, dict):
-            evt["restored"] = True
-            evt["delivery_managed"] = True
-        target_queue.put(evt)
-    if rows:
-        _notify_state_change()
-    return len(rows)
+        if not isinstance(evt, dict):
+            continue
+        if owns_event is not None:
+            try:
+                owned = bool(owns_event(evt))
+            except Exception:
+                owned = False
+        elif session_key:
+            owned = str(evt.get("session_key") or "") == session_key
+        else:
+            owned = False
+        if not owned:
+            continue
+        claim_id = f"stale-restore:{os.getpid()}:{uuid.uuid4().hex}"
+        if not claim_completion_delivery(str(delegation_id), claim_id):
+            continue
+        evt["restored"] = True
+        evt["delivery_managed"] = True
+        evt["_async_delivery_claim_token"] = claim_id
+        try:
+            target_queue.put(evt)
+        except Exception:
+            release_completion_delivery(str(delegation_id), claim_id)
+            raise
+        restored += 1
+    return restored
 
 
 _DURABLE_SELECT = """SELECT
@@ -514,7 +538,7 @@ def mark_completion_delivered(delegation_id: str) -> bool:
 
 
 def claim_completion_delivery(delegation_id: str, claim_id: str) -> bool:
-    """Claim one terminal pending completion across consumers/processes."""
+    """Claim one terminal pending or expired wait-held completion."""
     now = time.time()
     with _DB_LOCK, _connect() as conn:
         row = conn.execute(
@@ -532,8 +556,17 @@ def claim_completion_delivery(delegation_id: str, claim_id: str) -> bool:
                  AND (
                       delivery_state='pending'
                       OR (delivery_state='delivering' AND delivery_claimed_at < ?)
+                      OR (delivery_state='held_by_wait'
+                          AND (delivery_claimed_at IS NULL OR delivery_claimed_at < ?))
                  )""",
-            (claim_id, now, now, delegation_id, now - 300),
+            (
+                claim_id,
+                now,
+                now,
+                delegation_id,
+                now - 300,
+                now - _WAIT_HOLD_STALE_SECONDS,
+            ),
         )
         changed = cur.rowcount == 1
     if changed:

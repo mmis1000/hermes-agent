@@ -3155,6 +3155,60 @@ class _StopAfterOneNotificationPoll:
         return self._checks > 1
 
 
+def test_notification_poller_rescans_wait_holds_for_its_owned_session(monkeypatch):
+    import queue as _queue_mod
+
+    from tools import async_delegation
+    from tools.process_registry import process_registry
+
+    session = _session(session_key="session-owned-stale-hold")
+    event = {
+        "type": "async_delegation",
+        "delegation_id": "deleg_owned_stale_hold",
+        "session_key": "session-owned-stale-hold",
+        "status": "completed",
+        "summary": "restored from expired wait hold",
+    }
+    isolated_queue: _queue_mod.Queue = _queue_mod.Queue()
+    monkeypatch.setattr(process_registry, "completion_queue", isolated_queue)
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+    monkeypatch.setattr(server, "_emit", lambda *_args, **_kwargs: None)
+
+    calls = []
+
+    def _restore(target_queue, *, session_key="", owns_event=None):
+        assert session_key == ""
+        assert owns_event is not None
+        assert owns_event(event) is True
+        target_queue.put(dict(event))
+        calls.append(event["delegation_id"])
+        return 1
+
+    delivered = []
+
+    def _deliver(_rid, _sid, active_session, text):
+        delivered.append(text)
+        active_session["running"] = False
+
+    monkeypatch.setattr(
+        async_delegation, "restore_stale_wait_completions", _restore
+    )
+    monkeypatch.setattr(server, "_run_prompt_submit", _deliver)
+    server._sessions["sid-owned-stale-hold"] = session
+
+    try:
+        server._notification_poller_loop(
+            _StopAfterOneNotificationPoll(), "sid-owned-stale-hold", session
+        )
+        assert calls == ["deleg_owned_stale_hold"]
+        assert len(delivered) == 1
+        assert "restored from expired wait hold" in delivered[0]
+    finally:
+        server._sessions.pop("sid-owned-stale-hold", None)
+        while not isolated_queue.empty():
+            isolated_queue.get_nowait()
+
+
 def test_notification_poller_live_loop_requeues_foreign_completion_for_owner(
     monkeypatch,
 ):

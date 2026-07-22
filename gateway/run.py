@@ -17623,9 +17623,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         handled by ``_run_process_watcher`` / the post-turn drain).
         """
         await asyncio.sleep(3)  # let platforms finish connecting
+        from tools.async_delegation import restore_stale_wait_completions
         from tools.process_registry import process_registry as _pr
+
+        def _owns_gateway_event(evt: dict) -> bool:
+            self._enrich_async_delegation_routing(evt)
+            source = self._build_process_event_source(evt)
+            return source is not None and source.platform in self.adapters
+
         while self._running:
             try:
+                # A wait hold can expire after this gateway starts. Recover
+                # only events this gateway can route; the helper atomically
+                # claims each one before publishing it to this process queue.
+                restore_stale_wait_completions(
+                    _pr.completion_queue,
+                    owns_event=_owns_gateway_event,
+                )
                 # Peek the queue for async-delegation events. We must NOT
                 # consume watch/completion events here (other drains own them),
                 # so requeue anything that isn't ours.
