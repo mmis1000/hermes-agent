@@ -326,3 +326,30 @@ def test_restore_requeues_completion_after_stale_waiter_crash():
     assert row is not None
     assert row["delivery_state"] == "pending"
     assert row["delivery_claim"] is None
+
+
+def test_notification_drain_recovers_hold_that_expires_after_startup():
+    from tools.process_registry import ProcessRegistry
+
+    dispatched = _dispatch(
+        lambda: {"status": "completed", "summary": "delayed recovery"}
+    )
+    _wait_terminal(dispatched["delegation_id"])
+    _age_wait_hold(dispatched["delegation_id"], seconds=1)
+
+    registry = ProcessRegistry()
+    assert registry.completion_queue.empty()
+
+    _age_wait_hold(
+        dispatched["delegation_id"], seconds=ad._WAIT_HOLD_STALE_SECONDS + 1
+    )
+    drained = registry.drain_notifications(session_key="owner")
+
+    assert len(drained) == 1
+    event, text = drained[0]
+    assert event["delegation_id"] == dispatched["delegation_id"]
+    assert event["restored"] is True
+    assert "delayed recovery" in text
+    row = ad.get_durable_delegation(dispatched["delegation_id"])
+    assert row is not None
+    assert row["delivery_state"] == "delivering"
