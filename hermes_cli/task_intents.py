@@ -371,14 +371,19 @@ def _get_session_db() -> Optional[Any]:
         from hermes_constants import get_hermes_home
         from hermes_state import SessionDB
 
-        home = str(get_hermes_home())
+        home_path = get_hermes_home()
+        home = str(home_path)
     except Exception:
         return None
     cached = _DB_CACHE.get(home)
     if cached is not None:
         return cached
     try:
-        db = SessionDB()
+        # SessionDB's default path is computed when hermes_state is imported.
+        # Gateway tests and multi-profile runtimes can change HERMES_HOME later,
+        # so pass the current resolved path explicitly instead of leaking state
+        # through that import-time default.
+        db = SessionDB(home_path / "state.db")
     except Exception:
         return None
     _DB_CACHE[home] = db
