@@ -310,7 +310,7 @@ def test_stale_wait_hold_is_reclaimed_but_live_hold_is_not():
     }
 
 
-def test_restore_requeues_completion_after_stale_waiter_crash():
+def test_owner_requeues_completion_after_stale_waiter_crash():
     dispatched = _dispatch(lambda: {"status": "completed", "summary": "recover"})
     _wait_terminal(dispatched["delegation_id"])
     _age_wait_hold(
@@ -318,14 +318,15 @@ def test_restore_requeues_completion_after_stale_waiter_crash():
     )
 
     restored = queue.Queue()
-    assert ad.restore_undelivered_completions(restored) == 1
+    assert ad.restore_stale_wait_completions(restored, session_key="owner") == 1
     event = restored.get_nowait()
     assert event["delegation_id"] == dispatched["delegation_id"]
     assert event["restored"] is True
+    assert event["_async_delivery_claim_token"]
     row = ad.get_durable_delegation(dispatched["delegation_id"])
     assert row is not None
-    assert row["delivery_state"] == "pending"
-    assert row["delivery_claim"] is None
+    assert row["delivery_state"] == "delivering"
+    assert row["delivery_claim"] == event["_async_delivery_claim_token"]
 
 
 def test_notification_drain_recovers_hold_that_expires_after_startup():
@@ -350,6 +351,34 @@ def test_notification_drain_recovers_hold_that_expires_after_startup():
     assert event["delegation_id"] == dispatched["delegation_id"]
     assert event["restored"] is True
     assert "delayed recovery" in text
+    row = ad.get_durable_delegation(dispatched["delegation_id"])
+    assert row is not None
+    assert row["delivery_state"] == "delivering"
+
+
+def test_foreign_drain_cannot_steal_expired_wait_hold_from_owner():
+    from tools.process_registry import ProcessRegistry
+
+    dispatched = _dispatch(
+        lambda: {"status": "completed", "summary": "owned recovery"}
+    )
+    _wait_terminal(dispatched["delegation_id"])
+    _age_wait_hold(
+        dispatched["delegation_id"], seconds=ad._WAIT_HOLD_STALE_SECONDS + 1
+    )
+
+    foreign = ProcessRegistry()
+    assert foreign.drain_notifications(session_key="foreign") == []
+    row = ad.get_durable_delegation(dispatched["delegation_id"])
+    assert row is not None
+    assert row["delivery_state"] == "held_by_wait"
+
+    owner = ProcessRegistry()
+    drained = owner.drain_notifications(session_key="owner")
+    assert len(drained) == 1
+    event, text = drained[0]
+    assert event["delegation_id"] == dispatched["delegation_id"]
+    assert "owned recovery" in text
     row = ad.get_durable_delegation(dispatched["delegation_id"])
     assert row is not None
     assert row["delivery_state"] == "delivering"

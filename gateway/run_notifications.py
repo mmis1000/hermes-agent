@@ -1885,6 +1885,11 @@ class GatewayNotificationsMixin:
         """
         await asyncio.sleep(3)  # let platforms finish connecting
         from tools.async_delegation import ORPHAN_SWEEP_INTERVAL_S
+        from tools.async_delegation import restore_stale_wait_completions
+        def _owns_gateway_event(evt):
+            self._enrich_async_delegation_routing(evt)
+            source = self._build_process_event_source(evt)
+            return source is not None and source.platform in self.adapters
         from tools.process_registry import process_registry as _pr
         last_orphan_sweep = None
         while self._running:
