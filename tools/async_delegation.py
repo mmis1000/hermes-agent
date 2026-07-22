@@ -370,6 +370,38 @@ def restore_undelivered_completions(target_queue) -> int:
     return len(rows)
 
 
+def restore_stale_wait_completions(target_queue) -> int:
+    """Atomically requeue terminal results abandoned by a crashed waiter.
+
+    Startup restoration cannot recover a wait hold that has not expired yet.
+    Notification drains call this lightweight scan so the result is published
+    once the lease expires, without re-enqueuing unrelated pending rows.
+    """
+    now = time.time()
+    cutoff = now - _WAIT_HOLD_STALE_SECONDS
+    with _DB_LOCK, _connect() as conn:
+        rows = conn.execute(
+            """UPDATE async_delegations
+                  SET delivery_state='pending', delivery_claim=NULL,
+                      delivery_claimed_at=NULL, updated_at=?
+                WHERE state NOT IN ('running','finalizing','interrupt_requested')
+                  AND delivery_state='held_by_wait'
+                  AND (delivery_claimed_at IS NULL OR delivery_claimed_at < ?)
+                  AND event_json IS NOT NULL
+            RETURNING delegation_id, event_json""",
+            (now, cutoff),
+        ).fetchall()
+    for _delegation_id, payload in rows:
+        evt = json.loads(payload)
+        if isinstance(evt, dict):
+            evt["restored"] = True
+            evt["delivery_managed"] = True
+        target_queue.put(evt)
+    if rows:
+        _notify_state_change()
+    return len(rows)
+
+
 _DURABLE_SELECT = """SELECT
     delegation_id, origin_session, origin_ui_session_id, parent_session_id,
     state, dispatched_at, completed_at, updated_at, event_json, result_json,

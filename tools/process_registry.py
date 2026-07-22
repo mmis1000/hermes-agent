@@ -1320,6 +1320,13 @@ class ProcessRegistry:
         filter is provided, ownerless async-delegation events remain
         fail-closed and require positive proof.
         """
+        try:
+            from tools.async_delegation import restore_stale_wait_completions
+
+            restore_stale_wait_completions(self.completion_queue)
+        except Exception:
+            logger.debug("Could not recover stale delegation wait holds", exc_info=True)
+
         results: "list[tuple[dict, str]]" = []
         requeue: "list[dict]" = []
         while not self.completion_queue.empty():
