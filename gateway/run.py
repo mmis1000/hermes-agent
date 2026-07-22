@@ -27682,6 +27682,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if _plat_streaming is None
             else bool(_plat_streaming)
         )
+        _streaming_enabled = (
+            _streaming_enabled
+            and self._pre_send_status_guard_allows_final_streaming()
+        )
 
         _thread_metadata: Optional[Dict[str, Any]] = self._thread_metadata_for_source(source, event_message_id)
 
