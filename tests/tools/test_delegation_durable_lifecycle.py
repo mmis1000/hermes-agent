@@ -279,3 +279,50 @@ def test_restore_only_enqueues_pending_terminal_results():
     restored = queue.Queue()
     assert ad.restore_undelivered_completions(restored) == 1
     assert restored.get_nowait()["delegation_id"] == "deleg_restore_0"
+
+
+def _age_wait_hold(delegation_id, *, seconds):
+    with ad._DB_LOCK, ad._connect() as conn:
+        conn.execute(
+            """UPDATE async_delegations SET delivery_state='held_by_wait',
+                      delivery_claim='dead-waiter', delivery_claimed_at=?
+               WHERE delegation_id=?""",
+            (time.time() - seconds, delegation_id),
+        )
+
+
+def test_stale_wait_hold_is_reclaimed_but_live_hold_is_not():
+    stale = _dispatch(lambda: {"status": "completed", "summary": "stale"})
+    _wait_terminal(stale["delegation_id"])
+    _age_wait_hold(
+        stale["delegation_id"], seconds=ad._WAIT_HOLD_STALE_SECONDS + 1
+    )
+
+    claimed = ad.claim_async_delivery(stale["delegation_id"], managed=True)
+    assert claimed["status"] == "claimed"
+    assert ad.release_completion_delivery(stale["delegation_id"], claimed["token"])
+
+    live = _dispatch(lambda: {"status": "completed", "summary": "live"})
+    _wait_terminal(live["delegation_id"])
+    _age_wait_hold(live["delegation_id"], seconds=1)
+    assert ad.claim_async_delivery(live["delegation_id"], managed=True) == {
+        "status": "held"
+    }
+
+
+def test_restore_requeues_completion_after_stale_waiter_crash():
+    dispatched = _dispatch(lambda: {"status": "completed", "summary": "recover"})
+    _wait_terminal(dispatched["delegation_id"])
+    _age_wait_hold(
+        dispatched["delegation_id"], seconds=ad._WAIT_HOLD_STALE_SECONDS + 1
+    )
+
+    restored = queue.Queue()
+    assert ad.restore_undelivered_completions(restored) == 1
+    event = restored.get_nowait()
+    assert event["delegation_id"] == dispatched["delegation_id"]
+    assert event["restored"] is True
+    row = ad.get_durable_delegation(dispatched["delegation_id"])
+    assert row is not None
+    assert row["delivery_state"] == "pending"
+    assert row["delivery_claim"] is None

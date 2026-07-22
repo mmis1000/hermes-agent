@@ -35,6 +35,7 @@ DEFAULT_STATUS_GUARD_JUDGE_PROMPT = (
 )
 
 _DECISIONS = {"allow", "reject_and_steer"}
+_REDACTION_UNAVAILABLE = "[redacted: unavailable]"
 
 
 def _coerce_bool(value: Any, default: bool) -> bool:
@@ -107,7 +108,9 @@ def _redact(text: str) -> str:
 
         return redact_sensitive_text(str(text or ""), force=True)
     except Exception:
-        return str(text or "")
+        # The guard may use a separate auxiliary provider. Never fall back to
+        # the original text when the safety boundary itself is unavailable.
+        return _REDACTION_UNAVAILABLE
 
 
 def _clamp_redacted(text: Any, limit: int) -> str:
