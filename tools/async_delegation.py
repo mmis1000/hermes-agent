@@ -93,6 +93,10 @@ _DB_LOCK = threading.Lock()
 _STATE_CONDITION = threading.Condition()
 _ACTIVE_STATES = {"running", "finalizing", "interrupt_requested", "stalling"}
 _WAIT_POLL_SECONDS = 0.05
+# Public lifecycle waits are capped at 300 seconds. Keep the durable hold lease
+# longer than that bound so a live waiter cannot be pre-empted, while a process
+# that dies mid-wait cannot strand the result forever.
+_WAIT_HOLD_STALE_SECONDS = 360.0
 
 # ---------------------------------------------------------------------------
 # Stale-delegation detection (progress-based, on by default)
