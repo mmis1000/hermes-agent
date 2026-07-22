@@ -25234,10 +25234,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         identity = self._completion_delivery_identity(evt)
         durable_delegation_id = ""
+        durable_authoritative = False
         durable_claim_id = str(evt.get("_gateway_async_delivery_claim") or "")
 
         if evt.get("type") == "async_delegation":
-            durable_delegation_id = str(evt.get("delegation_id") or "")
+            candidate_id = str(evt.get("delegation_id") or "")
+            if candidate_id:
+                durable_delegation_id = candidate_id
+                try:
+                    from tools.async_delegation import get_durable_delegation
+
+                    # Older/non-durable producers still pass through the
+                    # compatibility claim/ack callbacks, but only an existing
+                    # SQLite row makes a failed acknowledgement retryable.
+                    durable_authoritative = (
+                        get_durable_delegation(candidate_id) is not None
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Could not inspect durable async completion %s: %s",
+                        candidate_id, exc,
+                    )
+                    return False
 
         # A previous call reached user-visible injection but failed to persist
         # the acknowledgement. Retry only the SQLite commit.
@@ -25247,7 +25265,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
                 if not complete_completion_delivery(
                     durable_delegation_id, durable_claim_id,
-                ):
+                ) and durable_authoritative:
                     return False
             parent_session_id = str(evt.get("parent_session_id") or "").strip()
             if parent_session_id:
@@ -25365,7 +25383,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
                 if not complete_completion_delivery(
                     durable_delegation_id, durable_claim_id,
-                ):
+                ) and durable_authoritative:
                     return False
                 evt.pop("_gateway_async_delivery_claim", None)
                 evt.pop("_gateway_async_delivery_accepted", None)
