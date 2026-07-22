@@ -9918,6 +9918,7 @@ def _notification_poller_loop(
     same way (status.update + agent turn) — the delivery path
     tools/kanban_tools.py documents for platform="tui" rows (issue #59890).
     """
+    from tools.async_delegation import restore_stale_wait_completions
     from tools.process_registry import process_registry, format_process_notification
 
     _emitted = set()  # dedup re-queued events so same completion isn't emitted 50 times while session is busy
@@ -9977,6 +9978,15 @@ def _notification_poller_loop(
                         )
                         with session["history_lock"]:
                             session["running"] = False
+        try:
+            restore_stale_wait_completions(
+                process_registry.completion_queue,
+                owns_event=lambda evt: _session_owns_notification_event(
+                    sid, session, evt
+                ),
+            )
+        except Exception:
+            logger.debug("Could not recover stale delegation wait holds", exc_info=True)
         try:
             evt = process_registry.completion_queue.get(timeout=0.5)
         except Exception:
