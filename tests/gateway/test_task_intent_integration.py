@@ -316,3 +316,23 @@ def test_legacy_pre_send_guard_opt_in_survives_disabled_merged_default(monkeypat
     assert config.enabled is True
     assert config.max_operations == 17
     assert config.judge_prompt == "legacy guard prompt"
+
+
+def test_pre_send_guard_buffers_final_streaming_and_fails_open():
+    from gateway.run import GatewayRunner
+
+    runner = object.__new__(GatewayRunner)
+    runner._load_pre_send_status_guard_config = MagicMock(
+        return_value=SimpleNamespace(enabled=True)
+    )
+    assert runner._pre_send_status_guard_allows_final_streaming() is False
+
+    runner._load_pre_send_status_guard_config = MagicMock(
+        return_value=SimpleNamespace(enabled=False)
+    )
+    assert runner._pre_send_status_guard_allows_final_streaming() is True
+
+    runner._load_pre_send_status_guard_config = MagicMock(
+        side_effect=RuntimeError("config unavailable")
+    )
+    assert runner._pre_send_status_guard_allows_final_streaming() is True

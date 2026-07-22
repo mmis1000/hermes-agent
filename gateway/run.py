@@ -10271,6 +10271,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return PreSendStatusGuardConfig(enabled=False)
         return PreSendStatusGuardConfig.from_mapping(guard_cfg)
 
+    def _pre_send_status_guard_allows_final_streaming(self) -> bool:
+        """Fail open unless the optional guard must inspect the whole draft.
+
+        A guard cannot reject claims that have already been streamed to the
+        user. When enabled, buffer the final answer until the guard runs while
+        leaving interim/commentary delivery available on the normal agent path.
+        """
+        try:
+            cfg = self._load_pre_send_status_guard_config()
+            return not bool(cfg and getattr(cfg, "enabled", False))
+        except Exception:
+            logger.debug("pre-send status guard streaming gate failed", exc_info=True)
+            return True
+
     def _active_task_for_pre_send_status_guard(self, session_id: str, task_intent_mgr: Any = None, cfg: Any = None):
         try:
             from hermes_cli.pre_send_status_guard import (
@@ -19108,6 +19122,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if _plat_streaming is None
             else bool(_plat_streaming)
         )
+        _streaming_enabled = (
+            _streaming_enabled
+            and self._pre_send_status_guard_allows_final_streaming()
+        )
 
         _thread_metadata: Optional[Dict[str, Any]] = self._thread_metadata_for_source(source, event_message_id)
 
@@ -20676,7 +20694,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if _plat_streaming is None
                 else bool(_plat_streaming)
             )
-            _want_stream_deltas = _streaming_enabled
+            _want_stream_deltas = (
+                _streaming_enabled
+                and self._pre_send_status_guard_allows_final_streaming()
+            )
             _want_interim_messages = interim_assistant_messages_enabled
             _want_interim_consumer = _want_interim_messages
             if _want_stream_deltas or _want_interim_consumer:
