@@ -28,6 +28,19 @@ def _decision(relationship: str, state_effect: str, raw: str, confidence: float 
     }
 
 
+def test_session_db_uses_current_hermes_home(hermes_home, monkeypatch, tmp_path):
+    import hermes_state
+    from hermes_cli import task_intents
+
+    monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", tmp_path / "stale-default.db")
+    task_intents._DB_CACHE.clear()
+
+    database = task_intents._get_session_db()
+
+    assert database is not None
+    assert database.db_path == hermes_home / "state.db"
+
+
 def test_raw_unicode_direct_message_round_trips_exactly_with_provenance(hermes_home):
     from hermes_cli.task_intents import TaskIntentManager
 
