@@ -288,6 +288,11 @@ async def test_gateway_ack_failure_retries_without_duplicate_injection(monkeypat
     runner._completion_delivery_retention = 32
     runner._inject_watch_notification = AsyncMock(return_value=True)
 
+    monkeypatch.setattr(
+        ad,
+        "get_durable_delegation",
+        lambda *_args, **_kwargs: {"delegation_id": "deleg-ack"},
+    )
     monkeypatch.setattr(ad, "claim_completion_delivery", lambda *_args, **_kwargs: True)
     acknowledgements = iter([False, True])
     monkeypatch.setattr(
