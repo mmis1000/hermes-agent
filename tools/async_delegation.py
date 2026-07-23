@@ -698,6 +698,25 @@ def delegation_contains_subagent(
     ) is not None
 
 
+def enqueue_subagent_steer(
+    delegation_id: str,
+    subagent_id: str,
+    *,
+    session_key: str,
+    message: str,
+) -> Dict[str, Any]:
+    outcome = _repository().enqueue_steer(
+        delegation_id, subagent_id, session_key, message
+    )
+    if outcome.get("status") == "accepted":
+        _notify_state_change()
+    return outcome
+
+
+def inspect_subagent_steer(mailbox_id: str) -> Dict[str, Any]:
+    return _repository().inspect_steer(mailbox_id)
+
+
 def request_pending_subagent_interrupt(
     delegation_id: str,
     subagent_id: str,

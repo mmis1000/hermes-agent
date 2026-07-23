@@ -1031,6 +1031,20 @@ CREATE TABLE IF NOT EXISTS delegation_attempts (
     UNIQUE (logical_id, attempt_number)
 );
 
+CREATE TABLE IF NOT EXISTS delegation_steer_mailbox (
+    mailbox_id TEXT PRIMARY KEY,
+    delegation_id TEXT NOT NULL REFERENCES async_delegations(delegation_id) ON DELETE CASCADE,
+    logical_id TEXT NOT NULL REFERENCES delegation_logical_subagents(logical_id) ON DELETE CASCADE,
+    attempt_id TEXT NOT NULL REFERENCES delegation_attempts(attempt_id) ON DELETE CASCADE,
+    sequence_number INTEGER NOT NULL,
+    message TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    created_at REAL NOT NULL,
+    forwarded_at REAL,
+    resolved_at REAL,
+    UNIQUE (attempt_id, sequence_number)
+);
+
 CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);
 CREATE INDEX IF NOT EXISTS idx_sessions_source_id ON sessions(source, id);
 CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);
@@ -1067,6 +1081,8 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_delegation_one_active_attempt
     WHERE state IN ('starting','running','finalizing','interrupt_requested');
 CREATE INDEX IF NOT EXISTS idx_delegation_runs_delivery
     ON delegation_runs(delivery_state, completed_at);
+CREATE INDEX IF NOT EXISTS idx_delegation_steer_attempt
+    ON delegation_steer_mailbox(attempt_id, sequence_number);
 """
 
 

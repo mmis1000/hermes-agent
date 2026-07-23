@@ -119,6 +119,255 @@ def test_tool_schema_and_runtime_validation_are_strict():
         assert payload["action"]
         assert payload["error"]
 
+
+def _starting_steer_attempt(delegation_id: str, subagent_id: str):
+    repository = ad._repository()
+    initial = repository.register_initial_dispatch(
+        {
+            "delegation_id": delegation_id,
+            "session_key": "owner",
+            "dispatched_at": time.time(),
+            "root_subagent_ids": [subagent_id],
+        }
+    )
+    return repository, initial, initial["attempts"][0]
+
+
+def test_steer_queues_while_starting_then_forwards_in_order_and_acks_injection():
+    from tools.delegation_control import delegation_control
+
+    repository, initial, attempt = _starting_steer_attempt(
+        "deleg-steer-starting", "sa-steer"
+    )
+
+    responses = [
+        json.loads(
+            delegation_control(
+                action="steer",
+                delegation_id="deleg-steer-starting",
+                subagent_id="sa-steer",
+                message=text,
+                session_key="owner",
+            )
+        )
+        for text in ("first guidance", "second guidance")
+    ]
+    assert [item["status"] for item in responses] == ["accepted", "accepted"]
+    assert [item["steer_status"] for item in responses] == ["pending", "pending"]
+
+    delivered = []
+    agent = MagicMock()
+
+    def accept(text, **kwargs):
+        delivered.append((text, kwargs["mailbox_id"], kwargs["outcome_callback"]))
+        return True
+
+    agent.steer.side_effect = accept
+    dt._register_subagent(
+        {
+            "subagent_id": "sa-steer",
+            "delegation_attempt_id": attempt["attempt_id"],
+            "delegation_run_id": initial["run_id"],
+            "status": "running",
+            "events": [],
+            "assistant_text_tail": "",
+            "agent": agent,
+        }
+    )
+
+    assert [item[0] for item in delivered] == ["first guidance", "second guidance"]
+    assert [repository.inspect_steer(item[1])["status"] for item in delivered] == [
+        "forwarded",
+        "forwarded",
+    ]
+    for _, _, callback in delivered:
+        callback("injected")
+    assert [repository.inspect_steer(item[1])["status"] for item in delivered] == [
+        "injected",
+        "injected",
+    ]
+    observed = json.loads(
+        delegation_control(
+            action="status",
+            delegation_id="deleg-steer-starting",
+            subagent_id="sa-steer",
+            session_key="owner",
+        )
+    )["subagents"][0]["steers"]
+    assert [item["status"] for item in observed] == ["injected", "injected"]
+    assert all("message" not in item for item in observed)
+
+
+def test_steer_rejects_foreign_terminal_and_interrupt_wins_startup_race():
+    from tools.delegation_control import delegation_control
+
+    repository, initial, attempt = _starting_steer_attempt(
+        "deleg-steer-races", "sa-race"
+    )
+    foreign = json.loads(
+        delegation_control(
+            action="steer",
+            delegation_id="deleg-steer-races",
+            subagent_id="sa-race",
+            message="foreign",
+            session_key="foreign",
+        )
+    )
+    assert foreign["status"] == "not_found"
+
+    queued = json.loads(
+        delegation_control(
+            action="steer",
+            delegation_id="deleg-steer-races",
+            subagent_id="sa-race",
+            message="must lose to interrupt",
+            session_key="owner",
+        )
+    )
+    assert ad.request_pending_subagent_interrupt(
+        "deleg-steer-races", "sa-race", session_key="owner", reason="stop"
+    ) == "interrupt_requested"
+    assert repository.inspect_steer(queued["mailbox_id"])["status"] == (
+        "superseded_by_interrupt"
+    )
+
+    agent = MagicMock()
+    dt._register_subagent(
+        {
+            "subagent_id": "sa-race",
+            "delegation_attempt_id": attempt["attempt_id"],
+            "delegation_run_id": initial["run_id"],
+            "status": "running",
+            "events": [],
+            "assistant_text_tail": "",
+            "agent": agent,
+        }
+    )
+    agent.interrupt.assert_called_once()
+    agent.steer.assert_not_called()
+
+    terminal_repo, _, terminal_attempt = _starting_steer_attempt(
+        "deleg-steer-terminal", "sa-terminal"
+    )
+    assert terminal_repo.transition_attempt(
+        terminal_attempt["attempt_id"], {"starting"}, "completed"
+    )["status"] == "updated"
+    terminal = json.loads(
+        delegation_control(
+            action="steer",
+            delegation_id="deleg-steer-terminal",
+            subagent_id="sa-terminal",
+            message="too late",
+            session_key="owner",
+        )
+    )
+    assert terminal["status"] == "already_terminal"
+    assert terminal["terminal_status"] == "completed"
+
+
+@pytest.mark.parametrize(
+    ("winner", "expected"),
+    [
+        ("interrupt", "superseded_by_interrupt"),
+        ("completion", "too_late_after_completion"),
+    ],
+)
+def test_claimed_steer_reports_honest_race_outcome(monkeypatch, winner, expected):
+    from tools.delegation_control import delegation_control
+
+    repository, initial, attempt = _starting_steer_attempt(
+        f"deleg-steer-{winner}", f"sa-{winner}"
+    )
+    claim_started = threading.Event()
+    release_claim = threading.Event()
+    real_claim = type(repository).claim_steer
+
+    def blocked_claim(self, attempt_id, mailbox_id):
+        outcome = real_claim(self, attempt_id, mailbox_id)
+        claim_started.set()
+        assert release_claim.wait(2)
+        return outcome
+
+    monkeypatch.setattr(type(repository), "claim_steer", blocked_claim)
+
+    class RaceAgent:
+        def __init__(self):
+            self.interrupted = False
+
+        def interrupt(self, _reason):
+            self.interrupted = True
+
+        def steer(self, _text, *, outcome_callback, **_kwargs):
+            if self.interrupted:
+                outcome_callback("superseded_by_interrupt")
+                return False
+            return True
+
+    agent = RaceAgent()
+    child_id = f"sa-{winner}"
+    dt._register_subagent(
+        {
+            "subagent_id": child_id,
+            "delegation_attempt_id": attempt["attempt_id"],
+            "delegation_run_id": initial["run_id"],
+            "status": "running",
+            "events": [],
+            "assistant_text_tail": "",
+            "agent": agent,
+        }
+    )
+    responses = []
+
+    def request_steer():
+        responses.append(
+            json.loads(
+                delegation_control(
+                    action="steer",
+                    delegation_id=f"deleg-steer-{winner}",
+                    subagent_id=child_id,
+                    message="race guidance",
+                    session_key="owner",
+                )
+            )
+        )
+
+    thread = threading.Thread(target=request_steer)
+    thread.start()
+    assert claim_started.wait(2)
+    if winner == "interrupt":
+        interrupted = json.loads(
+            delegation_control(
+                action="interrupt",
+                delegation_id="deleg-steer-interrupt",
+                subagent_id=child_id,
+                session_key="owner",
+            )
+        )
+        assert interrupted["status"] == "interrupt_requested"
+    else:
+        repository.complete_run(
+            initial["run_id"],
+            {
+                "completed_at": time.time(),
+                "status": "completed",
+                "children": [
+                    {
+                        "subagent_id": child_id,
+                        "attempt_id": attempt["attempt_id"],
+                        "status": "completed",
+                    }
+                ],
+            },
+            {"status": "completed"},
+        )
+    release_claim.set()
+    thread.join(2)
+
+    assert not thread.is_alive()
+    assert responses[0]["status"] == expected
+    assert responses[0]["steer_status"] == expected
+
+
 def test_list_and_status_hide_foreign_session_like_unknown():
     release = threading.Event()
     dispatched = _dispatch(

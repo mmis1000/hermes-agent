@@ -219,6 +219,9 @@ def _register_subagent(record: Dict[str, Any]) -> None:
                     sid,
                     outcome,
                 )
+        attempt_id = record.get("delegation_attempt_id")
+        if isinstance(attempt_id, str):
+            forward_pending_subagent_steers(sid, attempt_id)
 
 
 def _unregister_subagent(
@@ -289,6 +292,54 @@ def interrupt_subagent_status(subagent_id: str, reason: str = "") -> str:
         logger.debug("interrupt_subagent(%s) failed: %s", subagent_id, exc)
         return "interrupt_failed"
     return "interrupt_requested"
+
+
+def forward_pending_subagent_steers(subagent_id: str, attempt_id: str) -> int:
+    """Forward ordered durable mailbox items to one exact live attempt."""
+    if not subagent_id or not attempt_id:
+        return 0
+    with _active_subagents_lock:
+        record = _active_subagents.get(subagent_id)
+        if not record or record.get("delegation_attempt_id") != attempt_id:
+            return 0
+        agent = record.get("agent")
+    steer = getattr(agent, "steer", None)
+    if not callable(steer):
+        return 0
+
+    try:
+        from tools.async_delegation import _repository
+
+        repository = _repository()
+    except Exception:
+        return 0
+
+    forwarded = 0
+    while True:
+        pending = repository.pending_steers(attempt_id)
+        if not pending:
+            break
+        mailbox_id = str(pending[0]["mailbox_id"])
+        claimed = repository.claim_steer(attempt_id, mailbox_id)
+        if claimed.get("status") != "claimed":
+            break
+
+        def _ack(outcome: str, *, _mailbox_id: str = mailbox_id) -> None:
+            repository.resolve_steer(_mailbox_id, outcome)
+
+        accepted = bool(
+            steer(
+                str(claimed.get("message") or ""),
+                mailbox_id=mailbox_id,
+                outcome_callback=_ack,
+            )
+        )
+        if not accepted:
+            repository.resolve_steer(mailbox_id, "too_late_after_completion")
+            break
+        repository.mark_steer_forwarded(mailbox_id)
+        forwarded += 1
+    return forwarded
 
 
 def interrupt_subagent(subagent_id: str, reason: str = "") -> bool:

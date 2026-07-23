@@ -301,6 +301,163 @@ class DelegationRepository:
             "attempt_number": attempt_number,
         }
 
+    def enqueue_steer(
+        self,
+        delegation_id: str,
+        logical_id: str,
+        session_key: str,
+        message: str,
+    ) -> Dict[str, Any]:
+        """Append one ordered steer to the current authorized attempt."""
+        now = time.time()
+        mailbox_id = _new_id("steer")
+        with self.write_txn() as conn:
+            attempt = conn.execute(
+                "SELECT a.attempt_id,a.run_id,a.state,a.attempt_number "
+                "FROM delegation_attempts a "
+                "JOIN delegation_logical_subagents l ON l.logical_id=a.logical_id "
+                "JOIN async_delegations d ON d.delegation_id=l.delegation_id "
+                "WHERE d.delegation_id=? AND d.origin_session=? AND l.logical_id=? "
+                "ORDER BY a.attempt_number DESC LIMIT 1",
+                (delegation_id, session_key, logical_id),
+            ).fetchone()
+            if attempt is None:
+                return {"status": "not_found"}
+            if attempt["state"] not in _ACTIVE_STATES:
+                return {
+                    "status": "already_terminal",
+                    "terminal_status": str(attempt["state"]),
+                    "attempt_id": str(attempt["attempt_id"]),
+                    "run_id": str(attempt["run_id"]),
+                }
+            sequence = int(
+                conn.execute(
+                    "SELECT COALESCE(MAX(sequence_number),0)+1 "
+                    "FROM delegation_steer_mailbox WHERE attempt_id=?",
+                    (attempt["attempt_id"],),
+                ).fetchone()[0]
+            )
+            conn.execute(
+                "INSERT INTO delegation_steer_mailbox "
+                "(mailbox_id,delegation_id,logical_id,attempt_id,sequence_number,"
+                "message,status,created_at) VALUES (?,?,?,?,?,?,'pending',?)",
+                (
+                    mailbox_id,
+                    delegation_id,
+                    logical_id,
+                    attempt["attempt_id"],
+                    sequence,
+                    message,
+                    now,
+                ),
+            )
+        return {
+            "status": "accepted",
+            "mailbox_id": mailbox_id,
+            "attempt_id": str(attempt["attempt_id"]),
+            "run_id": str(attempt["run_id"]),
+            "attempt_state": str(attempt["state"]),
+            "sequence_number": sequence,
+        }
+
+    def pending_steers(self, attempt_id: str) -> List[Dict[str, Any]]:
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                "SELECT mailbox_id,message,sequence_number FROM delegation_steer_mailbox "
+                "WHERE attempt_id=? AND status='pending' ORDER BY sequence_number",
+                (attempt_id,),
+            ).fetchall()
+            return [dict(row) for row in rows]
+        finally:
+            conn.close()
+
+    def claim_steer(self, attempt_id: str, mailbox_id: str) -> Dict[str, Any]:
+        """Claim only the oldest unresolved item for one still-current attempt."""
+        now = time.time()
+        with self.write_txn() as conn:
+            row = conn.execute(
+                "SELECT m.*,a.state FROM delegation_steer_mailbox m "
+                "JOIN delegation_attempts a ON a.attempt_id=m.attempt_id "
+                "WHERE m.mailbox_id=? AND m.attempt_id=?",
+                (mailbox_id, attempt_id),
+            ).fetchone()
+            if row is None:
+                return {"status": "not_found"}
+            if row["state"] not in _ACTIVE_STATES:
+                conn.execute(
+                    "UPDATE delegation_steer_mailbox SET status='too_late_after_completion',resolved_at=? "
+                    "WHERE mailbox_id=? AND status IN ('pending','forwarding','forwarded')",
+                    (now, mailbox_id),
+                )
+                return {"status": "too_late_after_completion"}
+            if row["status"] != "pending":
+                return {"status": str(row["status"])}
+            earlier = conn.execute(
+                "SELECT 1 FROM delegation_steer_mailbox WHERE attempt_id=? "
+                "AND sequence_number<? AND status IN ('pending','forwarding') LIMIT 1",
+                (attempt_id, row["sequence_number"]),
+            ).fetchone()
+            if earlier is not None:
+                return {"status": "blocked"}
+            changed = conn.execute(
+                "UPDATE delegation_steer_mailbox SET status='forwarding' "
+                "WHERE mailbox_id=? AND status='pending'",
+                (mailbox_id,),
+            ).rowcount
+        return (
+            {"status": "claimed", "message": str(row["message"])}
+            if changed == 1
+            else {"status": "stale"}
+        )
+
+    def mark_steer_forwarded(self, mailbox_id: str) -> Dict[str, Any]:
+        now = time.time()
+        with self.write_txn() as conn:
+            changed = conn.execute(
+                "UPDATE delegation_steer_mailbox SET status='forwarded',forwarded_at=? "
+                "WHERE mailbox_id=? AND status='forwarding'",
+                (now, mailbox_id),
+            ).rowcount
+            row = conn.execute(
+                "SELECT status FROM delegation_steer_mailbox WHERE mailbox_id=?",
+                (mailbox_id,),
+            ).fetchone()
+        return {
+            "status": "forwarded" if changed == 1 else str(row[0] if row else "not_found")
+        }
+
+    def resolve_steer(self, mailbox_id: str, outcome: str) -> Dict[str, Any]:
+        if outcome not in {
+            "injected",
+            "superseded_by_interrupt",
+            "too_late_after_completion",
+        }:
+            raise ValueError("invalid steer outcome")
+        now = time.time()
+        with self.write_txn() as conn:
+            changed = conn.execute(
+                "UPDATE delegation_steer_mailbox SET status=?,resolved_at=? "
+                "WHERE mailbox_id=? AND status IN ('pending','forwarding','forwarded')",
+                (outcome, now, mailbox_id),
+            ).rowcount
+            row = conn.execute(
+                "SELECT status FROM delegation_steer_mailbox WHERE mailbox_id=?",
+                (mailbox_id,),
+            ).fetchone()
+        return {"status": outcome if changed == 1 else str(row[0] if row else "not_found")}
+
+    def inspect_steer(self, mailbox_id: str) -> Dict[str, Any]:
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT * FROM delegation_steer_mailbox WHERE mailbox_id=?",
+                (mailbox_id,),
+            ).fetchone()
+            return {"status": "not_found"} if row is None else dict(row)
+        finally:
+            conn.close()
+
     def transition_attempt(
         self,
         attempt_id: str,
@@ -329,6 +486,17 @@ class DelegationRepository:
                 "UPDATE delegation_attempts SET state=?,metadata_json=?,\n                   started_at=COALESCE(?,started_at),completed_at=?,updated_at=?\n                   WHERE attempt_id=? AND state=?",
                 (new_state, _dump(merged), started_at, terminal_at, now, attempt_id, row[0]),
             ).rowcount
+            if changed == 1 and new_state not in _ACTIVE_STATES:
+                mailbox_outcome = (
+                    "superseded_by_interrupt"
+                    if new_state in {"interrupted", "abandoned"}
+                    else "too_late_after_completion"
+                )
+                conn.execute(
+                    "UPDATE delegation_steer_mailbox SET status=?,resolved_at=? "
+                    "WHERE attempt_id=? AND status IN ('pending','forwarding','forwarded')",
+                    (mailbox_outcome, terminal_at or now, attempt_id),
+                )
         return {"status": "updated" if changed == 1 else "stale"}
 
     def request_interrupt(self, attempt_id: str, reason: str = "") -> Dict[str, Any]:
@@ -345,6 +513,13 @@ class DelegationRepository:
                 "UPDATE delegation_attempts SET state='interrupt_requested',\n                   interrupt_reason=?,interrupt_requested_at=?,updated_at=?\n                   WHERE attempt_id=? AND state=? AND interrupt_requested_at IS NULL",
                 (reason or None, now, now, attempt_id, row[0]),
             ).rowcount
+            if changed == 1:
+                conn.execute(
+                    "UPDATE delegation_steer_mailbox "
+                    "SET status='superseded_by_interrupt',resolved_at=? "
+                    "WHERE attempt_id=? AND status='pending'",
+                    (now, attempt_id),
+                )
         return {"status": "interrupt_requested" if changed == 1 else "stale"}
 
     def take_interrupt(self, attempt_id: str) -> Dict[str, Any]:
@@ -367,6 +542,12 @@ class DelegationRepository:
                 "UPDATE delegation_attempts SET state='running',interrupt_reason=NULL,\n                   interrupt_requested_at=NULL,interrupt_taken_at=NULL,updated_at=?\n                   WHERE attempt_id=? AND state='interrupt_requested'\n                     AND interrupt_requested_at IS NOT NULL AND interrupt_taken_at IS NULL",
                 (now, attempt_id),
             ).rowcount
+            if changed == 1:
+                conn.execute(
+                    "UPDATE delegation_steer_mailbox SET status='pending',resolved_at=NULL "
+                    "WHERE attempt_id=? AND status='superseded_by_interrupt'",
+                    (attempt_id,),
+                )
         return {"status": "rolled_back" if changed == 1 else "stale"}
 
     def complete_run(self, run_id: str, event: Dict[str, Any], result: Dict[str, Any]) -> Dict[str, Any]:
@@ -399,6 +580,12 @@ class DelegationRepository:
                 conn.execute(
                     "UPDATE delegation_attempts SET state=?,completed_at=?,updated_at=?,metadata_json=?\n                       WHERE attempt_id=? AND state IN\n                         ('starting','running','finalizing','interrupt_requested')",
                     (_attempt_state(child.get("status") or event.get("status")), completed_at, completed_at, _dump(metadata), attempt[0]),
+                )
+                conn.execute(
+                    "UPDATE delegation_steer_mailbox "
+                    "SET status='too_late_after_completion',resolved_at=? "
+                    "WHERE attempt_id=? AND status IN ('pending','forwarding','forwarded')",
+                    (completed_at, attempt[0]),
                 )
         return {"status": "completed", "delegation_id": run[0], "run_id": run_id}
 
@@ -646,6 +833,32 @@ class DelegationRepository:
             " ORDER BY l.root_ordinal IS NULL,l.root_ordinal,l.created_at,l.logical_id",
             (delegation_id, run_id) if run_id else (delegation_id,),
         ).fetchall()
+        steer_rows = conn.execute(
+            "SELECT m.mailbox_id,m.logical_id,m.attempt_id,m.sequence_number,"
+            "m.status,m.created_at,m.forwarded_at,m.resolved_at "
+            "FROM delegation_steer_mailbox m "
+            "JOIN delegation_attempts a ON a.attempt_id=m.attempt_id "
+            "WHERE m.delegation_id=?" + (" AND a.run_id=?" if run_id else "") +
+            " ORDER BY m.logical_id,m.sequence_number",
+            (delegation_id, run_id) if run_id else (delegation_id,),
+        ).fetchall()
+        steers_by_child: Dict[str, List[Dict[str, Any]]] = {}
+        for steer_row in steer_rows:
+            steers_by_child.setdefault(str(steer_row["logical_id"]), []).append(
+                {
+                    key: steer_row[key]
+                    for key in (
+                        "mailbox_id",
+                        "attempt_id",
+                        "sequence_number",
+                        "status",
+                        "created_at",
+                        "forwarded_at",
+                        "resolved_at",
+                    )
+                    if steer_row[key] is not None
+                }
+            )
         children: Dict[str, Dict[str, Any]] = {}
         roots: List[str] = []
         active_states: List[str] = []
@@ -661,6 +874,7 @@ class DelegationRepository:
                 "attempt_id": attempt["attempt_id"],
                 "attempt_number": attempt["attempt_number"],
                 "run_id": attempt["run_id"],
+                "steers": steers_by_child.get(str(attempt["logical_id"]), []),
             }
             children[attempt["logical_id"]] = child
             if attempt["root_ordinal"] is not None:

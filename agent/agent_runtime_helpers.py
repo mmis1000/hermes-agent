@@ -3343,7 +3343,8 @@ def apply_pending_steer_to_tool_results(agent, messages: list, num_tool_msgs: in
     """
     if num_tool_msgs <= 0 or not messages:
         return
-    steer_text = agent._drain_pending_steer()
+    steer_envelopes = agent._drain_pending_steer_envelopes()
+    steer_text = agent._steer_envelope_text(steer_envelopes)
     if not steer_text:
         return
     # Find the last tool-role message in the recent tail. Skipping
@@ -3359,16 +3360,7 @@ def apply_pending_steer_to_tool_results(agent, messages: list, num_tool_msgs: in
         # No tool result in this batch (e.g. all skipped by interrupt);
         # put the steer back so the caller's fallback path can deliver
         # it as a normal next-turn user message.
-        _lock = getattr(agent, "_pending_steer_lock", None)
-        if _lock is not None:
-            with _lock:
-                if agent._pending_steer:
-                    agent._pending_steer = agent._pending_steer + "\n" + steer_text
-                else:
-                    agent._pending_steer = steer_text
-        else:
-            existing = getattr(agent, "_pending_steer", None)
-            agent._pending_steer = (existing + "\n" + steer_text) if existing else steer_text
+        agent._requeue_pending_steer_envelopes(steer_envelopes)
         return
     marker = format_steer_marker(steer_text)
     existing_content = messages[target_idx].get("content", "")
@@ -3384,6 +3376,7 @@ def apply_pending_steer_to_tool_results(agent, messages: list, num_tool_msgs: in
             messages[target_idx]["content"] = f"{existing_content}{marker}"
     else:
         messages[target_idx]["content"] = existing_content + marker
+    agent._ack_steer_envelopes(steer_envelopes, "injected")
     _ra().logger.info(
         "Delivered /steer to agent after tool batch (%d chars): %s",
         len(steer_text),

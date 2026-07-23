@@ -605,6 +605,7 @@ def init_agent(
     # iteration. Message-role alternation is preserved (we modify an
     # existing tool message rather than inserting a new user turn).
     agent._pending_steer: Optional[str] = None
+    agent._pending_steer_envelopes: list = []
     agent._pending_steer_lock = threading.Lock()
 
     # Concurrent-tool worker thread tracking.  `_execute_tool_calls_concurrent`

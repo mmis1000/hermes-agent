@@ -554,10 +554,29 @@ def finalize_turn(
     # (the response is still returned either way — #8049).
     if _cleanup_errors:
         result["cleanup_errors"] = _cleanup_errors
-    # If a /steer landed after the final assistant turn (no more tool
-    # batches to drain into), hand it back to the caller so it can be
-    # delivered as the next user turn instead of being silently lost.
-    _leftover_steer = agent._drain_pending_steer()
+    # If a local /steer landed after the final assistant turn, hand only
+    # untracked text back to the caller as the next user turn. Durable child
+    # mailbox envelopes have missed this attempt's last injection point and
+    # receive an explicit terminal acknowledgement instead.
+    _drain_envelopes = getattr(agent, "_drain_pending_steer_envelopes", None)
+    if callable(_drain_envelopes):
+        _leftover_envelopes = _drain_envelopes()
+        _tracked_leftovers = [
+            item for item in _leftover_envelopes if item.get("mailbox_id")
+        ]
+        _local_leftovers = [
+            item for item in _leftover_envelopes if not item.get("mailbox_id")
+        ]
+        if _tracked_leftovers:
+            agent._ack_steer_envelopes(
+                _tracked_leftovers, "too_late_after_completion"
+            )
+        _leftover_steer = agent._steer_envelope_text(_local_leftovers)
+    else:
+        # Compatibility for lightweight test/plugin agents implementing only
+        # the pre-envelope local /steer protocol.
+        _legacy_drain = getattr(agent, "_drain_pending_steer", None)
+        _leftover_steer = _legacy_drain() if callable(_legacy_drain) else None
     if _leftover_steer:
         result["pending_steer"] = _leftover_steer
     agent._response_was_previewed = False
