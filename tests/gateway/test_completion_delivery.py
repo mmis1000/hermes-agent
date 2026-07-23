@@ -121,10 +121,30 @@ def test_duplicate_async_queue_replay_injects_once(monkeypatch, isolated_registr
     adapter.handle_message.assert_awaited_once()
 
 
+def test_distinct_runs_of_one_delegation_are_delivered_once_each():
+    adapter = SimpleNamespace(handle_message=AdmittingHandler())
+    runner = _runner(adapter)
+    first = _async_event("deleg_resumed") | {"run_id": "run-1"}
+    replay = dict(first)
+    resumed = _async_event("deleg_resumed") | {"run_id": "run-2"}
+
+    async def _exercise():
+        return (
+            await runner._deliver_completion_notification("first", first),
+            await runner._deliver_completion_notification("replay", replay),
+            await runner._deliver_completion_notification("resumed", resumed),
+        )
+
+    assert asyncio.run(_exercise()) == (True, None, True)
+    assert adapter.handle_message.await_count == 2
+
+
+
+
 def test_gateway_idle_watcher_restores_only_gateway_routable_wait_holds(
     monkeypatch, isolated_registry,
 ):
-    adapter = SimpleNamespace(handle_message=AsyncMock())
+    adapter = SimpleNamespace(handle_message=AdmittingHandler())
     runner = _runner(adapter)
     _stop_after_sleeps(monkeypatch, runner, count=2)
 
@@ -219,7 +239,7 @@ def test_failed_async_injection_is_retried_and_only_success_is_acked(
     monkeypatch.setattr(
         async_delegation,
         "complete_completion_delivery",
-        lambda delegation_id, _claim_id: acknowledgements.append(delegation_id) or True,
+        lambda delegation_id, _claim_id, **scope: acknowledgements.append(delegation_id) or True,
         raising=False,
     )
 
@@ -925,7 +945,8 @@ def test_sibling_claimed_by_other_consumer_is_not_double_delivered(
     assert "Result for deleg_owned_0" in delivered.text
     assert "Result for deleg_owned_1" not in delivered.text
     row = async_delegation.get_durable_delegation(events[1]["delegation_id"])
-    assert row["delivery_state"] == "pending"
+    assert row["delivery_state"] == "delivering"
+    assert row["delivery_claim"] == "other-consumer:claim"
 
 
 @pytest.mark.parametrize("unavailable", ["raw_adapter", "transport", "owner_db", "api_db"])

@@ -489,12 +489,13 @@ The parent agent orchestrates its own running children with the same `delegate_t
 {"action": "stop",  "subagent_id": "sa-0-1a2b3c4d"}
 {"action": "wait", "delegation_id": "dlg_...", "timeout_seconds": 30}
 {"action": "status", "delegation_id": "dlg_..."}
+{"action": "resume", "delegation_id": "dlg_...", "subagent_id": "sa-0-1a2b3c4d", "message": "continue from the last attempt"}
 ```
 
 - **`list`** returns the conversation's live children: `subagent_id`, goal, status, `running_seconds`, `accepting_steer`, and the live transcript path. Ids also come back in the spawn dispatch response as `subagent_ids`. Without a handle it also includes durable records from this session.
 - **`steer`** queues a course correction into a running child without stopping it (delivery semantics below).
 - **`stop`** ends a live child early at its next iteration boundary; the partial result still re-enters the conversation as a normal completion message. With a `delegation_id`, `stop` aliases `interrupt`.
-- **`status` / `tail` / `wait` / `interrupt` / `abandon`** operate on the handle returned by spawn. Use one bounded `wait` only when the parent must synchronize; prefer async delivery otherwise.
+- **`status` / `tail` / `wait` / `resume` / `interrupt` / `abandon`** operate on the handle returned by spawn. Use one bounded `wait` only when the parent must synchronize; prefer async delivery otherwise.
 
 Control actions run synchronously in-turn (never backgrounded), are scoped to the caller's own spawn tree — a conversation can never see or control another session's children — and never consume the per-turn subagent spawn cap, so `stop` keeps working even after the cap is hit.
 
