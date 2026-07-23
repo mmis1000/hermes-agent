@@ -1172,6 +1172,10 @@ def handle_function_call(
                 tool_request_middleware_trace=list(_tool_middleware_trace),
                 enabled_toolsets=enabled_toolsets,
                 disabled_toolsets=disabled_toolsets,
+                # Stateful agent tools (notably delegation resume) need the
+                # live owning agent even when invoked through Tool Search's
+                # deferred ``tool_call`` bridge.
+                parent_agent=parent_agent,
             )
 
     _tool_original_args = dict(function_args)
