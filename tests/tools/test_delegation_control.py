@@ -368,6 +368,47 @@ def test_claimed_steer_reports_honest_race_outcome(monkeypatch, winner, expected
     assert responses[0]["steer_status"] == expected
 
 
+def test_compressed_parent_session_retains_control_without_root_scope_leak():
+    from hermes_state import SessionDB
+    from tools.delegation_control import delegation_control
+
+    session_db = SessionDB()
+    session_db.create_session("owner", source="discord")
+    session_db.end_session("owner", "compression")
+    session_db.create_session(
+        "owner-tip", source="discord", parent_session_id="owner"
+    )
+    session_db.create_session(
+        "owner-branch",
+        source="discord",
+        parent_session_id="owner",
+        model_config={"_branched_from": "owner"},
+    )
+    dispatched = _dispatch(lambda: {"status": "completed", "summary": "ok"})
+    delegation_id = dispatched["delegation_id"]
+    _wait_terminal(delegation_id)
+
+    status = json.loads(
+        delegation_control(
+            action="status", delegation_id=delegation_id, session_key="owner-tip"
+        )
+    )
+    listed = json.loads(delegation_control(action="list", session_key="owner-tip"))
+    branch = json.loads(
+        delegation_control(
+            action="status",
+            delegation_id=delegation_id,
+            session_key="owner-branch",
+        )
+    )
+
+    assert status["delegation_id"] == delegation_id
+    assert [item["delegation_id"] for item in listed["delegations"]] == [
+        delegation_id
+    ]
+    assert branch["status"] == "not_found"
+
+
 def test_list_and_status_hide_foreign_session_like_unknown():
     release = threading.Event()
     dispatched = _dispatch(

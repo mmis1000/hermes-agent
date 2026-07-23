@@ -56,6 +56,19 @@ def _resolve_session_key(session_key: Optional[str]) -> str:
     return get_current_session_key(default="")
 
 
+def _control_session_candidates(session_key: str) -> List[str]:
+    """Exact controller plus proven compression ancestors, fail-closed."""
+    if not session_key:
+        return [session_key]
+    try:
+        from hermes_state import SessionDB
+
+        candidates = SessionDB().control_session_candidates(session_key)
+    except Exception:
+        candidates = []
+    return candidates or [session_key]
+
+
 def _redact_reason(reason: Optional[str]) -> str:
     text = str(reason or "")
     return _delegate.redact_observable_text(text) if text else ""
@@ -310,12 +323,15 @@ def delegation_control(
     if error:
         return _invalid(action, error)
 
-    origin = _resolve_session_key(session_key)
+    caller_session = _resolve_session_key(session_key)
+    owner_candidates = _control_session_candidates(caller_session)
+    origin = caller_session
     audit_reason = _redact_reason(reason)
 
     if action == "list":
         delegations = []
-        for record in _async.list_async_delegations(session_key=origin):
+        for record in _async.list_durable_delegations(session_keys=owner_candidates):
+            record_origin = str(record.get("session_key") or "")
             delegations.append(
                 {
                     "delegation_id": record.get("delegation_id"),
@@ -326,7 +342,7 @@ def delegation_control(
                     "dispatched_at": record.get("dispatched_at"),
                     "completed_at": record.get("completed_at"),
                     "subagents": _children_for_record(
-                        record, session_key=origin, include_tail=False
+                        record, session_key=record_origin, include_tail=False
                     ),
                 }
             )
@@ -337,7 +353,12 @@ def delegation_control(
 
     target = str(delegation_id or "").strip()
     child_target = subagent_id.strip() if isinstance(subagent_id, str) else None
-    record = _async.get_async_delegation(target, session_key=origin)
+    record = None
+    for owner_candidate in owner_candidates:
+        record = _async.get_async_delegation(target, session_key=owner_candidate)
+        if record is not None:
+            origin = owner_candidate
+            break
     if record is None:
         return _not_found(action, target)
     if child_target and not _async.delegation_contains_subagent(

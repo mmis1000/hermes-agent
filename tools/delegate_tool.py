@@ -27,6 +27,7 @@ logger = logging.getLogger(__name__)
 import os
 import threading
 import time
+import uuid
 from concurrent.futures import (
     ThreadPoolExecutor,
     TimeoutError as FuturesTimeoutError,
@@ -1390,6 +1391,37 @@ def _json_safe_copy(value: Any) -> Any:
         return json.loads(json.dumps(value))
     except (TypeError, ValueError, OverflowError):
         return None
+
+
+def prepare_resumed_child_session(bundle: Dict[str, Any]) -> Dict[str, str]:
+    """Validate a hydration bundle and allocate a distinct child segment.
+
+    This deliberately does not create the SQLite row. The standard AIAgent
+    persistence path creates/enriches it with the effective current runtime
+    configuration before the first resumed turn is stored.
+    """
+    if not isinstance(bundle, dict):
+        raise ValueError("missing subagent resume bundle")
+    prior = bundle.get("prior_child_session_id")
+    owner = bundle.get("parent_session_id")
+    history = bundle.get("history")
+    metadata = bundle.get("reconstruction_metadata")
+    if (
+        not isinstance(prior, str)
+        or not prior
+        or not isinstance(owner, str)
+        or not owner
+        or not isinstance(history, list)
+        or not history
+        or not isinstance(metadata, dict)
+        or metadata.get("parent_session_id") != owner
+    ):
+        raise ValueError("incomplete subagent resume bundle")
+    return {
+        "session_id": f"{time.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}",
+        "parent_session_id": prior,
+        "delegate_from": owner,
+    }
 
 
 def _safe_fallback_routes(value: Any) -> List[Dict[str, str]]:

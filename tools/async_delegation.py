@@ -290,6 +290,65 @@ def list_durable_delegations(
     return _repository().list_snapshots(session_keys=session_keys, limit=limit)
 
 
+_RESUME_METADATA_FIELDS = frozenset(
+    {
+        "child_session_id",
+        "parent_session_id",
+        "parent_logical_id",
+        "depth",
+        "role",
+        "model",
+        "provider",
+        "api_mode",
+        "reasoning_config",
+        "enabled_toolsets",
+        "disabled_toolsets",
+        "workdir",
+        "max_iterations",
+        "fallback_routes",
+        "provider_routing",
+    }
+)
+
+
+def load_subagent_resume_bundle(
+    delegation_id: str,
+    logical_id: str,
+    *,
+    session_key: str,
+) -> Dict[str, Any]:
+    """Load one authorized child's validated provider-facing replay bundle."""
+    snapshot = get_async_delegation(delegation_id, session_key=session_key)
+    if snapshot is None:
+        return {"status": "not_found"}
+    child = (snapshot.get("children") or {}).get(logical_id)
+    if not isinstance(child, dict):
+        return {"status": "not_found"}
+    metadata = {
+        key: child.get(key)
+        for key in _RESUME_METADATA_FIELDS
+        if key in child
+    }
+    child_session_id = metadata.get("child_session_id")
+    try:
+        from hermes_state import SessionDB
+
+        bundle = SessionDB().get_subagent_resume_bundle(
+            child_session_id, metadata
+        )
+    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+        return {"status": "resume_unavailable", "reason": str(exc)}
+    return {
+        "status": "ready",
+        "delegation_id": delegation_id,
+        "subagent_id": logical_id,
+        "attempt_id": child.get("attempt_id"),
+        "attempt_number": child.get("attempt_number"),
+        "run_id": child.get("run_id"),
+        "bundle": bundle,
+    }
+
+
 def mark_completion_delivered(delegation_id: str) -> bool:
     return _changed(_repository().acknowledge_pending(delegation_id), "delivered")
 
