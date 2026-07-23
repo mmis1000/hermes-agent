@@ -2,8 +2,10 @@
 
 Local observability plugin for Hermes token usage. When enabled, it listens to the per-request `post_api_request` hook and writes:
 
-- `~/.hermes/reports/token_usage/events.jsonl` — one row per model request
-- `~/.hermes/reports/token_usage/latest.md` — rolling Markdown summary
+- `$HERMES_HOME/reports/token_usage/events.jsonl` — one row per model request
+- `$HERMES_HOME/reports/token_usage/latest.md` — rolling Markdown summary
+
+`$HERMES_HOME` defaults to `~/.hermes` and follows the active profile.
 
 The report includes per-model reasoning-token statistics and exact-boundary counts for `516`, `1034`, and `1552` by default, useful for investigating Codex reasoning-token clustering.
 
@@ -20,3 +22,5 @@ Environment knobs:
 - `HERMES_TOKEN_USAGE_REPORT_MAX_EVENTS` — number of recent JSONL rows scanned for `latest.md` (default `20000`)
 - `HERMES_TOKEN_USAGE_REPORT_RECENT_ROWS` — recent-events rows in the report (default `25`)
 - `HERMES_TOKEN_USAGE_REPORT_TARGETS` — comma-separated exact reasoning-token targets (default `516,1034,1552`)
+
+The target values are diagnostic exact-match counters, not token limits.
