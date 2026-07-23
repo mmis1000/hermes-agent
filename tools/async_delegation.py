@@ -294,8 +294,10 @@ def mark_completion_delivered(delegation_id: str) -> bool:
     return _changed(_repository().acknowledge_pending(delegation_id), "delivered")
 
 
-def claim_completion_delivery(delegation_id: str, claim_id: str) -> bool:
-    inspected = _repository().inspect_delivery(delegation_id)
+def claim_completion_delivery(
+    delegation_id: str, claim_id: str, *, run_id: Optional[str] = None
+) -> bool:
+    inspected = _repository().inspect_delivery(delegation_id, run_id)
     if inspected.get("status") == "not_found":
         return True
     if inspected.get("status") != "found":
@@ -303,7 +305,7 @@ def claim_completion_delivery(delegation_id: str, claim_id: str) -> bool:
     return _changed(
         _repository().claim_run_delivery(
             delegation_id,
-            None,
+            run_id,
             claim_id,
             wait_stale_seconds=_WAIT_HOLD_STALE_SECONDS,
         ),
@@ -330,12 +332,22 @@ def claim_event_delivery(evt: Dict[str, Any], consumer: str) -> Optional[str]:
     if not delegation_id:
         return ""
     claim_id = f"{consumer}:{os.getpid()}:{uuid.uuid4().hex}"
-    return claim_id if claim_completion_delivery(delegation_id, claim_id) else None
+    run_id = evt.get("run_id")
+    return claim_id if claim_completion_delivery(
+        delegation_id,
+        claim_id,
+        run_id=str(run_id) if run_id else None,
+    ) else None
 
 
-def claim_async_delivery(delegation_id: str, *, managed: bool = False) -> Dict[str, Any]:
+def claim_async_delivery(
+    delegation_id: str,
+    *,
+    managed: bool = False,
+    run_id: Optional[str] = None,
+) -> Dict[str, Any]:
     recover_stale_wait_holds(delegation_id)
-    inspected = _repository().inspect_delivery(delegation_id)
+    inspected = _repository().inspect_delivery(delegation_id, run_id)
     status = inspected.get("status")
     if status == "not_found":
         return {"status": "stale" if managed else "legacy"}
@@ -349,15 +361,17 @@ def claim_async_delivery(delegation_id: str, *, managed: bool = False) -> Dict[s
     if disposition in _TERMINAL_DELIVERY_STATES:
         return {"status": "stale"}
     token = f"auto:{os.getpid()}:{uuid.uuid4().hex}"
-    outcome = _repository().claim_run_delivery(delegation_id, None, token)
+    outcome = _repository().claim_run_delivery(delegation_id, run_id, token)
     if outcome.get("status") == "claimed":
         _notify_state_change()
         return {"status": "claimed", "token": token}
     return {"status": "held" if outcome.get("status") == "held" else "stale"}
 
 
-def inspect_async_delivery_claim(delegation_id: str, token: str) -> str:
-    inspected = _repository().inspect_delivery(delegation_id)
+def inspect_async_delivery_claim(
+    delegation_id: str, token: str, *, run_id: Optional[str] = None
+) -> str:
+    inspected = _repository().inspect_delivery(delegation_id, run_id)
     if inspected.get("status") != "found":
         return "not_found" if inspected.get("status") == "not_found" else "stale"
     if inspected.get("delivery_state") == "delivering" and inspected.get("delivery_claim") == token:
@@ -366,9 +380,13 @@ def inspect_async_delivery_claim(delegation_id: str, token: str) -> str:
 
 
 def _delivery_claim_action(
-    delegation_id: str, claim_id: str, *, delivered: bool
+    delegation_id: str,
+    claim_id: str,
+    *,
+    delivered: bool,
+    run_id: Optional[str] = None,
 ) -> bool:
-    inspected = _repository().inspect_delivery(delegation_id)
+    inspected = _repository().inspect_delivery(delegation_id, run_id)
     if inspected.get("status") != "found":
         return False
     run_id = str(inspected["run_id"])
@@ -388,8 +406,16 @@ def complete_completion_delivery(delegation_id: str, claim_id: str) -> bool:
     return _delivery_claim_action(delegation_id, claim_id, delivered=True)
 
 
-def finish_async_delivery(delegation_id: str, token: str, *, delivered: bool) -> bool:
-    return _delivery_claim_action(delegation_id, token, delivered=delivered)
+def finish_async_delivery(
+    delegation_id: str,
+    token: str,
+    *,
+    delivered: bool,
+    run_id: Optional[str] = None,
+) -> bool:
+    return _delivery_claim_action(
+        delegation_id, token, delivered=delivered, run_id=run_id
+    )
 
 
 def complete_event_delivery(evt: Dict[str, Any], claim_id: str) -> bool:
@@ -399,7 +425,13 @@ def complete_event_delivery(evt: Dict[str, Any], claim_id: str) -> bool:
         from tools.process_registry import commit_notification_delivery, process_registry
 
         return commit_notification_delivery(evt, process_registry.completion_queue)
-    return complete_completion_delivery(str(evt.get("delegation_id") or ""), claim_id)
+    run_id = evt.get("run_id")
+    return _delivery_claim_action(
+        str(evt.get("delegation_id") or ""),
+        claim_id,
+        delivered=True,
+        run_id=str(run_id) if run_id else None,
+    )
 
 
 def release_event_delivery(evt: Dict[str, Any], claim_id: str) -> None:
@@ -410,7 +442,13 @@ def release_event_delivery(evt: Dict[str, Any], claim_id: str) -> None:
 
         requeue_notification_delivery(evt, process_registry.completion_queue)
         return
-    release_completion_delivery(str(evt.get("delegation_id") or ""), claim_id)
+    run_id = evt.get("run_id")
+    _delivery_claim_action(
+        str(evt.get("delegation_id") or ""),
+        claim_id,
+        delivered=False,
+        run_id=str(run_id) if run_id else None,
+    )
 
 
 def hold_completion_for_wait(

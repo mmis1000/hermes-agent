@@ -16,7 +16,12 @@ import time
 import pytest
 
 from tools import async_delegation as ad
-from tools.process_registry import process_registry, format_process_notification
+from tools.process_registry import (
+    finish_notification_delivery,
+    format_process_notification,
+    prepare_notification_delivery,
+    process_registry,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -392,7 +397,17 @@ def test_recovery_completes_exact_old_run_without_mutating_live_new_run(tmp_path
     assert ad.restore_undelivered_completions(restored) == 1
     event = restored.get_nowait()
     assert (event["run_id"], event["status"]) == (initial["run_id"], "unknown")
+    assert prepare_notification_delivery(event) == "deliver"
+    assert ad.inspect_async_delivery_claim(
+        "deleg_abandoned",
+        event["_async_delivery_claim_token"],
+        run_id=initial["run_id"],
+    ) == "current"
+    assert finish_notification_delivery(event, delivered=True)
     assert repository.inspect_delivery("deleg_abandoned", initial["run_id"])["completed_at"]
+    assert repository.inspect_delivery(
+        "deleg_abandoned", initial["run_id"]
+    )["delivery_state"] == "delivered"
     live = repository.inspect_delivery("deleg_abandoned", resumed["run_id"])
     assert live["completed_at"] is None
     assert repository.snapshot("deleg_abandoned")["children"]["sa-resumed"]["status"] == "starting"

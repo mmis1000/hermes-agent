@@ -99,7 +99,9 @@ def prepare_notification_delivery(event: Dict[str, Any]) -> str:
             from tools.async_delegation import inspect_async_delivery_claim
 
             status = inspect_async_delivery_claim(
-                str(event.get("delegation_id") or ""), str(token)
+                str(event.get("delegation_id") or ""),
+                str(token),
+                run_id=str(event["run_id"]) if event.get("run_id") else None,
             )
         except Exception:
             logger.debug("accepted delivery claim inspection failed", exc_info=True)
@@ -117,7 +119,9 @@ def prepare_notification_delivery(event: Dict[str, Any]) -> str:
             from tools.async_delegation import inspect_async_delivery_claim
 
             status = inspect_async_delivery_claim(
-                str(event.get("delegation_id") or ""), str(token)
+                str(event.get("delegation_id") or ""),
+                str(token),
+                run_id=str(event["run_id"]) if event.get("run_id") else None,
             )
         except Exception:
             logger.debug("retained async delivery claim inspection failed", exc_info=True)
@@ -136,6 +140,7 @@ def prepare_notification_delivery(event: Dict[str, Any]) -> str:
         claim = claim_async_delivery(
             str(event.get("delegation_id") or ""),
             managed=bool(event.get("delivery_managed", False)),
+            run_id=str(event["run_id"]) if event.get("run_id") else None,
         )
     except Exception:
         logger.debug("async delivery claim failed", exc_info=True)
@@ -167,6 +172,7 @@ def finish_notification_delivery(event: Dict[str, Any], *, delivered: bool) -> b
             str(event.get("delegation_id") or ""),
             str(token),
             delivered=effective_delivered,
+            run_id=str(event["run_id"]) if event.get("run_id") else None,
         )
     except Exception:
         logger.debug("async delivery finish failed", exc_info=True)
