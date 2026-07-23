@@ -974,7 +974,61 @@ CREATE TABLE IF NOT EXISTS async_delegations (
     owner_started_at INTEGER,
     task_json TEXT,
     delivery_claim TEXT,
-    delivery_claimed_at REAL
+    delivery_claimed_at REAL,
+    root_subagent_ids_json TEXT NOT NULL DEFAULT '[]',
+    children_json TEXT NOT NULL DEFAULT '{}',
+    interrupt_requests_json TEXT NOT NULL DEFAULT '{}',
+    interrupt_reason TEXT,
+    abandon_reason TEXT,
+    lifecycle_version INTEGER NOT NULL DEFAULT 1
+);
+
+CREATE TABLE IF NOT EXISTS delegation_logical_subagents (
+    logical_id TEXT PRIMARY KEY,
+    delegation_id TEXT NOT NULL REFERENCES async_delegations(delegation_id) ON DELETE CASCADE,
+    parent_logical_id TEXT REFERENCES delegation_logical_subagents(logical_id),
+    root_ordinal INTEGER,
+    spec_json TEXT NOT NULL DEFAULT '{}',
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    UNIQUE (delegation_id, root_ordinal)
+);
+
+CREATE TABLE IF NOT EXISTS delegation_runs (
+    run_id TEXT PRIMARY KEY,
+    delegation_id TEXT NOT NULL REFERENCES async_delegations(delegation_id) ON DELETE CASCADE,
+    run_number INTEGER NOT NULL,
+    kind TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    completed_at REAL,
+    event_json TEXT,
+    result_json TEXT,
+    delivery_state TEXT NOT NULL DEFAULT 'pending',
+    delivery_claim TEXT,
+    delivery_claimed_at REAL,
+    delivery_attempts INTEGER NOT NULL DEFAULT 0,
+    delivered_at REAL,
+    UNIQUE (delegation_id, run_number)
+);
+
+CREATE TABLE IF NOT EXISTS delegation_attempts (
+    attempt_id TEXT PRIMARY KEY,
+    logical_id TEXT NOT NULL REFERENCES delegation_logical_subagents(logical_id) ON DELETE CASCADE,
+    run_id TEXT NOT NULL REFERENCES delegation_runs(run_id) ON DELETE CASCADE,
+    attempt_number INTEGER NOT NULL,
+    physical_worker_id TEXT,
+    state TEXT NOT NULL,
+    owner_pid INTEGER,
+    owner_started_at INTEGER,
+    created_at REAL NOT NULL,
+    started_at REAL,
+    completed_at REAL,
+    updated_at REAL NOT NULL,
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    interrupt_reason TEXT,
+    interrupt_requested_at REAL,
+    interrupt_taken_at REAL,
+    UNIQUE (logical_id, attempt_number)
 );
 
 CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);
@@ -1004,7 +1058,103 @@ CREATE INDEX IF NOT EXISTS idx_sessions_gateway_peer
     ON sessions(source, user_id, chat_id, chat_type, thread_id, started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_sessions_handoff_state
     ON sessions(handoff_state, started_at);
+CREATE INDEX IF NOT EXISTS idx_async_delegations_owner_updated
+    ON async_delegations(origin_session, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_delegation_logical_container
+    ON delegation_logical_subagents(delegation_id, root_ordinal);
+CREATE INDEX IF NOT EXISTS idx_delegation_attempts_run
+    ON delegation_attempts(run_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_delegation_one_active_attempt
+    ON delegation_attempts(logical_id)
+    WHERE state IN ('starting','running','finalizing','interrupt_requested');
+CREATE INDEX IF NOT EXISTS idx_delegation_runs_delivery
+    ON delegation_runs(delivery_state, completed_at);
 """
+
+
+def _execute_schema_script(conn: sqlite3.Connection, script: str) -> None:
+    """Execute a DDL script without ``executescript``'s implicit commit."""
+    statement = ""
+    for line in script.splitlines():
+        statement += line + "\n"
+        if sqlite3.complete_statement(statement):
+            if statement.strip():
+                conn.execute(statement)
+            statement = ""
+    if statement.strip():  # pragma: no cover - constants are complete scripts
+        raise sqlite3.OperationalError("incomplete state schema statement")
+
+
+def _parse_schema_columns(schema_sql: str) -> Dict[str, Dict[str, str]]:
+    """Let SQLite derive ADD COLUMN expressions from the declarative schema."""
+    ref = sqlite3.connect(":memory:")
+    try:
+        ref.executescript(schema_sql)
+        expected: Dict[str, Dict[str, str]] = {}
+        tables = ref.execute(
+            "SELECT name FROM sqlite_master "
+            "WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+        ).fetchall()
+        for (table_name,) in tables:
+            columns: Dict[str, str] = {}
+            for row in ref.execute(f'PRAGMA table_info("{table_name}")'):
+                parts = [row[2]] if row[2] else []
+                if row[3] and not row[5]:
+                    parts.append("NOT NULL")
+                if row[4] is not None:
+                    parts.append(f"DEFAULT {row[4]}")
+                columns[row[1]] = " ".join(parts)
+            expected[table_name] = columns
+        return expected
+    finally:
+        ref.close()
+
+
+_EXPECTED_STATE_COLUMNS: Optional[Dict[str, Dict[str, str]]] = None
+_EXPECTED_STATE_COLUMNS_LOCK = threading.Lock()
+
+
+def _reconcile_state_columns(conn: sqlite3.Connection) -> None:
+    global _EXPECTED_STATE_COLUMNS
+    if _EXPECTED_STATE_COLUMNS is None:
+        with _EXPECTED_STATE_COLUMNS_LOCK:
+            if _EXPECTED_STATE_COLUMNS is None:
+                _EXPECTED_STATE_COLUMNS = _parse_schema_columns(SCHEMA_SQL)
+    for table_name, declared in (_EXPECTED_STATE_COLUMNS or {}).items():
+        live = {row[1] for row in conn.execute(f'PRAGMA table_info("{table_name}")')}
+        for column_name, column_type in declared.items():
+            if column_name not in live:
+                safe = column_name.replace('"', '""')
+                conn.execute(
+                    f'ALTER TABLE "{table_name}" ADD COLUMN "{safe}" {column_type}'
+                )
+
+
+def ensure_state_schema(conn: sqlite3.Connection) -> None:
+    """Reconcile the declarative state schema in one cross-process transaction.
+
+    The caller keeps ownership of an existing transaction.  Otherwise this
+    function acquires the SQLite write lock before introspection and returns
+    with no transaction open.
+    """
+    owns_transaction = not conn.in_transaction
+    if owns_transaction:
+        conn.execute("BEGIN IMMEDIATE")
+    try:
+        _execute_schema_script(conn, SCHEMA_SQL)
+        _reconcile_state_columns(conn)
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_messages_platform_msg_id "
+            "ON messages(session_id, platform_message_id) "
+            "WHERE platform_message_id IS NOT NULL"
+        )
+        _execute_schema_script(conn, DEFERRED_INDEX_SQL)
+        if owns_transaction:
+            conn.commit()
+    except BaseException:
+        if owns_transaction:
+            conn.rollback()
+        raise
 
 FTS_SQL = """
 CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
@@ -1543,90 +1693,11 @@ class SessionDB:
 
     @staticmethod
     def _parse_schema_columns(schema_sql: str) -> Dict[str, Dict[str, str]]:
-        """Extract expected columns per table from SCHEMA_SQL.
-
-        Uses an in-memory SQLite database to parse the SQL — SQLite itself
-        handles all syntax (DEFAULT expressions with commas, inline
-        REFERENCES, CHECK constraints, etc.) so there are zero regex
-        edge cases.  The in-memory DB is opened, the schema DDL is
-        executed, and PRAGMA table_info extracts the column metadata.
-
-        Adding a column to SCHEMA_SQL is all that's needed; the
-        reconciliation loop picks it up automatically.
-        """
-        ref = sqlite3.connect(":memory:")
-        try:
-            ref.executescript(schema_sql)
-            table_columns: Dict[str, Dict[str, str]] = {}
-            for (tbl,) in ref.execute(
-                "SELECT name FROM sqlite_master "
-                "WHERE type='table' AND name NOT LIKE 'sqlite_%'"
-            ).fetchall():
-                cols: Dict[str, str] = {}
-                for row in ref.execute(
-                    f'PRAGMA table_info("{tbl}")'
-                ).fetchall():
-                    # row: (cid, name, type, notnull, dflt_value, pk)
-                    col_name = row[1]
-                    col_type = row[2] or ""
-                    notnull = row[3]
-                    default = row[4]
-                    pk = row[5]
-                    # Reconstruct the type expression for ALTER TABLE ADD COLUMN
-                    parts = [col_type] if col_type else []
-                    if notnull and not pk:
-                        parts.append("NOT NULL")
-                    if default is not None:
-                        parts.append(f"DEFAULT {default}")
-                    cols[col_name] = " ".join(parts)
-                table_columns[tbl] = cols
-            return table_columns
-        finally:
-            ref.close()
+        return _parse_schema_columns(schema_sql)
 
     def _reconcile_columns(self, cursor: sqlite3.Cursor) -> None:
-        """Ensure live tables have every column declared in SCHEMA_SQL.
-
-        Follows the Beets/sqlite-utils pattern: the CREATE TABLE definition
-        in SCHEMA_SQL is the single source of truth for the desired schema.
-        On every startup this method diffs the live columns (via PRAGMA
-        table_info) against the declared columns, and ADDs any that are
-        missing.
-
-        This makes column additions a declarative operation — just add
-        the column to SCHEMA_SQL and it appears on the next startup.
-        Version-gated migration blocks are no longer needed for ADD COLUMN.
-        """
-        expected = self._parse_schema_columns(SCHEMA_SQL)
-        for table_name, declared_cols in expected.items():
-            # Get current columns from the live table
-            try:
-                rows = cursor.execute(
-                    f'PRAGMA table_info("{table_name}")'
-                ).fetchall()
-            except sqlite3.OperationalError:
-                continue  # Table doesn't exist yet (shouldn't happen after executescript)
-            live_cols = set()
-            for row in rows:
-                # PRAGMA table_info returns (cid, name, type, notnull, dflt_value, pk)
-                name = row[1] if isinstance(row, (tuple, list)) else row["name"]
-                live_cols.add(name)
-
-            for col_name, col_type in declared_cols.items():
-                if col_name not in live_cols:
-                    safe_name = col_name.replace('"', '""')
-                    try:
-                        cursor.execute(
-                            f'ALTER TABLE "{table_name}" ADD COLUMN "{safe_name}" {col_type}'
-                        )
-                    except sqlite3.OperationalError as exc:
-                        # Expected: "duplicate column name" from a race or
-                        # re-run.  Unexpected: "Cannot add a NOT NULL column
-                        # with default value NULL" from a schema mistake.
-                        # Log at DEBUG so it's visible in agent.log.
-                        logger.debug(
-                            "reconcile %s.%s: %s", table_name, col_name, exc,
-                        )
+        assert self._conn is not None
+        _reconcile_state_columns(self._conn)
 
     def _init_schema(self):
         """Create tables and FTS if they don't exist, reconcile columns.
@@ -1641,33 +1712,9 @@ class SessionDB:
         The schema_version table is retained for future data migrations
         (transforming existing rows) which cannot be handled declaratively.
         """
+        assert self._conn is not None
+        ensure_state_schema(self._conn)
         cursor = self._conn.cursor()
-
-        cursor.executescript(SCHEMA_SQL)
-
-        # ── Declarative column reconciliation ──────────────────────────
-        # Diff live tables against SCHEMA_SQL and ADD any missing columns.
-        # This is idempotent and self-healing: even if a version-gated
-        # migration was skipped (e.g. due to version renumbering), the
-        # column gets created here.
-        self._reconcile_columns(cursor)
-
-        # Indexes that reference reconciler-added columns must be created
-        # AFTER _reconcile_columns runs — declaring them in SCHEMA_SQL
-        # makes the initial executescript fail on legacy DBs (the index's
-        # WHERE clause references a column that doesn't exist yet).
-        try:
-            cursor.execute(
-                "CREATE INDEX IF NOT EXISTS idx_messages_platform_msg_id "
-                "ON messages(session_id, platform_message_id) "
-                "WHERE platform_message_id IS NOT NULL"
-            )
-        except sqlite3.OperationalError as exc:
-            logger.debug("idx_messages_platform_msg_id create skipped: %s", exc)
-
-        # Deferred indexes that reference the reconciler-added ``active``
-        # column (idx_messages_session_active) — same ordering constraint.
-        cursor.executescript(DEFERRED_INDEX_SQL)
 
         # Heal NULL ``active`` rows unconditionally on every startup.
         # On real-world DBs the reconciler-added ``active`` column can lack

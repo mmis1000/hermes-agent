@@ -290,16 +290,22 @@ def test_run_delivery_is_exact_and_omitted_run_fails_ambiguous(repo):
 
 
 def test_retention_protects_active_attempts_and_nonterminal_delivery(repo):
-    active = repo.register_initial_dispatch(_record("deleg-active", dispatched_at=1.0))
-    pending = repo.register_initial_dispatch(_record("deleg-pending", dispatched_at=2.0))
+    active = repo.register_initial_dispatch(
+        _record("deleg-active", ["sa-active"], dispatched_at=1.0)
+    )
+    pending = repo.register_initial_dispatch(
+        _record("deleg-pending", ["sa-pending"], dispatched_at=2.0)
+    )
     repo.complete_run(pending["run_id"], {"status": "completed"}, {"summary": "keep"})
-    prune = repo.register_initial_dispatch(_record("deleg-prune", dispatched_at=3.0))
+    prune = repo.register_initial_dispatch(
+        _record("deleg-prune", ["sa-prune"], dispatched_at=3.0)
+    )
     repo.complete_run(prune["run_id"], {"status": "completed"}, {"summary": "drop"})
     claimed = repo.claim_run_delivery("deleg-prune", prune["run_id"], "claim")
     assert claimed["status"] == "claimed"
     repo.commit_run_delivery(prune["run_id"], "claim")
 
-    outcome = repo.prune(cutoff=100.0, max_terminal=0)
+    outcome = repo.prune(cutoff=time.time() + 100.0, max_terminal=0)
     assert outcome["deleted"] == 1
     assert repo.snapshot("deleg-active") is not None
     assert repo.snapshot("deleg-pending") is not None
