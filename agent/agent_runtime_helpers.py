@@ -2356,6 +2356,21 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
     if not isinstance(function_args, dict):
         function_args = {}
 
+    # Keep a process-local, weak session binding for stateful tools. Some
+    # gateway adapters invoke registry handlers without preserving the optional
+    # ``parent_agent`` keyword; durable ownership is still checked by the tool
+    # before this binding may be used.
+    try:
+        from tools.approval import get_current_session_key
+        from tools.live_agent_registry import register_live_agent
+
+        register_live_agent(
+            agent,
+            session_keys=(get_current_session_key(default=""), effective_task_id),
+        )
+    except Exception:
+        logger.debug("Could not register live agent context", exc_info=True)
+
     _tool_middleware_trace = list(tool_request_middleware_trace or [])
     try:
         from hermes_cli.middleware import apply_tool_request_middleware
