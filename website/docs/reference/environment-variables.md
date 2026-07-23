@@ -217,6 +217,20 @@ Environment variables for the bundled [`observability/langfuse`](/user-guide/fea
 | `HERMES_LANGFUSE_DEBUG` | `true` enables verbose plugin logging to `agent.log` |
 | `LANGFUSE_PUBLIC_KEY` / `LANGFUSE_SECRET_KEY` / `LANGFUSE_BASE_URL` | Standard Langfuse SDK names. Accepted as fallbacks when the `HERMES_LANGFUSE_*` equivalents are unset. |
 
+### Local Token Usage Report
+
+Environment variables for the bundled
+[`observability/token_usage_report`](/user-guide/features/built-in-plugins#observabilitytoken_usage_report)
+plugin. The plugin is file-only and must be enabled separately with
+`hermes plugins enable observability/token_usage_report`.
+
+| Variable | Description |
+|----------|-------------|
+| `HERMES_TOKEN_USAGE_REPORT_DIR` | Override the report directory (default: `$HERMES_HOME/reports/token_usage`). |
+| `HERMES_TOKEN_USAGE_REPORT_MAX_EVENTS` | Recent JSONL events scanned when rebuilding the Markdown summary (default: `20000`). |
+| `HERMES_TOKEN_USAGE_REPORT_RECENT_ROWS` | Recent request rows shown in the summary (default: `25`). |
+| `HERMES_TOKEN_USAGE_REPORT_TARGETS` | Comma-separated exact reasoning-token values to count (default: `516,1034,1552`; these are diagnostic targets, not caps). |
+
 ### Nous Tool Gateway
 
 These variables configure the [Tool Gateway](/user-guide/features/tool-gateway) for paid Nous subscribers or self-hosted gateway deployments. Most users don't need to set these — the gateway is configured automatically via `hermes model` or `hermes tools`.
