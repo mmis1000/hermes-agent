@@ -262,6 +262,8 @@ Terminal, delivered history may be bounded by configured age/count retention. Pr
 
 Resume reconstructs a child agent through a shared session-hydration path rather than inventing a second transcript parser.
 
+The canonical persisted transcript can include provider-facing thinking/reasoning carriers on assistant messages, including `reasoning`, `reasoning_content`, signed or redacted `reasoning_details` blocks, and opaque Codex reasoning/message items. Resume preserves and replays these fields when required for provider continuity; it must not summarize, expose, or reinterpret them. Some carriers are encrypted or signed protocol state rather than readable chain-of-thought.
+
 The resumed attempt must:
 
 1. resolve the latest child-session continuation in the subagent's lineage;
@@ -324,8 +326,9 @@ After process loss:
 - Controls remain scoped to the delegation's originating session or proven session lineage.
 - Foreign and unknown IDs return indistinguishable errors.
 - Messages and reasons are bounded and passed through secret redaction at model-facing and observable serialization boundaries.
+- Persisted provider-facing reasoning carriers are available only to the internal resume/replay path; `status`, `tail`, completion summaries, and parent-facing tool results never expose them.
 - Live/archive tails include assistant text plus `tool.started` and `tool.completed` metadata only.
-- Hidden reasoning and raw private redaction carry buffers are never persisted or returned.
+- Hidden reasoning is never returned through parent-facing observability. Private raw redaction carry buffers are never persisted or returned.
 - Status responses expose operational counters, not provider reasoning payloads.
 
 ## 12. Compatibility
@@ -359,6 +362,7 @@ Use deterministic barriers/events for races and isolate global completion queues
 
 - resume after completion, interruption, error, timeout, and owner-loss unknown;
 - persisted transcript and required execution configuration are restored;
+- signed, redacted, and opaque provider reasoning carriers survive resume replay unchanged without appearing in parent-facing observability;
 - the resume message is the next user instruction;
 - concurrent resumes create one attempt;
 - resume while active returns `already_running`;
