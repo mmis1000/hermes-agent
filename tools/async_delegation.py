@@ -552,9 +552,7 @@ def interrupt_async_delegation(
             if current and current.get("status") == "interrupt_requested":
                 current["status"] = "running"
         for attempt in requested:
-            _repository().transition_attempt(
-                attempt["attempt_id"], {"interrupt_requested"}, "running"
-            )
+            _repository().rollback_interrupt_request(attempt["attempt_id"])
         _notify_state_change()
         return {
             "status": "interrupt_failed",
@@ -648,7 +646,21 @@ def pending_subagent_interrupt_ids(
 
 
 def archive_subagent_tail(subagent_id: str, tail: Dict[str, Any]) -> None:
-    attempt = _repository().find_attempt(subagent_id)
+    supplied_attempt = tail.get("delegation_attempt_id")
+    if "delegation_attempt_id" in tail and (
+        not isinstance(supplied_attempt, str) or not supplied_attempt
+    ):
+        return
+    supplied_run = tail.get("delegation_run_id")
+    if supplied_run is not None and (
+        not isinstance(supplied_run, str) or not supplied_run
+    ):
+        return
+    attempt = _repository().find_attempt(
+        subagent_id,
+        attempt_id=supplied_attempt,
+        run_id=supplied_run,
+    )
     if attempt is None or attempt["state"] not in _ACTIVE_STATES:
         return
     state = _attempt_state(tail.get("status"))
@@ -941,6 +953,7 @@ def dispatch_async_delegation_batch(
     root_subagent_ids: Optional[List[str]] = None,
     max_async_children: int = _DEFAULT_MAX_ASYNC_CHILDREN,
     delegation_id: Optional[str] = None,
+    _bind_attempts: Optional[Callable[[str, Dict[str, str]], None]] = None,
 ) -> Dict[str, Any]:
     """Dispatch a WHOLE fan-out batch as ONE background unit.
 
@@ -1004,6 +1017,11 @@ def dispatch_async_delegation_batch(
         _records[delegation_id] = record
 
     _persist_dispatch(record)
+    if _bind_attempts is not None:
+        _bind_attempts(
+            str(record["run_id"]),
+            dict(zip(record["root_subagent_ids"], record["attempt_ids"])),
+        )
     executor = _get_executor(max_async_children)
 
     def _worker() -> None:

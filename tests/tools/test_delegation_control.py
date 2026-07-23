@@ -221,6 +221,83 @@ def test_starting_child_interrupt_is_queued_then_applied_once():
         allow_finish.set()
 
 
+def test_stale_real_registration_and_archive_cannot_mutate_new_attempt():
+    repository = ad._repository()
+    initial = repository.register_initial_dispatch(
+        {
+            "delegation_id": "deleg-exact-attempt",
+            "session_key": "owner",
+            "origin_ui_session_id": "ui-owner",
+            "parent_session_id": "parent-owner",
+            "dispatched_at": 1.0,
+            "goal": "original",
+            "root_subagent_ids": ["sa-exact"],
+        }
+    )
+    stale_attempt_id = initial["attempts"][0]["attempt_id"]
+    assert repository.transition_attempt(
+        stale_attempt_id, {"starting"}, "completed"
+    )["status"] == "updated"
+    resumed = repository.reserve_resumed_attempt(
+        "sa-exact", physical_worker_id="worker-current"
+    )
+
+    stale_record = {
+        "subagent_id": "sa-exact",
+        "delegation_attempt_id": stale_attempt_id,
+        "delegation_run_id": initial["run_id"],
+        "parent_id": None,
+        "goal": "stale callback",
+        "status": "running",
+        "started_at": time.time(),
+        "agent": MagicMock(),
+    }
+    dt._register_subagent(stale_record)
+    stale_record["status"] = "error"
+    dt._unregister_subagent("sa-exact")
+
+    current = repository.snapshot("deleg-exact-attempt")["children"]["sa-exact"]
+    assert current["attempt_id"] == resumed["attempt_id"]
+    assert current["run_id"] == resumed["run_id"]
+    assert current["status"] == "starting"
+    assert current.get("goal") == "original"
+
+
+def test_interrupt_callback_failure_rolls_back_pending_marker_for_retry():
+    release = threading.Event()
+    successful_calls = []
+
+    def failed_interrupt():
+        raise RuntimeError("signal failed")
+
+    dispatched = _dispatch(
+        lambda: (release.wait(2), {"status": "completed", "summary": "done"})[1],
+        roots=["sa-interrupt-retry"],
+        interrupt_fn=failed_interrupt,
+    )
+    delegation_id = dispatched["delegation_id"]
+    try:
+        first = ad.interrupt_async_delegation(
+            delegation_id, session_key="owner", reason="first"
+        )
+        assert first["status"] == "interrupt_failed"
+        snapshot = ad.get_durable_delegation(delegation_id)
+        assert snapshot["state"] == "running"
+        assert snapshot["interrupt_requests"] == {}
+
+        with ad._records_lock:
+            ad._records[delegation_id]["interrupt_fn"] = lambda: successful_calls.append(True)
+        second = ad.interrupt_async_delegation(
+            delegation_id, session_key="owner", reason="second"
+        )
+        assert second["status"] == "interrupt_requested"
+        assert successful_calls == [True]
+        assert ad.take_pending_subagent_interrupt("sa-interrupt-retry") == (True, "second")
+        assert ad.take_pending_subagent_interrupt("sa-interrupt-retry") == (False, "")
+    finally:
+        release.set()
+
+
 def test_wait_consumes_result_and_registry_auto_delivery_drops_it():
     dispatched = _dispatch(lambda: {"status": "completed", "summary": "one owner"})
     _wait_terminal(dispatched["delegation_id"])

@@ -484,6 +484,55 @@ def test_delegate_task_background_routes_async_and_does_not_block(monkeypatch):
     assert "the real task" in text
 
 
+def test_delegate_task_binds_exact_run_and_attempt_before_runner(tmp_path, monkeypatch):
+    from unittest.mock import MagicMock
+    import tools.delegate_tool as dt
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    parent = MagicMock()
+    parent._delegate_depth = 0
+    parent.session_id = "sess-bind"
+    parent._interrupt_requested = False
+    parent._active_children = []
+    parent._active_children_lock = None
+    child = MagicMock()
+    child._delegate_role = "leaf"
+    child._subagent_id = "sa-bound"
+    observed = {}
+
+    def run_bound(task_index, goal, child=None, parent_agent=None, **_kwargs):
+        observed["run_id"] = getattr(child, "_delegation_run_id", None)
+        observed["attempt_id"] = getattr(child, "_delegation_attempt_id", None)
+        return {
+            "task_index": task_index,
+            "status": "completed",
+            "summary": goal,
+            "api_calls": 1,
+            "duration_seconds": 0.1,
+            "model": "m",
+        }
+
+    creds = {
+        "model": "m", "provider": None, "base_url": None, "api_key": None,
+        "api_mode": None, "command": None, "args": None,
+    }
+    monkeypatch.setattr(dt, "_build_child_agent", lambda **_kwargs: child)
+    monkeypatch.setattr(dt, "_run_single_child", run_bound)
+    monkeypatch.setattr(dt, "_resolve_delegation_credentials", lambda *_a, **_k: creds)
+
+    payload = json.loads(
+        dt.delegate_task(goal="bind exact ids", background=True, parent_agent=parent)
+    )
+    event = _drain_for(payload["delegation_id"])
+    assert event is not None
+    snapshot = ad.get_durable_delegation(payload["delegation_id"])
+    durable_child = snapshot["children"]["sa-bound"]
+    assert observed == {
+        "run_id": snapshot["run_id"],
+        "attempt_id": durable_child["attempt_id"],
+    }
+
+
 def test_delegate_task_background_uses_live_tui_agent_session_id(monkeypatch):
     """TUI async delegation must route to the live/compressed agent id.
 

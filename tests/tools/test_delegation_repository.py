@@ -168,20 +168,26 @@ def test_stale_attempt_and_interrupt_cannot_poison_new_attempt(repo):
     assert repo.snapshot("deleg-1")["children"]["sa-root"]["status"] == "interrupt_requested"
 
 
-def test_stale_run_completion_does_not_overwrite_or_publish(repo):
+def test_exact_run_completion_is_independent_of_newer_reserved_run(repo):
     initial = repo.register_initial_dispatch(_record())
     old_attempt = initial["attempts"][0]["attempt_id"]
     repo.transition_attempt(old_attempt, {"starting"}, "completed")
     resumed = repo.reserve_resumed_attempt("sa-root")
-    stale_event = {"status": "error", "summary": "stale", "completed_at": 19.0}
-    assert repo.complete_run(initial["run_id"], stale_event, stale_event)["status"] == "stale"
-    assert repo.pending_events() == []
+    initial_event = {"status": "error", "summary": "initial", "completed_at": 19.0}
+    assert repo.complete_run(initial["run_id"], initial_event, initial_event)["status"] == "completed"
+    assert repo.pending_events() == [{"run_id": initial["run_id"], "event": initial_event}]
+    current = repo.snapshot("deleg-1")["children"]["sa-root"]
+    assert current["attempt_id"] == resumed["attempt_id"]
+    assert current["status"] == "starting"
+    assert repo.inspect_delivery("deleg-1", resumed["run_id"])["completed_at"] is None
+
+    duplicate = {"status": "error", "summary": "duplicate", "completed_at": 20.0}
+    assert repo.complete_run(initial["run_id"], duplicate, duplicate)["status"] == "stale"
+    assert len(repo.pending_events()) == 1
+
     fresh_event = {"status": "completed", "summary": "fresh", "completed_at": 20.0}
     assert repo.complete_run(resumed["run_id"], fresh_event, fresh_event)["status"] == "completed"
-
-    stale_event["completed_at"] = 21.0
-    assert repo.complete_run(resumed["run_id"], stale_event, stale_event)["status"] == "stale"
-    assert len(repo.pending_events()) == 1
+    assert len(repo.pending_events()) == 2
     snap = repo.snapshot("deleg-1")
     assert snap["event"]["summary"] == "fresh"
     assert snap["result"]["summary"] == "fresh"

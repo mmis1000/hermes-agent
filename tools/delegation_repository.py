@@ -351,16 +351,26 @@ class DelegationRepository:
             ).rowcount
         return {"status": "taken", "reason": str(row[0] or "")} if changed == 1 else {"status": "not_pending"}
 
+    def rollback_interrupt_request(self, attempt_id: str) -> Dict[str, Any]:
+        """Roll back an exact interrupt marker only if no worker consumed it."""
+        now = time.time()
+        with self.write_txn() as conn:
+            changed = conn.execute(
+                "UPDATE delegation_attempts SET state='running',interrupt_reason=NULL,\n                   interrupt_requested_at=NULL,interrupt_taken_at=NULL,updated_at=?\n                   WHERE attempt_id=? AND state='interrupt_requested'\n                     AND interrupt_requested_at IS NOT NULL AND interrupt_taken_at IS NULL",
+                (now, attempt_id),
+            ).rowcount
+        return {"status": "rolled_back" if changed == 1 else "stale"}
+
     def complete_run(self, run_id: str, event: Dict[str, Any], result: Dict[str, Any]) -> Dict[str, Any]:
         completed_at = float(event.get("completed_at") or time.time())
         with self.write_txn() as conn:
             run = conn.execute(
-                "SELECT r.delegation_id,r.completed_at,r.run_number,\n                          (SELECT MAX(x.run_number) FROM delegation_runs x\n                           WHERE x.delegation_id=r.delegation_id) AS latest\n                   FROM delegation_runs r WHERE r.run_id=?",
+                "SELECT delegation_id,completed_at FROM delegation_runs WHERE run_id=?",
                 (run_id,),
             ).fetchone()
             if run is None:
                 return {"status": "not_found"}
-            if run[1] is not None or run[2] != run[3]:
+            if run[1] is not None:
                 return {"status": "stale"}
             changed = conn.execute(
                 "UPDATE delegation_runs SET completed_at=?,event_json=?,result_json=?\n                   WHERE run_id=? AND completed_at IS NULL",
@@ -739,10 +749,26 @@ class DelegationRepository:
         if not isinstance(worker_id, str) or not worker_id:
             return None
         parent_id = record.get("parent_id")
+        supplied_attempt_id = record.get("delegation_attempt_id")
+        has_supplied_attempt = supplied_attempt_id is not None
         now = time.time()
         with self.write_txn() as conn:
-            attempt = self._attempt_for_worker(conn, worker_id)
-            if attempt is None and isinstance(parent_id, str) and parent_id:
+            if has_supplied_attempt:
+                if not isinstance(supplied_attempt_id, str) or not supplied_attempt_id:
+                    return None
+                attempt = conn.execute(
+                    "SELECT a.*,l.delegation_id,l.logical_id AS stable_id,l.spec_json\n                       FROM delegation_attempts a JOIN delegation_logical_subagents l\n                         ON l.logical_id=a.logical_id\n                       WHERE a.attempt_id=?\n                         AND (a.physical_worker_id=? OR a.logical_id=?)",
+                    (supplied_attempt_id, worker_id, worker_id),
+                ).fetchone()
+                supplied_run_id = record.get("delegation_run_id")
+                if attempt is not None and supplied_run_id is not None and (
+                    not isinstance(supplied_run_id, str)
+                    or supplied_run_id != attempt["run_id"]
+                ):
+                    attempt = None
+            else:
+                attempt = self._attempt_for_worker(conn, worker_id)
+            if attempt is None and not has_supplied_attempt and isinstance(parent_id, str) and parent_id:
                 parent = self._attempt_for_worker(conn, parent_id)
                 if parent is None:
                     return None
@@ -770,6 +796,8 @@ class DelegationRepository:
                 attempt = self._attempt_for_worker(conn, worker_id)
             if attempt is None:
                 return None
+            if attempt["state"] not in _ACTIVE_STATES:
+                return None
             metadata = _json(attempt["metadata_json"], {})
             spec = _json(attempt["spec_json"], {})
             metadata.update({key: value for key, value in record.items() if key != "agent" and (key not in spec or spec[key] != value)})
@@ -783,12 +811,24 @@ class DelegationRepository:
             return {"delegation_id": str(attempt["delegation_id"]), "attempt_id": str(attempt["attempt_id"])}
 
     def find_attempt(
-        self, worker_id: str, *, delegation_id: Optional[str] = None, session_key: Optional[str] = None
+        self,
+        worker_id: str,
+        *,
+        attempt_id: Optional[str] = None,
+        run_id: Optional[str] = None,
+        delegation_id: Optional[str] = None,
+        session_key: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
         conn = self._connect()
         try:
             clauses = ["(a.physical_worker_id=? OR a.logical_id=?)"]
             params: List[Any] = [worker_id, worker_id]
+            if attempt_id is not None:
+                clauses.append("a.attempt_id=?")
+                params.append(attempt_id)
+            if run_id is not None:
+                clauses.append("a.run_id=?")
+                params.append(run_id)
             if delegation_id is not None:
                 clauses.append("l.delegation_id=?")
                 params.append(delegation_id)

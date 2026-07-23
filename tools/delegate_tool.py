@@ -195,16 +195,17 @@ def _register_subagent(record: Dict[str, Any]) -> None:
             take_pending_subagent_interrupt,
         )
 
-        register_subagent_lifecycle(record)
-        pending, reason = take_pending_subagent_interrupt(sid)
-        if pending:
-            outcome = interrupt_subagent_status(sid, reason=reason)
-            if outcome != "interrupt_requested":
-                logger.warning(
-                    "queued interrupt for starting subagent %s resolved as %s",
-                    sid,
-                    outcome,
-                )
+        delegation_id = register_subagent_lifecycle(record)
+        if delegation_id is not None:
+            pending, reason = take_pending_subagent_interrupt(sid)
+            if pending:
+                outcome = interrupt_subagent_status(sid, reason=reason)
+                if outcome != "interrupt_requested":
+                    logger.warning(
+                        "queued interrupt for starting subagent %s resolved as %s",
+                        sid,
+                        outcome,
+                    )
     except Exception:
         logger.debug("subagent/delegation association failed", exc_info=True)
 
@@ -223,6 +224,8 @@ def _unregister_subagent(subagent_id: str) -> None:
         "model": record.get("model"),
         "started_at": record.get("started_at"),
         "status": record.get("status"),
+        "delegation_attempt_id": record.get("delegation_attempt_id"),
+        "delegation_run_id": record.get("delegation_run_id"),
         "interrupt_reason": record.get("interrupt_reason"),
         "tool_count": record.get("tool_count", 0),
         "last_tool": record.get("last_tool", ""),
@@ -2134,23 +2137,28 @@ def _run_single_child(
         _raw_depth = getattr(child, "_delegate_depth", 1)
         _tui_depth = max(0, _raw_depth - 1) if isinstance(_raw_depth, int) else 0
         _parent_sid = getattr(child, "_parent_subagent_id", None)
-        _register_subagent(
-            {
-                "subagent_id": _subagent_id,
-                "parent_id": _parent_sid if isinstance(_parent_sid, str) else None,
-                "depth": _tui_depth,
-                "goal": goal,
-                "model": (
-                    getattr(child, "model", None)
-                    if isinstance(getattr(child, "model", None), str)
-                    else None
-                ),
-                "started_at": time.time(),
-                "status": "running",
-                "tool_count": 0,
-                "agent": child,
-            }
-        )
+        _registration = {
+            "subagent_id": _subagent_id,
+            "parent_id": _parent_sid if isinstance(_parent_sid, str) else None,
+            "depth": _tui_depth,
+            "goal": goal,
+            "model": (
+                getattr(child, "model", None)
+                if isinstance(getattr(child, "model", None), str)
+                else None
+            ),
+            "started_at": time.time(),
+            "status": "running",
+            "tool_count": 0,
+            "agent": child,
+        }
+        _attempt_id = getattr(child, "_delegation_attempt_id", None)
+        if isinstance(_attempt_id, str):
+            _registration["delegation_attempt_id"] = _attempt_id
+        _run_id = getattr(child, "_delegation_run_id", None)
+        if isinstance(_run_id, str):
+            _registration["delegation_run_id"] = _run_id
+        _register_subagent(_registration)
 
     try:
         _heartbeat_thread.start()
@@ -3215,6 +3223,14 @@ def delegate_task(
                 except Exception:
                     pass
 
+        def _bind_batch_attempts(run_id: str, attempt_ids: Dict[str, str]) -> None:
+            for _c in _child_agents:
+                _sid = getattr(_c, "_subagent_id", None)
+                if not isinstance(_sid, str) or _sid not in attempt_ids:
+                    continue
+                _c._delegation_run_id = run_id
+                _c._delegation_attempt_id = attempt_ids[_sid]
+
         _goals = [t["goal"] for t in task_list]
         dispatch = dispatch_async_delegation_batch(
             goals=_goals,
@@ -3238,6 +3254,7 @@ def delegate_task(
             # Reuse the live-transcript directory's id (when created) so the
             # returned delegation_id matches cache/delegation/live/<id>/.
             delegation_id=live_deleg_id,
+            _bind_attempts=_bind_batch_attempts,
         )
 
         if dispatch.get("status") == "dispatched":
