@@ -337,13 +337,12 @@ def test_submit_failure_removes_durable_running_record(tmp_path, monkeypatch):
     )
 
     assert result["status"] == "rejected"
-    with ad._DB_LOCK, ad._connect() as conn:
-        assert conn.execute("SELECT COUNT(*) FROM async_delegations").fetchone()[0] == 0
+    assert ad.list_durable_delegations() == []
 
 
 def test_pending_retention_prunes_delivered_before_undelivered(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    monkeypatch.setattr(ad, "_MAX_RETAINED_COMPLETED", 2)
+    monkeypatch.setattr(ad, "_MAX_RETAINED_COMPLETED", 0)
     for index, delivery_state in enumerate(("pending", "delivered", "pending")):
         delegation_id = f"deleg_{index}"
         record = {
@@ -381,12 +380,10 @@ def test_recover_marks_abandoned_running_record_unknown(tmp_path, monkeypatch):
         "parent_session_id": None,
         "dispatched_at": 1.0,
     }
-    ad._persist_dispatch(record)
-    with ad._DB_LOCK, ad._connect() as conn:
-        conn.execute(
-            "UPDATE async_delegations SET owner_pid=?, owner_started_at=NULL WHERE delegation_id=?",
-            (99999999, "deleg_abandoned"),
-        )
+    record["root_subagent_ids"] = ["sa-abandoned"]
+    assert ad._repository().register_initial_dispatch(
+        record, owner_pid=99999999
+    )["status"] == "registered"
 
     assert ad.recover_abandoned_delegations() == 1
     durable = ad.get_durable_delegation("deleg_abandoned")
