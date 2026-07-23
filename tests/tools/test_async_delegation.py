@@ -156,9 +156,13 @@ def test_resume_reserves_exact_attempt_and_runs_with_hydrated_history(
     monkeypatch.setattr(
         delegate_tool, "prepare_resumed_child_session", lambda _bundle: continuation
     )
+    resumed_metadata = {
+        **metadata,
+        "child_session_id": continuation["session_id"],
+    }
     built = SimpleNamespace(
         _delegation_session_ref={},
-        _delegation_runtime_metadata=dict(metadata),
+        _delegation_runtime_metadata=resumed_metadata,
         close=lambda: None,
     )
     build_calls = []
@@ -172,6 +176,18 @@ def test_resume_reserves_exact_attempt_and_runs_with_hydrated_history(
 
     def fake_run(*args, **kwargs):
         run_calls.append((args, kwargs))
+        db.create_session(
+            continuation["session_id"],
+            source="subagent",
+            parent_session_id=child_session,
+            model_config={"_delegate_from": parent_session},
+        )
+        db.append_message(
+            continuation["session_id"], "user", kwargs["resume_message"]
+        )
+        db.append_message(
+            continuation["session_id"], "assistant", "new resumed work"
+        )
         return {
             "status": "completed",
             "summary": "resumed result",
@@ -223,6 +239,25 @@ def test_resume_reserves_exact_attempt_and_runs_with_hydrated_history(
         delegation_id, run_id=dispatched["run_id"]
     )
     assert resumed_snapshot["children"][logical_id]["status"] == "completed"
+    assert (
+        resumed_snapshot["children"][logical_id]["child_session_id"]
+        == continuation["session_id"]
+    )
+    next_resume = ad.load_subagent_resume_bundle(
+        delegation_id, logical_id, session_key=parent_session
+    )
+    assert next_resume["status"] == "ready"
+    assert next_resume["bundle"]["prior_child_session_id"] == continuation["session_id"]
+    assert next_resume["bundle"]["child_lineage"] == [
+        child_session,
+        continuation["session_id"],
+    ]
+    assert [item["content"] for item in next_resume["bundle"]["history"]] == [
+        "original child goal",
+        "partial answer",
+        "continue from the partial answer",
+        "new resumed work",
+    ]
 
 
 def test_resume_construction_failure_is_terminal_and_retryable(monkeypatch):

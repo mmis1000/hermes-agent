@@ -457,11 +457,14 @@ def dispatch_resumed_subagent(
         child._delegation_session_ref.update(
             {"run_id": run_id, "attempt_id": attempt_id}
         )
-        metadata = dict(child._delegation_runtime_metadata)
-        metadata.update(
-            {"child_session_id": bundle["prior_child_session_id"]}
-        )
-        child._delegation_runtime_metadata = dict(metadata)
+        child_metadata = dict(child._delegation_runtime_metadata)
+        # Keep the prior segment only in durable in-flight metadata.  The
+        # reconstructed child must retain its newly allocated session ID so a
+        # successful completion can advance the replay anchor.
+        metadata = {
+            **child_metadata,
+            "child_session_id": bundle["prior_child_session_id"],
+        }
     except Exception as exc:
         result = {
             "status": "error",
@@ -503,6 +506,11 @@ def dispatch_resumed_subagent(
                 resume_workdir=metadata.get("workdir"),
             )
             status = str(result.get("status") or "error")
+            if status == "completed":
+                # The standard conversation runner has now persisted the new
+                # child segment.  Completing the exact attempt with this field
+                # atomically advances the anchor used by the next resume.
+                result["child_session_id"] = continuation["session_id"]
         except Exception as exc:
             logger.exception("Resumed delegation %s/%s crashed", delegation_id, logical_id)
             result = {
