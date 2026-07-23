@@ -126,7 +126,7 @@ delegation(
 Rules:
 
 - `delegation_id`, `subagent_id`, and non-empty `message` are required.
-- Resume is allowed after `completed`, `interrupted`, `error`, `timed_out`, or owner-loss `unknown` states.
+- Resume is allowed after `completed`, `interrupted`, `error`, `timeout`, or owner-loss `unknown` states.
 - Resume during a live or starting attempt returns `already_running`.
 - An atomic transition creates exactly one new attempt.
 - The call returns immediately; the resumed attempt runs in the background.
@@ -171,6 +171,12 @@ Responses gain `attempt_id` when a current attempt exists. Repeated requests rem
 
 `tail` continues to expose only bounded, redacted assistant text and tool lifecycle events. It defaults to the current/latest attempt and may include an optional validated `attempt_id` selector. Combined cross-attempt conversational history is reconstructed from persisted session lineage, not by concatenating unbounded live-tail buffers.
 
+### 4.5 Wait and compatibility projections
+
+Existing `wait(delegation_id=...)` remains FIFO-compatible: it consumes the oldest authorized undelivered terminal execution run. If no terminal run is waiting, it atomically binds its hold to the latest active run visible when the wait begins. An optional validated `run_id` selector permits exact waiting without changing legacy callers.
+
+Delegation-level compatibility fields are projections, never separate authority: `worker_status` reflects the active attempt when one exists and otherwise the latest attempt; top-level `result` and `delivery_disposition` reflect the latest execution run. Status also exposes `active_run_id`, `latest_run_id`, and pending-run count so callers do not need to infer multi-run state. Every completion event, claim, and dedupe key uses `run_id`, including when an initial batch overlaps a resumed child run.
+
 ## 5. State Model
 
 ### 5.1 Separate logical identity, execution attempts, and delivery
@@ -189,7 +195,7 @@ Worker state and delivery state remain independent.
 starting → running → completed
                    → interrupted
                    → error
-                   → timed_out
+                   → timeout
                    → unknown
 starting/running → interrupt_requested → interrupted|completed|error
 ```
@@ -210,7 +216,7 @@ A resumed attempt must not overwrite the already-delivered completion of an earl
 
 ## 6. Persistence Design
 
-The current `async_delegations` record becomes the durable logical container and compatibility projection. Add normalized durable records for repeated execution.
+The current `async_delegations` record becomes the durable logical container. Normalized logical-subagent, attempt, execution-run, and mailbox rows are the sole mutable worker/delivery authority for every new or materialized record. Legacy rows are materialized transactionally once; after the migration marker is set, old child/result/claim JSON and columns are frozen compatibility input rather than a second writable projection. Compatibility responses are derived from normalized rows.
 
 ### 6.1 Logical subagents
 
@@ -219,7 +225,7 @@ A normalized logical-subagent record stores:
 - `delegation_id`;
 - stable `subagent_id`;
 - logical parent subagent ID and depth;
-- original goal, context, role, model, toolsets, and workspace metadata;
+- original goal, context, role, named model/provider route, effective enabled/disabled tool restrictions, workspace metadata, and non-secret named fallback-route policy;
 - latest and active attempt IDs;
 - creation and update timestamps.
 
@@ -237,6 +243,8 @@ Each immutable attempt stores:
 - bounded archived observable tail;
 - interruption details;
 - durable steer-mailbox entries and their dispositions.
+
+Reconstruction metadata is an explicit allowlist. It excludes API keys, base URLs, headers, arbitrary request bodies, credential leases, clients, callbacks, ACP commands/arguments, and live objects. Resume resolves named routes and credentials from current authorized configuration and fails closed if a required route is unavailable. Approval policy is also re-evaluated from current configuration so security tightening applies to resumed attempts instead of replaying a stale callback or historical auto-approval value.
 
 ### 6.3 Execution runs and delivery
 
@@ -264,6 +272,8 @@ Resume reconstructs a child agent through a shared session-hydration path rather
 
 The canonical persisted transcript can include provider-facing thinking/reasoning carriers on assistant messages, including `reasoning`, `reasoning_content`, signed or redacted `reasoning_details` blocks, and opaque Codex reasoning/message items. Resume preserves and replays these fields when required for provider continuity; it must not summarize, expose, or reinterpret them. Some carriers are encrypted or signed protocol state rather than readable chain-of-thought.
 
+Subagent replay uses a bounded child-only lineage. Attempt 1 is parented to the owning parent-agent session. Every resumed attempt is parented to the prior child tip, while `_delegate_from` continues to identify the original owning parent session. The replay walker starts at the latest child tip, includes child compression continuations and every prior resumed-attempt segment in chronological order, and stops before the owning parent-agent session. It never prepends the parent transcript.
+
 The resumed attempt must:
 
 1. resolve the latest child-session continuation in the subagent's lineage;
@@ -285,9 +295,9 @@ Extend the live subagent registry so each entry carries both logical `subagent_i
 
 ### 8.2 Durable startup steer mailbox
 
-Steers accepted while an attempt is `starting` are persisted before returning success. Immediately after live-agent registration, Hermes drains them in order through `AIAgent.steer()`.
+Steers accepted while an attempt is `starting` are persisted before returning success. Immediately after live-agent registration, Hermes atomically claims them in order and forwards them through `AIAgent.steer()`.
 
-For a running attempt, acceptance and mailbox insertion occur before best-effort live forwarding. This gives recovery code enough information to report whether a steer was injected, superseded, or too late.
+For a running attempt, acceptance and mailbox insertion occur before best-effort live forwarding. Mailbox state is explicit: `pending → forwarded → injected`, with terminal alternatives `superseded_by_interrupt` and `too_late_after_completion`. Calling `AIAgent.steer()` only establishes `forwarded`. Pending steers retain ordered envelopes with exact mailbox IDs across drain and requeue. Only successful marker insertion in either the pre-API or post-tool path establishes `injected`; final-response and interrupt paths acknowledge their distinct terminal outcomes. Atomic claim/drain prevents startup registration and concurrent live forwarding from injecting one mailbox item twice.
 
 ### 8.3 Precedence
 
@@ -310,6 +320,7 @@ Required guarantees:
 - queued startup interrupt is consumed exactly once;
 - accepted completion delivery is never injected twice, including after a bookkeeping failure;
 - authorization checks occur before existence-sensitive responses.
+- ownership accepts the exact origin session or a proven compression continuation of that session, but not an arbitrary session sharing the same conversation root; a delegated orchestrator controls only delegations it originated and their descendants.
 
 ## 10. Recovery Behavior
 
