@@ -24,12 +24,37 @@ Persist stable logical subagents, immutable execution attempts, and independent 
 
 `hermes_state.py` remains the declarative schema authority. Add the final normalized delegation DDL to its shared bootstrap rather than running conditional DDL on every delegation operation.
 
+Export one connection-level `ensure_state_schema(conn)` bootstrap from `hermes_state.py`. Both `SessionDB._init_schema()` and the repository connection factory call that same function before their first query; neither copies DDL or assumes the other opened the database first. The repository gates the call once per process/database path, while the bootstrap itself remains cross-process idempotent.
+
 Support only:
 
 1. the released pre-feature schema; and
 2. the final normalized schema.
 
 A one-time, idempotent legacy data migration runs under the repository write transaction.
+
+The delegation container gains `lifecycle_version INTEGER NOT NULL DEFAULT 1`. Version 1 is the released pre-feature representation; version 2 is the final normalized representation. The migration transaction inserts every normalized row, transfers delivery/result/claim state, freezes the legacy mutable payloads, and sets `lifecycle_version=2` last. Readers never import later writes from legacy fields after version 2.
+
+### Exact released-schema migration
+
+Migration preserves released identifiers and dispositions rather than inventing new identities:
+
+- every existing `sa-*` child ID becomes its stable logical-subagent ID;
+- root order comes from `root_subagent_ids_json`; non-root children have no root ordinal and retain their recorded parent ID;
+- each legacy child becomes attempt 1 in the initial run;
+- child states map as follows:
+  - `starting`, `running`, `finalizing`, `interrupt_requested` remain their canonical active states;
+  - `completed` and `success` become `completed`;
+  - `error`, `failed`, and `budget_exhausted` become `error`;
+  - `interrupted` and `cancelled` become `interrupted`;
+  - `timeout` becomes `timeout`;
+  - missing or unrecognized terminal values become `unknown`;
+- delivery dispositions remain exactly `pending`, `held_by_wait`, `delivering`, `delivered`, `consumed`, or `suppressed`;
+- released `pending` plus a non-null claim token is canonicalized to `delivering`;
+- claim token/time, delivery attempts, delivered time, event payload, and result payload move to the initial run atomically;
+- existing owner PID/process-start data moves to active attempt 1, not the run.
+
+Migration is idempotent: a version-2 container is read only from normalized rows, and concurrent losers observe version 2 after acquiring the write transaction.
 
 ### Repository
 
@@ -54,7 +79,7 @@ Attempt and run IDs are allocated before worker submission and passed directly i
 
 ### Delegation container
 
-Keep authorization/routing, original task payload, dispatch time, and abandonment metadata. Legacy worker/result/delivery columns remain only for one-time migration and read compatibility; new/materialized records never update them.
+Keep authorization/routing, original task payload, dispatch time, abandonment metadata, and the `lifecycle_version` cutover marker. Legacy worker/result/delivery columns remain only for one-time migration and read compatibility; new/materialized records never update them.
 
 ### Logical subagent
 
@@ -97,7 +122,7 @@ Do not duplicate worker state or owner fields on runs. A run is incomplete when 
 
 ## Repository operations
 
-Every write returns a structured outcome; no ambiguous booleans.
+Repository writes return structured outcomes; no ambiguous booleans. Compatibility wrappers may retain their established boolean, token, string, or dictionary shapes as specified below.
 
 1. `register_initial_dispatch(...)`
    - creates logical roots, attempt 1 per root, and one initial run atomically;
@@ -127,7 +152,9 @@ No mutation API silently chooses the latest run.
 
 - Existing current APIs remain callable during Task 1.
 - Their implementation delegates to the repository.
+- Existing wrapper names retain their exact return shapes and released missing-row behavior. In particular, boolean legacy-delivery claims still return `True` for a missing durable row, event claims retain `""`/token/`None`, and `claim_async_delivery()` retains its `legacy`, `stale`, `not_ready`, `held`, and `claimed` dictionary outcomes.
 - Legacy events without a run ID are valid only while a delegation has exactly one run.
+- Repository resolution of an omitted run ID returns `ambiguous_run` when a durable delegation has more than one run; it never selects the latest. Compatibility wrappers fail closed without changing shape: boolean wrappers return `False`, token wrappers return `None`, and structured automatic claim returns `{"status": "stale", "reason": "ambiguous_run"}`.
 - Multiple-run consumer cutover is deferred until resume/integration is implemented.
 - Gateway, TUI, CLI, and ProcessRegistry are unchanged in Task 1 unless a current single-run regression requires a minimal adapter fix.
 
