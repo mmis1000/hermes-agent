@@ -779,56 +779,76 @@ def wait_for_delegation(
         return {"status": "not_found", "delegation_id": delegation_id}
     owns_hold = binding.get("status") == "held"
 
-    while True:
-        snapshot = get_async_delegation(
-            delegation_id, session_key=session_key, run_id=bound_run_id
-        )
-        if snapshot is None:
-            if owns_hold:
-                release_wait_hold(
-                    delegation_id, claim_id, session_key=session_key,
-                    run_id=bound_run_id,
-                )
-            return {"status": "not_found", "delegation_id": delegation_id}
-        if _terminal(snapshot):
-            claimed = owns_hold and consume_waited_completion(
-                delegation_id, claim_id, session_key=session_key,
-                run_id=bound_run_id,
+    def _wait_bound() -> Dict[str, Any]:
+        while True:
+            snapshot = get_async_delegation(
+                delegation_id, session_key=session_key, run_id=bound_run_id
             )
-            current = get_async_delegation(
-                delegation_id, session_key=session_key, run_id=bound_run_id
-            ) or snapshot
-            current["claimed_delivery"] = bool(claimed)
-            return current
-
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            latest = get_async_delegation(
-                delegation_id, session_key=session_key, run_id=bound_run_id
-            ) or snapshot
-            if _terminal(latest):
+            if snapshot is None:
+                if owns_hold:
+                    release_wait_hold(
+                        delegation_id, claim_id, session_key=session_key,
+                        run_id=bound_run_id,
+                    )
+                return {"status": "not_found", "delegation_id": delegation_id}
+            if _terminal(snapshot):
                 claimed = owns_hold and consume_waited_completion(
                     delegation_id, claim_id, session_key=session_key,
                     run_id=bound_run_id,
                 )
                 current = get_async_delegation(
                     delegation_id, session_key=session_key, run_id=bound_run_id
-                ) or latest
+                ) or snapshot
                 current["claimed_delivery"] = bool(claimed)
                 return current
-            if owns_hold:
-                release_wait_hold(
-                    delegation_id, claim_id, session_key=session_key,
-                    run_id=bound_run_id,
-                )
-            current = get_async_delegation(
-                delegation_id, session_key=session_key, run_id=bound_run_id
-            ) or latest
-            current["status"] = "timeout"
-            current["claimed_delivery"] = False
-            return current
-        with _STATE_CONDITION:
-            _STATE_CONDITION.wait(timeout=min(remaining, _WAIT_POLL_SECONDS))
+
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                latest = get_async_delegation(
+                    delegation_id, session_key=session_key, run_id=bound_run_id
+                ) or snapshot
+                if _terminal(latest):
+                    claimed = owns_hold and consume_waited_completion(
+                        delegation_id, claim_id, session_key=session_key,
+                        run_id=bound_run_id,
+                    )
+                    current = get_async_delegation(
+                        delegation_id, session_key=session_key, run_id=bound_run_id
+                    ) or latest
+                    current["claimed_delivery"] = bool(claimed)
+                    return current
+                if owns_hold:
+                    release_wait_hold(
+                        delegation_id, claim_id, session_key=session_key,
+                        run_id=bound_run_id,
+                    )
+                current = get_async_delegation(
+                    delegation_id, session_key=session_key, run_id=bound_run_id
+                ) or latest
+                current["status"] = "timeout"
+                current["claimed_delivery"] = False
+                return current
+            with _STATE_CONDITION:
+                _STATE_CONDITION.wait(timeout=min(remaining, _WAIT_POLL_SECONDS))
+
+    try:
+        return _wait_bound()
+    except BaseException:
+        # A transient DB/read failure after acquisition must never strand a
+        # held_by_wait run. Preserve the original exception if cleanup also
+        # encounters the same transient lock.
+        if owns_hold:
+            for retry_index in range(3):
+                try:
+                    release_wait_hold(
+                        delegation_id, claim_id, session_key=session_key,
+                        run_id=bound_run_id,
+                    )
+                    break
+                except Exception:
+                    if retry_index < 2:
+                        time.sleep(0.05)
+        raise
 
 
 def suppress_completion_delivery(

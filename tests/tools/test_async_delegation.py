@@ -332,6 +332,44 @@ def test_resume_construction_failure_is_terminal_and_retryable(monkeypatch):
     assert len(submitted) == 1
 
 
+def test_wait_releases_exact_hold_when_snapshot_read_fails(monkeypatch):
+    import sqlite3
+
+    released = []
+
+    class FakeRepository:
+        def recover_stale_wait_holds(self, **_kwargs):
+            return 0
+
+        def hold_for_wait(self, delegation_id, session_key, token, **_kwargs):
+            return {"status": "held", "run_id": "run-bound"}
+
+        def release_wait_hold(self, delegation_id, session_key, token, **kwargs):
+            released.append((delegation_id, session_key, token, kwargs.get("run_id")))
+            return {"status": "released"}
+
+    fake_repository = FakeRepository()
+    monkeypatch.setattr(ad, "_repository", lambda: fake_repository)
+    monkeypatch.setattr(
+        ad,
+        "get_async_delegation",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            sqlite3.OperationalError("database is locked")
+        ),
+    )
+
+    with pytest.raises(sqlite3.OperationalError, match="database is locked"):
+        ad.wait_for_delegation(
+            "deleg-wait-read-error",
+            session_key="owner",
+            timeout_seconds=0,
+            run_id="run-bound",
+        )
+    assert len(released) == 1
+    assert released[0][0:2] == ("deleg-wait-read-error", "owner")
+    assert released[0][3] == "run-bound"
+
+
 def test_dispatch_returns_immediately_without_blocking():
     gate = threading.Event()
 
