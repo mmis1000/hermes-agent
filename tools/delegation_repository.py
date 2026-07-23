@@ -750,7 +750,7 @@ class DelegationRepository:
             return None
         parent_id = record.get("parent_id")
         supplied_attempt_id = record.get("delegation_attempt_id")
-        has_supplied_attempt = supplied_attempt_id is not None
+        has_supplied_attempt = "delegation_attempt_id" in record
         now = time.time()
         with self.write_txn() as conn:
             if has_supplied_attempt:

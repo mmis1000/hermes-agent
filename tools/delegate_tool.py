@@ -224,8 +224,6 @@ def _unregister_subagent(subagent_id: str) -> None:
         "model": record.get("model"),
         "started_at": record.get("started_at"),
         "status": record.get("status"),
-        "delegation_attempt_id": record.get("delegation_attempt_id"),
-        "delegation_run_id": record.get("delegation_run_id"),
         "interrupt_reason": record.get("interrupt_reason"),
         "tool_count": record.get("tool_count", 0),
         "last_tool": record.get("last_tool", ""),
@@ -233,6 +231,9 @@ def _unregister_subagent(subagent_id: str) -> None:
         "assistant_text_tail": str(record.get("assistant_text_tail") or ""),
         "last_activity_at": record.get("last_activity_at"),
     }
+    for lifecycle_id in ("delegation_attempt_id", "delegation_run_id"):
+        if lifecycle_id in record:
+            tail[lifecycle_id] = record[lifecycle_id]
     try:
         from tools.async_delegation import archive_subagent_tail
 

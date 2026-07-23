@@ -58,6 +58,38 @@ def _wait_terminal(delegation_id, timeout=2.0):
     raise AssertionError("delegation did not become terminal")
 
 
+def _interrupt_twice(monkeypatch, delegation_id, while_running=None):
+    barrier = threading.Barrier(2)
+    real_get = ad.get_async_delegation
+    synchronized = threading.local()
+
+    def synchronized_initial_snapshot(*args, **kwargs):
+        snapshot = real_get(*args, **kwargs)
+        if not getattr(synchronized, "done", False):
+            synchronized.done = True
+            barrier.wait(timeout=2)
+        return snapshot
+
+    monkeypatch.setattr(ad, "get_async_delegation", synchronized_initial_snapshot)
+    outcomes, returned = [], threading.Event()
+
+    def request(reason):
+        outcomes.append(ad.interrupt_async_delegation(
+            delegation_id, session_key="owner", reason=reason
+        ))
+        returned.set()
+
+    threads = [threading.Thread(target=request, args=(reason,)) for reason in ("one", "two")]
+    for thread in threads:
+        thread.start()
+    if while_running:
+        while_running(outcomes, returned)
+    for thread in threads:
+        thread.join(4)
+        assert not thread.is_alive()
+    return outcomes
+
+
 def test_tool_schema_and_runtime_validation_are_strict():
     import tools.delegation_control  # noqa: F401
     from tools.delegation_control import _handle_delegation_args, delegation_control
@@ -221,7 +253,8 @@ def test_starting_child_interrupt_is_queued_then_applied_once():
         allow_finish.set()
 
 
-def test_stale_real_registration_and_archive_cannot_mutate_new_attempt():
+@pytest.mark.parametrize("supplied_attempt", ["stale", None, "", 17, "attempt_missing"])
+def test_invalid_attempt_registration_and_archive_fail_closed(supplied_attempt):
     repository = ad._repository()
     initial = repository.register_initial_dispatch(
         {
@@ -242,18 +275,20 @@ def test_stale_real_registration_and_archive_cannot_mutate_new_attempt():
         "sa-exact", physical_worker_id="worker-current"
     )
 
-    stale_record = {
+    invalid_record = {
         "subagent_id": "sa-exact",
-        "delegation_attempt_id": stale_attempt_id,
+        "delegation_attempt_id": (
+            stale_attempt_id if supplied_attempt == "stale" else supplied_attempt
+        ),
         "delegation_run_id": initial["run_id"],
         "parent_id": None,
-        "goal": "stale callback",
+        "goal": "invalid callback",
         "status": "running",
         "started_at": time.time(),
         "agent": MagicMock(),
     }
-    dt._register_subagent(stale_record)
-    stale_record["status"] = "error"
+    dt._register_subagent(invalid_record)
+    invalid_record["status"] = "error"
     dt._unregister_subagent("sa-exact")
 
     current = repository.snapshot("deleg-exact-attempt")["children"]["sa-exact"]
@@ -261,6 +296,38 @@ def test_stale_real_registration_and_archive_cannot_mutate_new_attempt():
     assert current["run_id"] == resumed["run_id"]
     assert current["status"] == "starting"
     assert current.get("goal") == "original"
+
+
+def test_nested_child_without_attempt_id_allocates_propagates_and_archives_exact_id():
+    repository = ad._repository()
+    repository.register_initial_dispatch(
+        {
+            "delegation_id": "deleg-nested-attempt",
+            "session_key": "owner",
+            "dispatched_at": 1.0,
+            "root_subagent_ids": ["sa-parent"],
+        }
+    )
+    parent = dict(
+        subagent_id="sa-parent", parent_id=None, status="running", agent=MagicMock()
+    )
+    child = {
+        "subagent_id": "sa-child",
+        "parent_id": "sa-parent",
+        "goal": "nested",
+        "status": "running",
+        "agent": MagicMock(),
+    }
+    dt._register_subagent(parent)
+    dt._register_subagent(child)
+    attempt_id = child.get("delegation_attempt_id")
+    assert isinstance(attempt_id, str) and attempt_id
+    child.update(status="completed", tool_count=3)
+    dt._unregister_subagent("sa-child")
+    archived = repository.snapshot("deleg-nested-attempt")["children"]["sa-child"]
+    assert (archived["attempt_id"], archived["status"], archived["tool_count"]) == (
+        attempt_id, "completed", 3
+    )
 
 
 def test_interrupt_callback_failure_rolls_back_pending_marker_for_retry():
@@ -295,6 +362,88 @@ def test_interrupt_callback_failure_rolls_back_pending_marker_for_retry():
         assert ad.take_pending_subagent_interrupt("sa-interrupt-retry") == (True, "second")
         assert ad.take_pending_subagent_interrupt("sa-interrupt-retry") == (False, "")
     finally:
+        release.set()
+
+
+def test_concurrent_interrupt_callbacks_serialize_failure_then_success(monkeypatch):
+    release = threading.Event()
+    callback_rendezvous, successful_callback = threading.Barrier(2), threading.Event()
+    callback_guard, counts = threading.Lock(), [0, 0, 0]  # calls, active, peak
+
+    def interrupt_callback():
+        with callback_guard:
+            counts[0] += 1
+            call_number = counts[0]
+            counts[1] += 1
+            counts[2] = max(counts[2], counts[1])
+        try:
+            try:
+                callback_rendezvous.wait(timeout=0.5)
+                if call_number == 1:
+                    assert successful_callback.wait(2)
+            except threading.BrokenBarrierError:
+                pass
+            if call_number == 1:
+                raise RuntimeError("first signal failed")
+            successful_callback.set()
+        finally:
+            with callback_guard:
+                counts[1] -= 1
+
+    dispatched = _dispatch(
+        lambda: (release.wait(10), {"status": "completed", "summary": "done"})[1],
+        roots=["sa-concurrent-interrupt"],
+        interrupt_fn=interrupt_callback,
+    )
+    delegation_id = dispatched["delegation_id"]
+    try:
+        outcomes = _interrupt_twice(monkeypatch, delegation_id)
+        statuses = sorted(item["status"] for item in outcomes)
+        assert statuses == ["interrupt_failed", "interrupt_requested"]
+        assert counts == [2, 0, 1]
+        snapshot = ad.get_durable_delegation(delegation_id)
+        assert snapshot["state"] == "interrupt_requested"
+        assert list(snapshot["interrupt_requests"]) == ["sa-concurrent-interrupt"]
+        pending_reason = snapshot["interrupt_requests"]["sa-concurrent-interrupt"]
+        assert ad.take_pending_subagent_interrupt("sa-concurrent-interrupt") == (
+            True, pending_reason
+        )
+        assert ad.take_pending_subagent_interrupt("sa-concurrent-interrupt") == (False, "")
+    finally:
+        release.set()
+
+
+def test_concurrent_idempotent_interrupt_waits_for_callback_owner(monkeypatch):
+    release = threading.Event()
+    callback_entered, release_callback = threading.Event(), threading.Event()
+    callback_calls = []
+
+    def successful_interrupt():
+        callback_calls.append(True)
+        callback_entered.set()
+        assert release_callback.wait(2)
+
+    dispatched = _dispatch(
+        lambda: (release.wait(10), {"status": "completed", "summary": "done"})[1],
+        roots=["sa-idempotent-interrupt"],
+        interrupt_fn=successful_interrupt,
+    )
+    delegation_id = dispatched["delegation_id"]
+
+    def release_owner(outcomes, returned):
+        assert callback_entered.wait(2)
+        assert not returned.wait(0.2)
+        assert outcomes == []
+        release_callback.set()
+
+    try:
+        outcomes = _interrupt_twice(monkeypatch, delegation_id, release_owner)
+        assert [item["status"] for item in outcomes] == ["interrupt_requested"] * 2
+        assert callback_calls == [True]
+        assert ad.take_pending_subagent_interrupt("sa-idempotent-interrupt")[0] is True
+        assert ad.take_pending_subagent_interrupt("sa-idempotent-interrupt") == (False, "")
+    finally:
+        release_callback.set()
         release.set()
 
 

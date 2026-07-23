@@ -524,42 +524,93 @@ def interrupt_async_delegation(
             "delegation_id": delegation_id,
             "worker_status": snapshot["state"],
         }
-    if snapshot["state"] == "interrupt_requested":
-        return {"status": "interrupt_requested", "delegation_id": delegation_id}
     with _records_lock:
         record = _records.get(delegation_id)
         if record is None or record.get("session_key", "") != session_key:
+            if snapshot["state"] == "interrupt_requested":
+                return {"status": "interrupt_requested", "delegation_id": delegation_id}
             return {"status": "interrupt_unavailable", "delegation_id": delegation_id}
-        fn = record.get("interrupt_fn")
-        if not callable(fn):
-            return {"status": "interrupt_unavailable", "delegation_id": delegation_id}
-        requested = []
-        for child_id, child in snapshot["children"].items():
-            if child["status"] not in _ACTIVE_STATES:
-                continue
-            attempt = _repository().find_attempt(child_id, delegation_id=delegation_id)
-            if attempt and _repository().request_interrupt(
-                attempt["attempt_id"], reason
-            ).get("status") in {"interrupt_requested", "already_requested"}:
-                requested.append(attempt)
-        record["status"] = "interrupt_requested"
-    _notify_state_change()
-    try:
-        fn()
-    except Exception as exc:
+        interrupt_lock = record.setdefault("_interrupt_lock", threading.Lock())
+
+    # Durable request ownership and the live callback form one per-delegation
+    # transaction. Never wait for this lock while holding _records_lock.
+    with interrupt_lock:
+        snapshot = get_async_delegation(delegation_id, session_key=session_key)
+        if snapshot is None:
+            return {"status": "not_found", "delegation_id": delegation_id}
+        if _terminal(snapshot):
+            return {
+                "status": "already_terminal",
+                "delegation_id": delegation_id,
+                "worker_status": snapshot["state"],
+            }
         with _records_lock:
             current = _records.get(delegation_id)
-            if current and current.get("status") == "interrupt_requested":
-                current["status"] = "running"
-        for attempt in requested:
-            _repository().rollback_interrupt_request(attempt["attempt_id"])
+            if current is not record or current.get("session_key", "") != session_key:
+                if snapshot["state"] == "interrupt_requested":
+                    return {"status": "interrupt_requested", "delegation_id": delegation_id}
+                return {"status": "interrupt_unavailable", "delegation_id": delegation_id}
+            fn = current.get("interrupt_fn")
+        if not callable(fn):
+            return {"status": "interrupt_unavailable", "delegation_id": delegation_id}
+
+        requested_attempt_ids = []
+        for child in snapshot["children"].values():
+            if child["status"] not in _ACTIVE_STATES:
+                continue
+            attempt_id = child.get("attempt_id")
+            if not isinstance(attempt_id, str) or not attempt_id:
+                continue
+            outcome = _repository().request_interrupt(attempt_id, reason)
+            if outcome.get("status") == "interrupt_requested":
+                requested_attempt_ids.append(attempt_id)
+
+        # A caller that owns no transition is idempotent. It observes the
+        # prior owner's completed transaction and never invokes or rolls back.
+        if not requested_attempt_ids:
+            current_snapshot = get_async_delegation(
+                delegation_id, session_key=session_key
+            )
+            if current_snapshot is None:
+                return {"status": "not_found", "delegation_id": delegation_id}
+            if _terminal(current_snapshot):
+                return {
+                    "status": "already_terminal",
+                    "delegation_id": delegation_id,
+                    "worker_status": current_snapshot["state"],
+                }
+            status = (
+                "interrupt_requested"
+                if current_snapshot["state"] == "interrupt_requested"
+                else "interrupt_unavailable"
+            )
+            return {"status": status, "delegation_id": delegation_id}
+
+        with _records_lock:
+            current = _records.get(delegation_id)
+            if current is record:
+                current["status"] = "interrupt_requested"
         _notify_state_change()
-        return {
-            "status": "interrupt_failed",
-            "delegation_id": delegation_id,
-            "error": f"{type(exc).__name__}: {exc}",
-        }
-    return {"status": "interrupt_requested", "delegation_id": delegation_id}
+        try:
+            fn()
+        except Exception as exc:
+            for attempt_id in requested_attempt_ids:
+                _repository().rollback_interrupt_request(attempt_id)
+            current_snapshot = get_async_delegation(
+                delegation_id, session_key=session_key
+            )
+            with _records_lock:
+                current = _records.get(delegation_id)
+                if current is record and current.get("status") == "interrupt_requested":
+                    if current_snapshot and current_snapshot["state"] in _ACTIVE_STATES:
+                        current["status"] = current_snapshot["state"]
+            _notify_state_change()
+            return {
+                "status": "interrupt_failed",
+                "delegation_id": delegation_id,
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+        return {"status": "interrupt_requested", "delegation_id": delegation_id}
 
 
 def abandon_async_delegation(
@@ -787,6 +838,7 @@ def dispatch_async_delegation(
         "dispatched_at": dispatched_at,
         "completed_at": None,
         "interrupt_fn": interrupt_fn,
+        "_interrupt_lock": threading.Lock(),
         "root_subagent_ids": list(root_subagent_ids or []),
     }
     # Capacity check and record insert under ONE lock hold — checking
@@ -863,7 +915,9 @@ def _finalize(delegation_id: str, result: Dict[str, Any], status: str) -> None:
         record["status"] = "finalizing"
         record["completed_at"] = time.time()
         record["interrupt_fn"] = None  # drop the closure; child is done
-        event_record = dict(record)
+        event_record = {
+            k: v for k, v in record.items() if k != "_interrupt_lock"
+        }
 
     _push_completion_event(event_record, result, status)
     with _records_lock:
@@ -997,6 +1051,7 @@ def dispatch_async_delegation_batch(
         "dispatched_at": dispatched_at,
         "completed_at": None,
         "interrupt_fn": interrupt_fn,
+        "_interrupt_lock": threading.Lock(),
         "root_subagent_ids": list(root_subagent_ids or []),
         "is_batch": True,
     }
@@ -1079,7 +1134,9 @@ def _finalize_batch(
         record["status"] = "finalizing"
         record["completed_at"] = time.time()
         record["interrupt_fn"] = None
-        event_record = dict(record)
+        event_record = {
+            k: v for k, v in record.items() if k != "_interrupt_lock"
+        }
 
     try:
         from tools.process_registry import process_registry
@@ -1155,7 +1212,11 @@ def list_async_delegations(
         return list_durable_delegations(session_keys=[session_key])
     with _records_lock:
         return [
-            {k: v for k, v in r.items() if k != "interrupt_fn"}
+            {
+                k: v
+                for k, v in r.items()
+                if k not in {"interrupt_fn", "_interrupt_lock"}
+            }
             for r in _records.values()
         ]
 
