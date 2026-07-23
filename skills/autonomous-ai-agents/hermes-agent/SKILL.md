@@ -702,22 +702,22 @@ Four systems run alongside the main conversation loop. Quick reference
 here; full developer notes live in `AGENTS.md`, user-facing docs under
 `website/docs/user-guide/features/`.
 
-### Delegation (`delegate_task`)
+### Delegation (`delegate_task` + `delegation`)
 
-Spawn a subagent with an isolated context + terminal session.
+`delegate_task` creates a new logical delegation and returns its ID immediately.
+The `delegation` control tool operates that existing delegation durably:
+`list`, `status`, `tail`, `wait`, `steer`, `resume`, `interrupt`, and `abandon`.
 
-- **Single:** `delegate_task(goal, context)`.
-- **Batch:** `delegate_task(tasks=[{goal, ...}, ...])` runs children in
-  parallel, capped by `delegation.max_concurrent_children` (default 3).
-- **Background:** `delegate_task(background=true)` returns a handle
-  immediately and keeps the parent loop going; the child's result
-  re-enters the conversation as a new turn when it finishes.
-- **Roles:** `leaf` (default; cannot re-delegate) vs `orchestrator`
-  (can spawn its own workers, bounded by `delegation.max_spawn_depth`).
-- **Not durable.** A backgrounded child is still process-local — if the
-  parent process exits, the child is lost. For work that must outlive
-  the process, use `cronjob` or
-  `terminal(background=True, notify_on_complete=True)`.
+- **Spawn only for genuinely new independent work:** use `delegate_task(goal, context, toolsets)` or batch tasks.
+- **Steer an active child:** use `delegation(action="steer", delegation_id=..., subagent_id=..., message=...)` to add constraints without discarding its context.
+- **Resume a terminal/interrupted child:** use `delegation(action="resume", delegation_id=..., subagent_id=..., message=...)`. This preserves the stable logical subagent ID, hydrates its authorized child-only transcript, and creates a distinct immutable attempt/run.
+- **Do not respawn the same task by default.** Reuse the existing logical child for corrections, continuation, unfinished work, and follow-up review of its own findings. Spawn a fresh child only when clean independent context is itself required (for example an unbiased final reviewer) or the old transcript is unsuitable/unavailable.
+- **Exact controls:** pass `attempt_id`/`run_id` to status, tail, wait, or interruption paths when stale-attempt ambiguity matters. Unqualified wait is FIFO over pending terminal runs, then binds to the active run at call start.
+- **Delivery ownership:** wait consumes at most one exact run; interrupt does not suppress its eventual result; abandon suppresses every still-pending delivery for the logical delegation.
+- **Recovery:** process loss terminalizes the in-flight attempt as outcome-unknown, while persisted reconstruction policy and child transcript make a later explicit resume possible. Live credentials are resolved again and are not persisted in delegation metadata.
+- **Normal operation:** rely on asynchronous completion delivery rather than polling. Use one bounded `wait` only when synchronization is genuinely required.
+- **Roles:** `leaf` (default; cannot re-delegate) vs `orchestrator` (can spawn workers within configured depth bounds).
+- For work that must run automatically on a schedule or independently of conversational control, continue to prefer `cronjob` or a tracked background process.
 
 Config: `delegation.*` in `config.yaml`.
 

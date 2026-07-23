@@ -59,6 +59,45 @@ class TestSteerAcceptance:
         agent.steer("third note")
         assert agent._pending_steer == "first note\nsecond note\nthird note"
 
+    def test_tracked_envelopes_preserve_identity_and_ack_injection(self):
+        agent = _bare_agent()
+        outcomes = []
+        agent.steer(
+            "first",
+            mailbox_id="mail-1",
+            outcome_callback=lambda outcome: outcomes.append(("mail-1", outcome)),
+        )
+        agent.steer(
+            "second",
+            mailbox_id="mail-2",
+            outcome_callback=lambda outcome: outcomes.append(("mail-2", outcome)),
+        )
+        messages = [{"role": "tool", "content": "output", "tool_call_id": "1"}]
+
+        agent._apply_pending_steer_to_tool_results(messages, num_tool_msgs=1)
+
+        assert messages[0]["content"].endswith(
+            "first\nsecond\n[/OUT-OF-BAND USER MESSAGE]"
+        )
+        assert outcomes == [
+            ("mail-1", "injected"),
+            ("mail-2", "injected"),
+        ]
+
+    def test_interrupt_acks_tracked_envelope_as_superseded(self):
+        agent = _bare_agent()
+        outcomes = []
+        agent.steer(
+            "do not deliver",
+            mailbox_id="mail-1",
+            outcome_callback=outcomes.append,
+        )
+
+        agent._clear_pending_steer("superseded_by_interrupt")
+
+        assert outcomes == ["superseded_by_interrupt"]
+        assert agent._pending_steer is None
+
 
 class TestSteerDrain:
     def test_drain_returns_and_clears(self):

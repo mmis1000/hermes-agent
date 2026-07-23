@@ -16,7 +16,12 @@ import time
 import pytest
 
 from tools import async_delegation as ad
-from tools.process_registry import process_registry, format_process_notification
+from tools.process_registry import (
+    finish_notification_delivery,
+    format_process_notification,
+    prepare_notification_delivery,
+    process_registry,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -63,6 +68,341 @@ def _drain_for(delegation_id, timeout=5.0):
             continue
         time.sleep(0.02)
     return None
+
+
+def test_resume_reserves_exact_attempt_and_runs_with_hydrated_history(
+    tmp_path, monkeypatch
+):
+    from types import SimpleNamespace
+    import uuid
+    from hermes_state import SessionDB
+    from tools import delegate_tool
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    ad._reset_for_tests()
+    suffix = uuid.uuid4().hex
+    delegation_id = f"deleg-resume-e2e-{suffix}"
+    logical_id = f"sa-resume-e2e-{suffix}"
+    parent_session = f"parent-resume-e2e-{suffix}"
+    child_session = f"child-resume-e2e-{suffix}"
+    db = SessionDB()
+    db.create_session(parent_session, source="discord")
+    db.create_session(
+        child_session,
+        source="subagent",
+        parent_session_id=parent_session,
+        model_config={"_delegate_from": parent_session},
+    )
+    db.append_message(child_session, "user", "original child goal")
+    db.append_message(child_session, "assistant", "partial answer")
+
+    record = {
+        "delegation_id": delegation_id,
+        "goal": "finish the original task",
+        "goals": ["finish the original task"],
+        "context": None,
+        "toolsets": ["file"],
+        "role": "leaf",
+        "model": "test-model",
+        "session_key": parent_session,
+        "origin_ui_session_id": "ui-parent",
+        "parent_session_id": parent_session,
+        "status": "running",
+        "dispatched_at": time.time(),
+        "root_subagent_ids": [logical_id],
+        "is_batch": False,
+    }
+    ad._persist_dispatch(record)
+    initial_run = record["run_id"]
+    initial_attempt = record["attempt_ids"][0]
+    metadata = {
+        "child_session_id": child_session,
+        "parent_session_id": parent_session,
+        "model": "test-model",
+        "provider": "test-provider",
+        "role": "leaf",
+        "depth": 1,
+        "enabled_toolsets": ["file"],
+        "disabled_toolsets": ["delegation"],
+        "max_iterations": 7,
+    }
+    assert ad._repository().transition_attempt(
+        initial_attempt, {"starting"}, "completed", metadata=metadata
+    )["status"] == "updated"
+    assert ad._repository().complete_run(
+        initial_run,
+        {
+            "delegation_id": delegation_id,
+            "run_id": initial_run,
+            "status": "completed",
+            "completed_at": time.time(),
+        },
+        {"status": "completed", "summary": "partial answer"},
+    )["status"] == "completed"
+
+    submitted = []
+
+    class CapturingExecutor:
+        def submit(self, fn):
+            submitted.append(fn)
+            return SimpleNamespace()
+
+    monkeypatch.setattr(ad, "_get_executor", lambda _limit: CapturingExecutor())
+    continuation = {
+        "session_id": f"child-resume-e2e-next-{suffix}",
+        "parent_session_id": child_session,
+        "delegate_from": parent_session,
+    }
+    monkeypatch.setattr(
+        delegate_tool, "prepare_resumed_child_session", lambda _bundle: continuation
+    )
+    resumed_metadata = {
+        **metadata,
+        "child_session_id": continuation["session_id"],
+    }
+    built = SimpleNamespace(
+        _delegation_session_ref={},
+        _delegation_runtime_metadata=resumed_metadata,
+        close=lambda: None,
+    )
+    build_calls = []
+
+    def fake_build(**kwargs):
+        build_calls.append(kwargs)
+        return built
+
+    monkeypatch.setattr(delegate_tool, "build_resumed_child_agent", fake_build)
+    run_calls = []
+
+    def fake_run(*args, **kwargs):
+        run_calls.append((args, kwargs))
+        db.create_session(
+            continuation["session_id"],
+            source="subagent",
+            parent_session_id=child_session,
+            model_config={"_delegate_from": parent_session},
+        )
+        db.append_message(
+            continuation["session_id"], "user", kwargs["resume_message"]
+        )
+        db.append_message(
+            continuation["session_id"], "assistant", "new resumed work"
+        )
+        return {
+            "status": "completed",
+            "summary": "resumed result",
+            "api_calls": 1,
+            "duration_seconds": 0.1,
+            "model": "test-model",
+        }
+
+    monkeypatch.setattr(delegate_tool, "_run_single_child", fake_run)
+
+    dispatched = ad.dispatch_resumed_subagent(
+        delegation_id,
+        logical_id,
+        session_key=parent_session,
+        message="continue from the partial answer",
+        parent_agent=None,
+    )
+    assert dispatched["status"] == "dispatched"
+    assert dispatched["attempt_number"] == 2
+    assert dispatched["run_id"] != initial_run
+    assert dispatched["attempt_id"] != initial_attempt
+    assert len(submitted) == 1
+    assert build_calls[0]["logical_id"] == logical_id
+
+    duplicate = ad.dispatch_resumed_subagent(
+        delegation_id,
+        logical_id,
+        session_key=parent_session,
+        message="duplicate resume",
+        parent_agent=object(),
+    )
+    assert duplicate == {
+        "status": "already_running",
+        "attempt_id": dispatched["attempt_id"],
+        "run_id": dispatched["run_id"],
+    }
+
+    submitted[0]()
+    assert run_calls[0][1]["resume_message"] == "continue from the partial answer"
+    assert [item["content"] for item in run_calls[0][1]["conversation_history"]] == [
+        "original child goal",
+        "partial answer",
+    ]
+    event = _drain_for(delegation_id)
+    assert event["run_id"] == dispatched["run_id"]
+    assert event["status"] == "completed"
+    assert event["summary"] == "resumed result"
+    resumed_snapshot = ad._repository().snapshot(
+        delegation_id, run_id=dispatched["run_id"]
+    )
+    assert resumed_snapshot["children"][logical_id]["status"] == "completed"
+    assert (
+        resumed_snapshot["children"][logical_id]["child_session_id"]
+        == continuation["session_id"]
+    )
+    next_resume = ad.load_subagent_resume_bundle(
+        delegation_id, logical_id, session_key=parent_session
+    )
+    assert next_resume["status"] == "ready"
+    assert next_resume["bundle"]["prior_child_session_id"] == continuation["session_id"]
+    assert next_resume["bundle"]["child_lineage"] == [
+        child_session,
+        continuation["session_id"],
+    ]
+    assert [item["content"] for item in next_resume["bundle"]["history"]] == [
+        "original child goal",
+        "partial answer",
+        "continue from the partial answer",
+        "new resumed work",
+    ]
+
+
+def test_resume_construction_failure_is_terminal_and_retryable(monkeypatch):
+    from types import SimpleNamespace
+    from tools import delegate_tool
+
+    delegation_id = "deleg-resume-build-failure"
+    logical_id = "sa-resume-build-failure"
+    record = {
+        "delegation_id": delegation_id,
+        "goal": "retryable task",
+        "session_key": "owner",
+        "status": "running",
+        "dispatched_at": time.time(),
+        "root_subagent_ids": [logical_id],
+    }
+    ad._persist_dispatch(record)
+    initial_attempt = record["attempt_ids"][0]
+    metadata = {
+        "child_session_id": "child-last-good",
+        "parent_session_id": "owner",
+        "provider": "provider",
+        "model": "model",
+        "role": "leaf",
+        "depth": 1,
+    }
+    ad._repository().transition_attempt(
+        initial_attempt, {"starting"}, "completed", metadata=metadata
+    )
+    bundle = {
+        "prior_child_session_id": "child-last-good",
+        "history": [{"role": "user", "content": "goal"}],
+        "reconstruction_metadata": dict(metadata),
+    }
+    monkeypatch.setattr(
+        ad,
+        "load_subagent_resume_bundle",
+        lambda *a, **kw: {
+            "status": "ready",
+            "delegation_id": delegation_id,
+            "subagent_id": logical_id,
+            "bundle": bundle,
+        },
+    )
+    counter = iter(("child-failed-segment", "child-retry-segment"))
+    monkeypatch.setattr(
+        delegate_tool,
+        "prepare_resumed_child_session",
+        lambda _bundle: {
+            "session_id": next(counter),
+            "parent_session_id": "child-last-good",
+            "delegate_from": "owner",
+        },
+    )
+    monkeypatch.setattr(
+        delegate_tool,
+        "build_resumed_child_agent",
+        lambda **kwargs: (_ for _ in ()).throw(RuntimeError("constructor failed")),
+    )
+
+    failed = ad.dispatch_resumed_subagent(
+        delegation_id,
+        logical_id,
+        session_key="owner",
+        message="try again",
+        parent_agent=object(),
+    )
+    assert failed["status"] == "dispatch_failed"
+    assert failed["attempt_number"] == 2
+    failed_event = _drain_for(delegation_id)
+    assert failed_event["run_id"] == failed["run_id"]
+    assert failed_event["status"] == "error"
+    failed_snapshot = ad._repository().snapshot(
+        delegation_id, run_id=failed["run_id"]
+    )
+    failed_child = failed_snapshot["children"][logical_id]
+    assert failed_child["status"] == "error"
+    assert failed_child["child_session_id"] == "child-last-good"
+
+    submitted = []
+
+    class CapturingExecutor:
+        def submit(self, fn):
+            submitted.append(fn)
+            return SimpleNamespace()
+
+    monkeypatch.setattr(ad, "_get_executor", lambda _limit: CapturingExecutor())
+    monkeypatch.setattr(
+        delegate_tool,
+        "build_resumed_child_agent",
+        lambda **kwargs: SimpleNamespace(
+            _delegation_session_ref={},
+            _delegation_runtime_metadata=dict(metadata),
+            close=lambda: None,
+        ),
+    )
+    retried = ad.dispatch_resumed_subagent(
+        delegation_id,
+        logical_id,
+        session_key="owner",
+        message="retry after repaired config",
+        parent_agent=object(),
+    )
+    assert retried["status"] == "dispatched"
+    assert retried["attempt_number"] == 3
+    assert retried["child_session_id"] == "child-retry-segment"
+    assert len(submitted) == 1
+
+
+def test_wait_releases_exact_hold_when_snapshot_read_fails(monkeypatch):
+    import sqlite3
+
+    released = []
+
+    class FakeRepository:
+        def recover_stale_wait_holds(self, **_kwargs):
+            return 0
+
+        def hold_for_wait(self, delegation_id, session_key, token, **_kwargs):
+            return {"status": "held", "run_id": "run-bound"}
+
+        def release_wait_hold(self, delegation_id, session_key, token, **kwargs):
+            released.append((delegation_id, session_key, token, kwargs.get("run_id")))
+            return {"status": "released"}
+
+    fake_repository = FakeRepository()
+    monkeypatch.setattr(ad, "_repository", lambda: fake_repository)
+    monkeypatch.setattr(
+        ad,
+        "get_async_delegation",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            sqlite3.OperationalError("database is locked")
+        ),
+    )
+
+    with pytest.raises(sqlite3.OperationalError, match="database is locked"):
+        ad.wait_for_delegation(
+            "deleg-wait-read-error",
+            session_key="owner",
+            timeout_seconds=0,
+            run_id="run-bound",
+        )
+    assert len(released) == 1
+    assert released[0][0:2] == ("deleg-wait-read-error", "owner")
+    assert released[0][3] == "run-bound"
 
 
 def test_dispatch_returns_immediately_without_blocking():
@@ -337,13 +677,12 @@ def test_submit_failure_removes_durable_running_record(tmp_path, monkeypatch):
     )
 
     assert result["status"] == "rejected"
-    with ad._DB_LOCK, ad._connect() as conn:
-        assert conn.execute("SELECT COUNT(*) FROM async_delegations").fetchone()[0] == 0
+    assert ad.list_durable_delegations() == []
 
 
 def test_pending_retention_prunes_delivered_before_undelivered(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    monkeypatch.setattr(ad, "_MAX_RETAINED_COMPLETED", 2)
+    monkeypatch.setattr(ad, "_MAX_RETAINED_COMPLETED", 0)
     for index, delivery_state in enumerate(("pending", "delivered", "pending")):
         delegation_id = f"deleg_{index}"
         record = {
@@ -372,29 +711,42 @@ def test_pending_retention_prunes_delivered_before_undelivered(tmp_path, monkeyp
     assert ad.get_durable_delegation("deleg_2") is not None
 
 
-def test_recover_marks_abandoned_running_record_unknown(tmp_path, monkeypatch):
+def test_recovery_completes_exact_old_run_without_mutating_live_new_run(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     record = {
-        "delegation_id": "deleg_abandoned",
-        "session_key": "owner",
-        "origin_ui_session_id": "",
-        "parent_session_id": None,
-        "dispatched_at": 1.0,
+        "delegation_id": "deleg_abandoned", "session_key": "owner",
+        "origin_ui_session_id": "", "parent_session_id": None, "dispatched_at": 1.0,
     }
-    ad._persist_dispatch(record)
-    with ad._DB_LOCK, ad._connect() as conn:
-        conn.execute(
-            "UPDATE async_delegations SET owner_pid=?, owner_started_at=NULL WHERE delegation_id=?",
-            (99999999, "deleg_abandoned"),
-        )
-
-    assert ad.recover_abandoned_delegations() == 1
-    durable = ad.get_durable_delegation("deleg_abandoned")
-    assert durable["state"] == "unknown"
-    assert durable["delivery_state"] == "pending"
+    record["root_subagent_ids"] = ["sa-abandoned", "sa-resumed"]
+    repository = ad._repository()
+    initial = repository.register_initial_dispatch(
+        record, owner_pid=99999999
+    )
+    repository.transition_attempt(
+        initial["attempts"][1]["attempt_id"], {"starting"}, "completed"
+    )
+    resumed = repository.reserve_resumed_attempt(
+        "sa-resumed", owner_pid=os.getpid(), physical_worker_id="worker-live"
+    )
     restored = queue.Queue()
     assert ad.restore_undelivered_completions(restored) == 1
-    assert restored.get_nowait()["status"] == "unknown"
+    event = restored.get_nowait()
+    assert (event["run_id"], event["status"]) == (initial["run_id"], "unknown")
+    assert prepare_notification_delivery(event) == "deliver"
+    assert ad.inspect_async_delivery_claim(
+        "deleg_abandoned",
+        event["_async_delivery_claim_token"],
+        run_id=initial["run_id"],
+    ) == "current"
+    assert finish_notification_delivery(event, delivered=True)
+    assert repository.inspect_delivery("deleg_abandoned", initial["run_id"])["completed_at"]
+    assert repository.inspect_delivery(
+        "deleg_abandoned", initial["run_id"]
+    )["delivery_state"] == "delivered"
+    live = repository.inspect_delivery("deleg_abandoned", resumed["run_id"])
+    assert live["completed_at"] is None
+    assert repository.snapshot("deleg_abandoned")["children"]["sa-resumed"]["status"] == "starting"
+    assert ad.recover_abandoned_delegations() == 0
 
 
 def test_durable_delivery_claim_is_exclusive_and_retryable(tmp_path, monkeypatch):
@@ -485,6 +837,133 @@ def test_delegate_task_background_routes_async_and_does_not_block(monkeypatch):
     text = format_process_notification(evt)
     assert text is not None
     assert "the real task" in text
+
+
+def test_delegate_task_binds_exact_run_and_attempt_before_runner(tmp_path, monkeypatch):
+    from unittest.mock import MagicMock
+    import tools.delegate_tool as dt
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    parent = MagicMock()
+    parent._delegate_depth = 0
+    parent.session_id = "sess-bind"
+    parent._interrupt_requested = False
+    parent._active_children = []
+    parent._active_children_lock = None
+    child = MagicMock()
+    child._delegate_role = "leaf"
+    child._subagent_id = "sa-bound"
+    observed = {}
+
+    def run_bound(task_index, goal, child=None, parent_agent=None, **_kwargs):
+        observed["run_id"] = getattr(child, "_delegation_run_id", None)
+        observed["attempt_id"] = getattr(child, "_delegation_attempt_id", None)
+        return {
+            "task_index": task_index,
+            "status": "completed",
+            "summary": goal,
+            "api_calls": 1,
+            "duration_seconds": 0.1,
+            "model": "m",
+        }
+
+    creds = {
+        "model": "m", "provider": None, "base_url": None, "api_key": None,
+        "api_mode": None, "command": None, "args": None,
+    }
+    monkeypatch.setattr(dt, "_build_child_agent", lambda **_kwargs: child)
+    monkeypatch.setattr(dt, "_run_single_child", run_bound)
+    monkeypatch.setattr(dt, "_resolve_delegation_credentials", lambda *_a, **_k: creds)
+
+    payload = json.loads(
+        dt.delegate_task(goal="bind exact ids", background=True, parent_agent=parent)
+    )
+    event = _drain_for(payload["delegation_id"])
+    assert event is not None
+    snapshot = ad.get_durable_delegation(payload["delegation_id"])
+    durable_child = snapshot["children"]["sa-bound"]
+    assert observed == {
+        "run_id": snapshot["run_id"],
+        "attempt_id": durable_child["attempt_id"],
+    }
+
+
+def test_background_child_persists_reconstruction_metadata_before_execution(
+    tmp_path, monkeypatch
+):
+    from unittest.mock import MagicMock
+    import tools.delegate_tool as dt
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    parent = MagicMock()
+    parent._delegate_depth = 0
+    parent.session_id = "sess-reconstruct"
+    parent._interrupt_requested = False
+    parent._active_children = []
+    parent._active_children_lock = None
+    parent._current_task_id = None
+
+    child = MagicMock()
+    child._delegate_role = "leaf"
+    child._delegate_depth = 1
+    child._subagent_id = "sa-reconstruct"
+    child._parent_subagent_id = None
+    child._credential_pool = None
+    child.tool_progress_callback = None
+    child.model = "model-safe"
+    child._delegation_session_ref = {"session_id": "child-session"}
+    child._delegation_runtime_metadata = {
+        "child_session_id": "child-session",
+        "provider": "provider-safe",
+        "model": "model-safe",
+        "enabled_toolsets": ["terminal"],
+        "disabled_toolsets": ["delegation"],
+        "workdir": "/workspace/repo",
+        "max_iterations": 8,
+        "fallback_routes": [
+            {"provider": "fallback-safe", "model": "fallback-model"}
+        ],
+    }
+    entered = threading.Event()
+    release = threading.Event()
+
+    def run_conversation(user_message, task_id=None, stream_callback=None):
+        entered.set()
+        assert release.wait(5)
+        return {"final_response": "done", "completed": True, "api_calls": 1}
+
+    child.run_conversation.side_effect = run_conversation
+    creds = {
+        "model": "model-safe", "provider": None, "base_url": None,
+        "api_key": None, "api_mode": None, "command": None, "args": None,
+    }
+    monkeypatch.setattr(dt, "_build_child_agent", lambda **_kwargs: child)
+    monkeypatch.setattr(dt, "_resolve_delegation_credentials", lambda *_a, **_k: creds)
+
+    payload = json.loads(
+        dt.delegate_task(
+            goal="persist reconstruction", background=True, parent_agent=parent
+        )
+    )
+    try:
+        assert entered.wait(5)
+        snapshot = ad.get_durable_delegation(payload["delegation_id"])
+        durable_child = snapshot["children"]["sa-reconstruct"]
+        assert durable_child["child_session_id"] == "child-session"
+        assert durable_child["provider"] == "provider-safe"
+        assert durable_child["enabled_toolsets"] == ["terminal"]
+        assert durable_child["workdir"] == "/workspace/repo"
+        assert durable_child["fallback_routes"] == [
+            {"provider": "fallback-safe", "model": "fallback-model"}
+        ]
+        assert child._delegation_session_ref == {
+            "session_id": "child-session",
+            "run_id": snapshot["run_id"],
+            "attempt_id": durable_child["attempt_id"],
+        }
+    finally:
+        release.set()
+    assert _drain_for(payload["delegation_id"]) is not None
 
 
 def test_delegate_task_background_uses_live_tui_agent_session_id(monkeypatch):

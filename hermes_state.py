@@ -974,7 +974,75 @@ CREATE TABLE IF NOT EXISTS async_delegations (
     owner_started_at INTEGER,
     task_json TEXT,
     delivery_claim TEXT,
-    delivery_claimed_at REAL
+    delivery_claimed_at REAL,
+    root_subagent_ids_json TEXT NOT NULL DEFAULT '[]',
+    children_json TEXT NOT NULL DEFAULT '{}',
+    interrupt_requests_json TEXT NOT NULL DEFAULT '{}',
+    interrupt_reason TEXT,
+    abandon_reason TEXT,
+    lifecycle_version INTEGER NOT NULL DEFAULT 1
+);
+
+CREATE TABLE IF NOT EXISTS delegation_logical_subagents (
+    logical_id TEXT PRIMARY KEY,
+    delegation_id TEXT NOT NULL REFERENCES async_delegations(delegation_id) ON DELETE CASCADE,
+    parent_logical_id TEXT REFERENCES delegation_logical_subagents(logical_id),
+    root_ordinal INTEGER,
+    spec_json TEXT NOT NULL DEFAULT '{}',
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    UNIQUE (delegation_id, root_ordinal)
+);
+
+CREATE TABLE IF NOT EXISTS delegation_runs (
+    run_id TEXT PRIMARY KEY,
+    delegation_id TEXT NOT NULL REFERENCES async_delegations(delegation_id) ON DELETE CASCADE,
+    run_number INTEGER NOT NULL,
+    kind TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    completed_at REAL,
+    event_json TEXT,
+    result_json TEXT,
+    delivery_state TEXT NOT NULL DEFAULT 'pending',
+    delivery_claim TEXT,
+    delivery_claimed_at REAL,
+    delivery_attempts INTEGER NOT NULL DEFAULT 0,
+    delivered_at REAL,
+    UNIQUE (delegation_id, run_number)
+);
+
+CREATE TABLE IF NOT EXISTS delegation_attempts (
+    attempt_id TEXT PRIMARY KEY,
+    logical_id TEXT NOT NULL REFERENCES delegation_logical_subagents(logical_id) ON DELETE CASCADE,
+    run_id TEXT NOT NULL REFERENCES delegation_runs(run_id) ON DELETE CASCADE,
+    attempt_number INTEGER NOT NULL,
+    physical_worker_id TEXT,
+    state TEXT NOT NULL,
+    owner_pid INTEGER,
+    owner_started_at INTEGER,
+    created_at REAL NOT NULL,
+    started_at REAL,
+    completed_at REAL,
+    updated_at REAL NOT NULL,
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    interrupt_reason TEXT,
+    interrupt_requested_at REAL,
+    interrupt_taken_at REAL,
+    UNIQUE (logical_id, attempt_number)
+);
+
+CREATE TABLE IF NOT EXISTS delegation_steer_mailbox (
+    mailbox_id TEXT PRIMARY KEY,
+    delegation_id TEXT NOT NULL REFERENCES async_delegations(delegation_id) ON DELETE CASCADE,
+    logical_id TEXT NOT NULL REFERENCES delegation_logical_subagents(logical_id) ON DELETE CASCADE,
+    attempt_id TEXT NOT NULL REFERENCES delegation_attempts(attempt_id) ON DELETE CASCADE,
+    sequence_number INTEGER NOT NULL,
+    message TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    created_at REAL NOT NULL,
+    forwarded_at REAL,
+    resolved_at REAL,
+    UNIQUE (attempt_id, sequence_number)
 );
 
 CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);
@@ -1004,7 +1072,103 @@ CREATE INDEX IF NOT EXISTS idx_sessions_gateway_peer
     ON sessions(source, user_id, chat_id, chat_type, thread_id, started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_sessions_handoff_state
     ON sessions(handoff_state, started_at);
+CREATE INDEX IF NOT EXISTS idx_async_delegations_owner_updated
+    ON async_delegations(origin_session, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_delegation_attempts_run
+    ON delegation_attempts(run_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_delegation_one_active_attempt
+    ON delegation_attempts(logical_id)
+    WHERE state IN ('starting','running','finalizing','interrupt_requested');
+CREATE INDEX IF NOT EXISTS idx_delegation_runs_delivery
+    ON delegation_runs(delivery_state, completed_at);
+CREATE INDEX IF NOT EXISTS idx_delegation_steer_attempt
+    ON delegation_steer_mailbox(attempt_id, sequence_number);
 """
+
+
+def _execute_schema_script(conn: sqlite3.Connection, script: str) -> None:
+    """Execute a DDL script without ``executescript``'s implicit commit."""
+    statement = ""
+    for line in script.splitlines():
+        statement += line + "\n"
+        if sqlite3.complete_statement(statement):
+            if statement.strip():
+                conn.execute(statement)
+            statement = ""
+    if statement.strip():  # pragma: no cover - constants are complete scripts
+        raise sqlite3.OperationalError("incomplete state schema statement")
+
+
+def _parse_schema_columns(schema_sql: str) -> Dict[str, Dict[str, str]]:
+    """Let SQLite derive ADD COLUMN expressions from the declarative schema."""
+    ref = sqlite3.connect(":memory:")
+    try:
+        ref.executescript(schema_sql)
+        expected: Dict[str, Dict[str, str]] = {}
+        tables = ref.execute(
+            "SELECT name FROM sqlite_master "
+            "WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+        ).fetchall()
+        for (table_name,) in tables:
+            columns: Dict[str, str] = {}
+            for row in ref.execute(f'PRAGMA table_info("{table_name}")'):
+                parts = [row[2]] if row[2] else []
+                if row[3] and not row[5]:
+                    parts.append("NOT NULL")
+                if row[4] is not None:
+                    parts.append(f"DEFAULT {row[4]}")
+                columns[row[1]] = " ".join(parts)
+            expected[table_name] = columns
+        return expected
+    finally:
+        ref.close()
+
+
+_EXPECTED_STATE_COLUMNS: Optional[Dict[str, Dict[str, str]]] = None
+_EXPECTED_STATE_COLUMNS_LOCK = threading.Lock()
+
+
+def _reconcile_state_columns(conn: sqlite3.Connection) -> None:
+    global _EXPECTED_STATE_COLUMNS
+    if _EXPECTED_STATE_COLUMNS is None:
+        with _EXPECTED_STATE_COLUMNS_LOCK:
+            if _EXPECTED_STATE_COLUMNS is None:
+                _EXPECTED_STATE_COLUMNS = _parse_schema_columns(SCHEMA_SQL)
+    for table_name, declared in (_EXPECTED_STATE_COLUMNS or {}).items():
+        live = {row[1] for row in conn.execute(f'PRAGMA table_info("{table_name}")')}
+        for column_name, column_type in declared.items():
+            if column_name not in live:
+                safe = column_name.replace('"', '""')
+                conn.execute(
+                    f'ALTER TABLE "{table_name}" ADD COLUMN "{safe}" {column_type}'
+                )
+
+
+def ensure_state_schema(conn: sqlite3.Connection) -> None:
+    """Reconcile the declarative state schema in one cross-process transaction.
+
+    The caller keeps ownership of an existing transaction.  Otherwise this
+    function acquires the SQLite write lock before introspection and returns
+    with no transaction open.
+    """
+    owns_transaction = not conn.in_transaction
+    if owns_transaction:
+        conn.execute("BEGIN IMMEDIATE")
+    try:
+        _execute_schema_script(conn, SCHEMA_SQL)
+        _reconcile_state_columns(conn)
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_messages_platform_msg_id "
+            "ON messages(session_id, platform_message_id) "
+            "WHERE platform_message_id IS NOT NULL"
+        )
+        _execute_schema_script(conn, DEFERRED_INDEX_SQL)
+        if owns_transaction:
+            conn.commit()
+    except BaseException:
+        if owns_transaction:
+            conn.rollback()
+        raise
 
 FTS_SQL = """
 CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
@@ -1554,35 +1718,7 @@ class SessionDB:
         Adding a column to SCHEMA_SQL is all that's needed; the
         reconciliation loop picks it up automatically.
         """
-        ref = sqlite3.connect(":memory:")
-        try:
-            ref.executescript(schema_sql)
-            table_columns: Dict[str, Dict[str, str]] = {}
-            for (tbl,) in ref.execute(
-                "SELECT name FROM sqlite_master "
-                "WHERE type='table' AND name NOT LIKE 'sqlite_%'"
-            ).fetchall():
-                cols: Dict[str, str] = {}
-                for row in ref.execute(
-                    f'PRAGMA table_info("{tbl}")'
-                ).fetchall():
-                    # row: (cid, name, type, notnull, dflt_value, pk)
-                    col_name = row[1]
-                    col_type = row[2] or ""
-                    notnull = row[3]
-                    default = row[4]
-                    pk = row[5]
-                    # Reconstruct the type expression for ALTER TABLE ADD COLUMN
-                    parts = [col_type] if col_type else []
-                    if notnull and not pk:
-                        parts.append("NOT NULL")
-                    if default is not None:
-                        parts.append(f"DEFAULT {default}")
-                    cols[col_name] = " ".join(parts)
-                table_columns[tbl] = cols
-            return table_columns
-        finally:
-            ref.close()
+        return _parse_schema_columns(schema_sql)
 
     def _reconcile_columns(self, cursor: sqlite3.Cursor) -> None:
         """Ensure live tables have every column declared in SCHEMA_SQL.
@@ -1597,36 +1733,8 @@ class SessionDB:
         the column to SCHEMA_SQL and it appears on the next startup.
         Version-gated migration blocks are no longer needed for ADD COLUMN.
         """
-        expected = self._parse_schema_columns(SCHEMA_SQL)
-        for table_name, declared_cols in expected.items():
-            # Get current columns from the live table
-            try:
-                rows = cursor.execute(
-                    f'PRAGMA table_info("{table_name}")'
-                ).fetchall()
-            except sqlite3.OperationalError:
-                continue  # Table doesn't exist yet (shouldn't happen after executescript)
-            live_cols = set()
-            for row in rows:
-                # PRAGMA table_info returns (cid, name, type, notnull, dflt_value, pk)
-                name = row[1] if isinstance(row, (tuple, list)) else row["name"]
-                live_cols.add(name)
-
-            for col_name, col_type in declared_cols.items():
-                if col_name not in live_cols:
-                    safe_name = col_name.replace('"', '""')
-                    try:
-                        cursor.execute(
-                            f'ALTER TABLE "{table_name}" ADD COLUMN "{safe_name}" {col_type}'
-                        )
-                    except sqlite3.OperationalError as exc:
-                        # Expected: "duplicate column name" from a race or
-                        # re-run.  Unexpected: "Cannot add a NOT NULL column
-                        # with default value NULL" from a schema mistake.
-                        # Log at DEBUG so it's visible in agent.log.
-                        logger.debug(
-                            "reconcile %s.%s: %s", table_name, col_name, exc,
-                        )
+        assert self._conn is not None
+        _reconcile_state_columns(self._conn)
 
     def _init_schema(self):
         """Create tables and FTS if they don't exist, reconcile columns.
@@ -1641,33 +1749,9 @@ class SessionDB:
         The schema_version table is retained for future data migrations
         (transforming existing rows) which cannot be handled declaratively.
         """
+        assert self._conn is not None
+        ensure_state_schema(self._conn)
         cursor = self._conn.cursor()
-
-        cursor.executescript(SCHEMA_SQL)
-
-        # ── Declarative column reconciliation ──────────────────────────
-        # Diff live tables against SCHEMA_SQL and ADD any missing columns.
-        # This is idempotent and self-healing: even if a version-gated
-        # migration was skipped (e.g. due to version renumbering), the
-        # column gets created here.
-        self._reconcile_columns(cursor)
-
-        # Indexes that reference reconciler-added columns must be created
-        # AFTER _reconcile_columns runs — declaring them in SCHEMA_SQL
-        # makes the initial executescript fail on legacy DBs (the index's
-        # WHERE clause references a column that doesn't exist yet).
-        try:
-            cursor.execute(
-                "CREATE INDEX IF NOT EXISTS idx_messages_platform_msg_id "
-                "ON messages(session_id, platform_message_id) "
-                "WHERE platform_message_id IS NOT NULL"
-            )
-        except sqlite3.OperationalError as exc:
-            logger.debug("idx_messages_platform_msg_id create skipped: %s", exc)
-
-        # Deferred indexes that reference the reconciler-added ``active``
-        # column (idx_messages_session_active) — same ordering constraint.
-        cursor.executescript(DEFERRED_INDEX_SQL)
 
         # Heal NULL ``active`` rows unconditionally on every startup.
         # On real-world DBs the reconciler-added ``active`` column can lack
@@ -5198,6 +5282,191 @@ class SessionDB:
             repair_alternation=False,
         )
         return model_history, display_history
+
+    @staticmethod
+    def _session_model_config(row: Any) -> Dict[str, Any]:
+        """Decode one session row's model_config without trusting its shape."""
+        raw = row["model_config"] if row is not None else None
+        if isinstance(raw, dict):
+            return dict(raw)
+        if not isinstance(raw, str) or not raw:
+            return {}
+        try:
+            value = json.loads(raw)
+        except (TypeError, ValueError):
+            return {}
+        return value if isinstance(value, dict) else {}
+
+    def control_session_candidates(self, session_id: str) -> List[str]:
+        """Return exact session plus proven compression ancestors, newest first.
+
+        Branches, delegates, and arbitrary sessions sharing a conversation root
+        are deliberately excluded. This is the ownership seam used by durable
+        delegation controls when the originating parent was compressed after it
+        spawned a child.
+        """
+        if not session_id:
+            return []
+        candidates: List[str] = []
+        current = session_id
+        seen: set[str] = set()
+        with self._lock:
+            for _ in range(100):
+                if not current or current in seen:
+                    break
+                seen.add(current)
+                candidates.append(current)
+                row = self._conn.execute(
+                    """SELECT child.parent_session_id, child.source,
+                              child.model_config, parent.end_reason
+                       FROM sessions child
+                       LEFT JOIN sessions parent ON parent.id=child.parent_session_id
+                       WHERE child.id=?""",
+                    (current,),
+                ).fetchone()
+                config = self._session_model_config(row) if row is not None else {}
+                if (
+                    row is None
+                    or row["end_reason"] != "compression"
+                    or row["source"] in {"subagent", "tool"}
+                    or config.get("_delegate_from") is not None
+                    or config.get("_branched_from") is not None
+                ):
+                    break
+                current = row["parent_session_id"]
+        return candidates
+
+    def is_authorized_control_session(
+        self, origin_session_id: str, candidate_session_id: str
+    ) -> bool:
+        """Whether candidate is the origin or its proven compression tip."""
+        return bool(
+            origin_session_id
+            and origin_session_id
+            in self.control_session_candidates(candidate_session_id)
+        )
+
+    def get_subagent_resume_bundle(
+        self,
+        child_session_id: str,
+        reconstruction_metadata: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Return validated provider-facing history for one durable child.
+
+        The walk is child-only and fail-closed: every included segment must be a
+        ``source='subagent'`` row carrying the same stable ``_delegate_from``
+        owner marker. Parent-agent rows are never queried into the replay. A
+        compression continuation is followed only when its parent ended for
+        compression and it carries that same marker.
+        """
+        if not isinstance(reconstruction_metadata, dict):
+            raise ValueError("missing reconstruction metadata")
+        try:
+            metadata = json.loads(json.dumps(reconstruction_metadata))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("corrupt reconstruction metadata") from exc
+        expected_child = metadata.get("child_session_id")
+        delegate_from = metadata.get("parent_session_id")
+        if (
+            not isinstance(child_session_id, str)
+            or not child_session_id
+            or expected_child != child_session_id
+            or not isinstance(delegate_from, str)
+            or not delegate_from
+        ):
+            raise ValueError("incomplete reconstruction metadata")
+
+        with self._lock:
+            start = self._conn.execute(
+                "SELECT id,parent_session_id,source,model_config,end_reason "
+                "FROM sessions WHERE id=?",
+                (child_session_id,),
+            ).fetchone()
+            if start is None:
+                raise ValueError("missing subagent transcript")
+
+            # Follow only this child's compression continuation, never a sibling
+            # delegate/branch that happens to share the same parent.
+            tip = child_session_id
+            seen_forward = {tip}
+            for _ in range(100):
+                row = self._conn.execute(
+                    """SELECT child.id
+                       FROM sessions parent
+                       JOIN sessions child ON child.parent_session_id=parent.id
+                       WHERE parent.id=? AND parent.end_reason='compression'
+                         AND child.source='subagent'
+                         AND json_extract(COALESCE(child.model_config, '{}'),
+                                          '$._delegate_from')=?
+                       ORDER BY child.started_at DESC, child.id DESC LIMIT 1""",
+                    (tip, delegate_from),
+                ).fetchone()
+                if row is None or not row["id"] or row["id"] in seen_forward:
+                    break
+                tip = row["id"]
+                seen_forward.add(tip)
+
+            # Walk backward over resume/compression child segments, stopping
+            # immediately before the owning parent session.
+            child_ids_tip_to_root: List[str] = []
+            current = tip
+            seen: set[str] = set()
+            owner_parent = None
+            for _ in range(100):
+                if not current or current in seen:
+                    raise ValueError("corrupt subagent lineage")
+                seen.add(current)
+                row = self._conn.execute(
+                    "SELECT id,parent_session_id,source,model_config "
+                    "FROM sessions WHERE id=?",
+                    (current,),
+                ).fetchone()
+                if row is None:
+                    raise ValueError("missing subagent lineage segment")
+                config = self._session_model_config(row)
+                if row["source"] != "subagent" or config.get("_delegate_from") != delegate_from:
+                    owner_parent = current
+                    break
+                child_ids_tip_to_root.append(current)
+                current = row["parent_session_id"]
+            else:
+                raise ValueError("subagent lineage exceeds safety bound")
+
+            if owner_parent is None:
+                owner_parent = current
+            if child_session_id not in child_ids_tip_to_root:
+                raise ValueError("foreign subagent lineage")
+
+            child_ids = list(reversed(child_ids_tip_to_root))
+            placeholders = ",".join("?" for _ in child_ids)
+            rows = self._conn.execute(
+                f"SELECT session_id, {self._CONVERSATION_ROW_COLUMNS} "
+                f"FROM messages WHERE session_id IN ({placeholders}) AND active=1 "
+                "ORDER BY id",
+                tuple(child_ids),
+            ).fetchall()
+
+        if not self.is_authorized_control_session(delegate_from, owner_parent):
+            raise ValueError("foreign subagent lineage")
+        history = self._rows_to_conversation(
+            rows,
+            session_id=tip,
+            include_ancestors=False,
+            repair_alternation=True,
+        )
+        from agent.replay_cleanup import sanitize_replay_history
+
+        history = sanitize_replay_history(history)
+        if not history:
+            raise ValueError("missing subagent transcript")
+        return {
+            "history": history,
+            "prior_child_session_id": tip,
+            "initial_child_session_id": child_session_id,
+            "parent_session_id": delegate_from,
+            "child_lineage": child_ids,
+            "reconstruction_metadata": metadata,
+        }
 
     def get_ancestor_display_prefix(self, session_id: str) -> List[Dict[str, Any]]:
         """Return the ancestor-only display messages for a session lineage.

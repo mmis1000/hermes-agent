@@ -2978,6 +2978,7 @@ class AIAgent:
         """
         self._interrupt_requested = True
         self._interrupt_message = message
+        self._clear_pending_steer("superseded_by_interrupt")
         # A cron turn performs its API request on the conversation thread to
         # avoid the nested interrupt-worker deadlock.  Unlike the normal worker
         # path, its client is registered here so this cross-thread interrupt can
@@ -3054,66 +3055,119 @@ class AIAgent:
                     _set_interrupt(False, _wtid)
                 except Exception:
                     pass
-        # A hard interrupt supersedes any pending /steer — the steer was
-        # meant for the agent's next tool-call iteration, which will no
-        # longer happen. Drop it instead of surprising the user with a
-        # late injection on the post-interrupt turn.
-        _steer_lock = getattr(self, "_pending_steer_lock", None)
-        if _steer_lock is not None:
-            with _steer_lock:
-                self._pending_steer = None
+        # A hard interrupt supersedes pending steer envelopes. Tracked durable
+        # envelopes acknowledge the exact mailbox item; local /steer text is
+        # simply discarded for backward-compatible interrupt behavior.
+        self._clear_pending_steer("superseded_by_interrupt")
 
-    def steer(self, text: str) -> bool:
-        """
-        Inject a user message into the next tool result without interrupting.
+    def _steer_queue_unlocked(self) -> list:
+        queue = getattr(self, "_pending_steer_envelopes", None)
+        if isinstance(queue, list):
+            return queue
+        # object.__new__ test stubs and older restored agents may only have the
+        # legacy string slot. Materialize it once as an untracked envelope.
+        text = getattr(self, "_pending_steer", None)
+        queue = [{"text": text, "mailbox_id": None, "outcome_callback": None}] if text else []
+        self._pending_steer_envelopes = queue
+        return queue
 
-        Unlike interrupt(), this does NOT stop the current tool call. The
-        text is stashed and the agent loop appends it to the LAST tool
-        result's content once the current tool batch finishes. The model
-        sees the steer as part of the tool output on its next iteration.
+    def _sync_pending_steer_text_unlocked(self, queue: list) -> None:
+        self._pending_steer = "\n".join(
+            str(item.get("text") or "") for item in queue if item.get("text")
+        ) or None
 
-        Thread-safe: callable from gateway/CLI/TUI threads. Multiple calls
-        before the drain point concatenate with newlines.
-
-        Args:
-            text: The user text to inject. Empty strings are ignored.
-
-        Returns:
-            True if the steer was accepted, False if the text was empty.
-        """
-        if not text or not text.strip():
+    def steer(
+        self,
+        text: str,
+        *,
+        mailbox_id: Optional[str] = None,
+        outcome_callback=None,
+    ) -> bool:
+        """Queue one ordered steer envelope without interrupting the agent."""
+        if not isinstance(text, str) or not text.strip():
             return False
         cleaned = text.strip()
-        _lock = getattr(self, "_pending_steer_lock", None)
-        if _lock is None:
-            # Test stubs that built AIAgent via object.__new__ skip __init__.
-            # Fall back to direct attribute set; no concurrent callers expected
-            # in those stubs.
-            existing = getattr(self, "_pending_steer", None)
-            self._pending_steer = (existing + "\n" + cleaned) if existing else cleaned
+        envelope = {
+            "text": cleaned,
+            "mailbox_id": mailbox_id if isinstance(mailbox_id, str) else None,
+            "outcome_callback": outcome_callback if callable(outcome_callback) else None,
+        }
+        lock = getattr(self, "_pending_steer_lock", None)
+        if lock is None:
+            if envelope["mailbox_id"] and getattr(
+                self, "_interrupt_requested", False
+            ):
+                self._ack_steer_envelopes(
+                    [envelope], "superseded_by_interrupt"
+                )
+                return False
+            queue = self._steer_queue_unlocked()
+            queue.append(envelope)
+            self._sync_pending_steer_text_unlocked(queue)
             return True
-        with _lock:
-            if self._pending_steer:
-                self._pending_steer = self._pending_steer + "\n" + cleaned
-            else:
-                self._pending_steer = cleaned
+        with lock:
+            if envelope["mailbox_id"] and getattr(
+                self, "_interrupt_requested", False
+            ):
+                self._ack_steer_envelopes(
+                    [envelope], "superseded_by_interrupt"
+                )
+                return False
+            queue = self._steer_queue_unlocked()
+            queue.append(envelope)
+            self._sync_pending_steer_text_unlocked(queue)
         return True
 
-    def _drain_pending_steer(self) -> Optional[str]:
-        """Return the pending steer text (if any) and clear the slot.
+    def _drain_pending_steer_envelopes(self) -> list:
+        lock = getattr(self, "_pending_steer_lock", None)
+        if lock is None:
+            queue = list(self._steer_queue_unlocked())
+            self._pending_steer_envelopes = []
+            self._pending_steer = None
+            return queue
+        with lock:
+            queue = list(self._steer_queue_unlocked())
+            self._pending_steer_envelopes = []
+            self._pending_steer = None
+        return queue
 
-        Safe to call from the agent execution thread after appending tool
-        results. Returns None when no steer is pending.
-        """
-        _lock = getattr(self, "_pending_steer_lock", None)
-        if _lock is None:
-            text = getattr(self, "_pending_steer", None)
-            self._pending_steer = None
-            return text
-        with _lock:
-            text = self._pending_steer
-            self._pending_steer = None
-        return text
+    def _requeue_pending_steer_envelopes(self, envelopes: list) -> None:
+        if not envelopes:
+            return
+        lock = getattr(self, "_pending_steer_lock", None)
+        if lock is None:
+            queue = self._steer_queue_unlocked()
+            self._pending_steer_envelopes = list(envelopes) + queue
+            self._sync_pending_steer_text_unlocked(self._pending_steer_envelopes)
+            return
+        with lock:
+            queue = self._steer_queue_unlocked()
+            self._pending_steer_envelopes = list(envelopes) + queue
+            self._sync_pending_steer_text_unlocked(self._pending_steer_envelopes)
+
+    @staticmethod
+    def _steer_envelope_text(envelopes: list) -> Optional[str]:
+        return "\n".join(
+            str(item.get("text") or "") for item in envelopes if item.get("text")
+        ) or None
+
+    @staticmethod
+    def _ack_steer_envelopes(envelopes: list, outcome: str) -> None:
+        for envelope in envelopes:
+            callback = envelope.get("outcome_callback")
+            if callable(callback):
+                try:
+                    callback(outcome)
+                except Exception:
+                    logger.debug("steer outcome callback failed", exc_info=True)
+
+    def _clear_pending_steer(self, outcome: str) -> None:
+        envelopes = self._drain_pending_steer_envelopes()
+        self._ack_steer_envelopes(envelopes, outcome)
+
+    def _drain_pending_steer(self) -> Optional[str]:
+        """Compatibility text drain for local callers without mailbox tracking."""
+        return self._steer_envelope_text(self._drain_pending_steer_envelopes())
 
     def _record_file_mutation_result(
         self,

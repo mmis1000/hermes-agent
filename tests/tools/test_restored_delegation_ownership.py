@@ -81,11 +81,8 @@ def test_restore_stamps_restored_flag(tmp_path, monkeypatch):
     assert got["session_key"] == "OLD_SESSION_A"
 
     # The stamp is in-memory only — the durable payload is unchanged.
-    with ad._connect() as conn:
-        row = conn.execute(
-            "SELECT event_json FROM async_delegations WHERE delegation_id='d-old'"
-        ).fetchone()
-    assert "restored" not in json.loads(row[0])
+    stored = ad._repository().inspect_delivery("d-old")
+    assert "restored" not in json.loads(stored["event_json"])
 
 
 def test_unfiltered_drain_never_consumes_restored_events():

@@ -27,6 +27,8 @@ logger = logging.getLogger(__name__)
 import os
 import threading
 import time
+import uuid
+from types import SimpleNamespace
 from concurrent.futures import (
     ThreadPoolExecutor,
     TimeoutError as FuturesTimeoutError,
@@ -39,6 +41,7 @@ from toolsets import TOOLSETS
 # not natively known (named custom providers, third-party aggregators, etc.).
 # Must match hermes_cli.runtime_provider.RUNTIME_PROVIDER_TYPE_CUSTOM.
 _RUNTIME_PROVIDER_CUSTOM = "custom"
+_UNSET = object()
 from tools import file_state
 from tools.terminal_tool import set_approval_callback as _set_subagent_approval_cb
 from utils import base_url_hostname, is_truthy_value
@@ -187,15 +190,29 @@ def _register_subagent(record: Dict[str, Any]) -> None:
     record.setdefault("events", [])
     record.setdefault("assistant_text_tail", "")
     record.setdefault("assistant_text_raw_tail", "")
-    with _active_subagents_lock:
-        _active_subagents[sid] = record
+    durable_expected = (
+        "delegation_attempt_id" in record or "delegation_run_id" in record
+    )
+    delegation_id = None
     try:
         from tools.async_delegation import (
             register_subagent_lifecycle,
             take_pending_subagent_interrupt,
         )
 
-        register_subagent_lifecycle(record)
+        delegation_id = register_subagent_lifecycle(record)
+        # An exact durable attempt that fails validation must never replace the
+        # current live entry for the same stable logical child.
+        if durable_expected and delegation_id is None:
+            return
+    except Exception:
+        logger.debug("subagent/delegation association failed", exc_info=True)
+        if durable_expected:
+            return
+
+    with _active_subagents_lock:
+        _active_subagents[sid] = record
+    if delegation_id is not None:
         pending, reason = take_pending_subagent_interrupt(sid)
         if pending:
             outcome = interrupt_subagent_status(sid, reason=reason)
@@ -205,15 +222,21 @@ def _register_subagent(record: Dict[str, Any]) -> None:
                     sid,
                     outcome,
                 )
-    except Exception:
-        logger.debug("subagent/delegation association failed", exc_info=True)
+        attempt_id = record.get("delegation_attempt_id")
+        if isinstance(attempt_id, str):
+            forward_pending_subagent_steers(sid, attempt_id)
 
 
-def _unregister_subagent(subagent_id: str) -> None:
+def _unregister_subagent(
+    subagent_id: str, attempt_id: Optional[str] = None
+) -> None:
     # Archive before removal to close the live-to-durable observability gap.
     with _active_subagents_lock:
         record = _active_subagents.get(subagent_id)
-    if record is None:
+    if record is None or (
+        attempt_id is not None
+        and record.get("delegation_attempt_id") != attempt_id
+    ):
         return
     tail = {
         "subagent_id": subagent_id,
@@ -230,6 +253,9 @@ def _unregister_subagent(subagent_id: str) -> None:
         "assistant_text_tail": str(record.get("assistant_text_tail") or ""),
         "last_activity_at": record.get("last_activity_at"),
     }
+    for lifecycle_id in ("delegation_attempt_id", "delegation_run_id"):
+        if lifecycle_id in record:
+            tail[lifecycle_id] = record[lifecycle_id]
     try:
         from tools.async_delegation import archive_subagent_tail
 
@@ -269,6 +295,54 @@ def interrupt_subagent_status(subagent_id: str, reason: str = "") -> str:
         logger.debug("interrupt_subagent(%s) failed: %s", subagent_id, exc)
         return "interrupt_failed"
     return "interrupt_requested"
+
+
+def forward_pending_subagent_steers(subagent_id: str, attempt_id: str) -> int:
+    """Forward ordered durable mailbox items to one exact live attempt."""
+    if not subagent_id or not attempt_id:
+        return 0
+    with _active_subagents_lock:
+        record = _active_subagents.get(subagent_id)
+        if not record or record.get("delegation_attempt_id") != attempt_id:
+            return 0
+        agent = record.get("agent")
+    steer = getattr(agent, "steer", None)
+    if not callable(steer):
+        return 0
+
+    try:
+        from tools.async_delegation import _repository
+
+        repository = _repository()
+    except Exception:
+        return 0
+
+    forwarded = 0
+    while True:
+        pending = repository.pending_steers(attempt_id)
+        if not pending:
+            break
+        mailbox_id = str(pending[0]["mailbox_id"])
+        claimed = repository.claim_steer(attempt_id, mailbox_id)
+        if claimed.get("status") != "claimed":
+            break
+
+        def _ack(outcome: str, *, _mailbox_id: str = mailbox_id) -> None:
+            repository.resolve_steer(_mailbox_id, outcome)
+
+        accepted = bool(
+            steer(
+                str(claimed.get("message") or ""),
+                mailbox_id=mailbox_id,
+                outcome_callback=_ack,
+            )
+        )
+        if not accepted:
+            repository.resolve_steer(mailbox_id, "too_late_after_completion")
+            break
+        repository.mark_steer_forwarded(mailbox_id)
+        forwarded += 1
+    return forwarded
 
 
 def interrupt_subagent(subagent_id: str, reason: str = "") -> bool:
@@ -438,12 +512,20 @@ def _bounded_live_preview(value: Any) -> str:
     return text[:_LIVE_PREVIEW_CHAR_LIMIT] + "…"
 
 
-def _append_live_event(subagent_id: Optional[str], event: Dict[str, Any]) -> None:
+def _append_live_event(
+    subagent_id: Optional[str],
+    event: Dict[str, Any],
+    *,
+    attempt_id: Optional[str] = None,
+) -> None:
     if not subagent_id:
         return
     with _active_subagents_lock:
         record = _active_subagents.get(subagent_id)
-        if record is None:
+        if record is None or (
+            attempt_id is not None
+            and record.get("delegation_attempt_id") != attempt_id
+        ):
             return
         events = record.setdefault("events", [])
         events.append(event)
@@ -452,13 +534,18 @@ def _append_live_event(subagent_id: Optional[str], event: Dict[str, Any]) -> Non
         record["last_activity_at"] = event.get("timestamp") or time.time()
 
 
-def _append_live_text(subagent_id: Optional[str], delta: Any) -> None:
+def _append_live_text(
+    subagent_id: Optional[str], delta: Any, *, attempt_id: Optional[str] = None
+) -> None:
     if not subagent_id or not delta:
         return
     text = _stringify_tool_content(delta)
     with _active_subagents_lock:
         record = _active_subagents.get(subagent_id)
-        if record is None:
+        if record is None or (
+            attempt_id is not None
+            and record.get("delegation_attempt_id") != attempt_id
+        ):
             return
         # Keep only a private bounded carry so split-delta credentials can be
         # recognized. This field is excluded from snapshots and archives.
@@ -1054,6 +1141,12 @@ def _build_child_progress_callback(
     _batch: List[str] = []
     _tool_count = [0]  # per-subagent running counter (list for closure mutation)
 
+    def _current_attempt_id() -> Optional[str]:
+        if not session_ref:
+            return None
+        value = session_ref.get("attempt_id")
+        return str(value) if value else None
+
     def _identity_kwargs() -> Dict[str, Any]:
         kw: Dict[str, Any] = {
             "task_index": task_index,
@@ -1075,6 +1168,10 @@ def _build_child_progress_callback(
         # event lets UIs open/inspect the subagent's session directly.
         if session_ref and session_ref.get("session_id"):
             kw["child_session_id"] = str(session_ref["session_id"])
+        if _current_attempt_id():
+            kw["attempt_id"] = _current_attempt_id()
+        if session_ref and session_ref.get("run_id"):
+            kw["run_id"] = str(session_ref["run_id"])
         kw["tool_count"] = _tool_count[0]
         return kw
 
@@ -1111,7 +1208,10 @@ def _build_child_progress_callback(
             if subagent_id is not None:
                 with _active_subagents_lock:
                     rec = _active_subagents.get(subagent_id)
-                    if rec is not None:
+                    if rec is not None and (
+                        _current_attempt_id() is None
+                        or rec.get("delegation_attempt_id") == _current_attempt_id()
+                    ):
                         rec["status"] = kwargs.get("status") or "completed"
                         rec["last_activity_at"] = time.time()
             _relay("subagent.complete", preview=preview, **kwargs)
@@ -1123,7 +1223,9 @@ def _build_child_progress_callback(
             # No spinner echo — the CLI shows the child via the tree, and the
             # CLI/TUI progress handlers ignore non-tool event types, so this is
             # inert there; only a gateway watch window consumes it.
-            _append_live_text(subagent_id, preview)
+            _append_live_text(
+                subagent_id, preview, attempt_id=_current_attempt_id()
+            )
             _relay("subagent.text", preview=preview)
             return
 
@@ -1163,6 +1265,7 @@ def _build_child_progress_callback(
                     "duration_seconds": float(kwargs.get("duration") or 0.0),
                     "timestamp": time.time(),
                 },
+                attempt_id=_current_attempt_id(),
             )
             return
 
@@ -1199,11 +1302,15 @@ def _build_child_progress_callback(
                 ),
                 "timestamp": time.time(),
             },
+            attempt_id=_current_attempt_id(),
         )
         if subagent_id is not None:
             with _active_subagents_lock:
                 rec = _active_subagents.get(subagent_id)
-                if rec is not None:
+                if rec is not None and (
+                    _current_attempt_id() is None
+                    or rec.get("delegation_attempt_id") == _current_attempt_id()
+                ):
                     rec["tool_count"] = _tool_count[0]
                     rec["last_tool"] = tool_name or ""
         if spinner:
@@ -1280,6 +1387,206 @@ def _inherit_parent_base_url(parent_agent, fallback_base_url: Optional[str]) -> 
     return fallback_base_url or None
 
 
+def _json_safe_copy(value: Any) -> Any:
+    """Return a detached JSON value or ``None`` for runtime-only objects."""
+    try:
+        return json.loads(json.dumps(value))
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def build_resumed_child_agent(
+    *,
+    bundle: Dict[str, Any],
+    logical_id: str,
+    goal: str,
+    parent_agent,
+    continuation: Optional[Dict[str, str]] = None,
+):
+    """Reconstruct a child using persisted non-secret policy and live credentials."""
+    metadata = dict(bundle.get("reconstruction_metadata") or {})
+    model = str(metadata.get("model") or "").strip()
+    provider = str(metadata.get("provider") or "").strip()
+    if not model or not provider:
+        raise ValueError("saved child provider/model is unavailable")
+    continuation = continuation or prepare_resumed_child_session(bundle)
+    # Re-resolve credentials and approval policy from current authorized config;
+    # no persisted secret is ever accepted from the resume bundle.
+    credentials = _resolve_delegation_credentials(
+        {"provider": provider, "model": model}, parent_agent
+    )
+    runtime_parent = parent_agent
+    if runtime_parent is None:
+        from hermes_state import SessionDB
+
+        # Durable resume must work after a gateway restart, where the original
+        # parent AIAgent object no longer exists and native tool adapters may not
+        # expose the newly-created controller object. Rebuild only the non-secret
+        # policy surface consumed by _build_child_agent; credentials above were
+        # resolved fresh from the active provider configuration.
+        runtime_parent = SimpleNamespace(
+            session_id=continuation["delegate_from"],
+            _session_db=SessionDB(),
+            model=model,
+            provider=credentials.get("provider") or provider,
+            base_url=credentials.get("base_url"),
+            api_key=credentials.get("api_key"),
+            api_mode=credentials.get("api_mode"),
+            _client_kwargs={
+                key: value
+                for key, value in {
+                    "base_url": credentials.get("base_url"),
+                    "api_key": credentials.get("api_key"),
+                }.items()
+                if value
+            },
+            _delegate_depth=max(0, int(metadata.get("depth") or 1) - 1),
+            _subagent_id=metadata.get("parent_logical_id"),
+            enabled_toolsets=list(metadata.get("enabled_toolsets") or []),
+            disabled_toolsets=list(metadata.get("disabled_toolsets") or []),
+            valid_tool_names=[],
+            reasoning_config=_json_safe_copy(metadata.get("reasoning_config")),
+            _fallback_chain=_json_safe_copy(metadata.get("fallback_routes")) or [],
+            acp_command=credentials.get("command"),
+            acp_args=list(credentials.get("args") or []),
+        )
+    child = _build_child_agent(
+        task_index=0,
+        goal=goal,
+        context=None,
+        toolsets=list(metadata.get("enabled_toolsets") or []),
+        model=model,
+        max_iterations=int(metadata.get("max_iterations") or 50),
+        task_count=1,
+        parent_agent=runtime_parent,
+        override_provider=credentials.get("provider"),
+        override_base_url=credentials.get("base_url"),
+        override_api_key=credentials.get("api_key"),
+        override_api_mode=credentials.get("api_mode"),
+        override_request_overrides=credentials.get("request_overrides"),
+        override_max_tokens=(
+            metadata.get("max_tokens")
+            if isinstance(metadata.get("max_tokens"), int)
+            else credentials.get("max_output_tokens")
+        ),
+        override_acp_command=credentials.get("command"),
+        override_acp_args=credentials.get("args"),
+        required_disabled_toolsets=list(metadata.get("disabled_toolsets") or []),
+        workspace_override=metadata.get("workdir"),
+        reasoning_config_override=metadata.get("reasoning_config"),
+        fallback_model_override=list(metadata.get("fallback_routes") or []),
+        provider_preferences_override=metadata.get("provider_preferences"),
+        session_id_override=continuation["session_id"],
+        parent_session_id_override=continuation["parent_session_id"],
+        role=str(metadata.get("role") or "leaf"),
+    )
+
+    owner = continuation["delegate_from"]
+    prior = continuation["parent_session_id"]
+    session_id = continuation["session_id"]
+    parent_logical_id = metadata.get("parent_logical_id")
+    child.session_id = session_id
+    child._parent_session_id = prior
+    child._subagent_id = logical_id
+    child._parent_subagent_id = (
+        parent_logical_id if isinstance(parent_logical_id, str) else None
+    )
+    if isinstance(metadata.get("depth"), int):
+        child._delegate_depth = metadata["depth"]
+    child._delegate_role = str(metadata.get("role") or "leaf")
+    child._subagent_goal = goal
+    session_ref = {"session_id": session_id}
+    child._delegation_session_ref = session_ref
+    child._delegation_runtime_metadata = {
+        **metadata,
+        "child_session_id": session_id,
+        "parent_session_id": owner,
+        "enabled_toolsets": list(getattr(child, "enabled_toolsets", None) or []),
+        "disabled_toolsets": list(getattr(child, "disabled_toolsets", None) or []),
+        "reasoning_config": _json_safe_copy(
+            getattr(child, "reasoning_config", metadata.get("reasoning_config"))
+        ),
+        "fallback_routes": _json_safe_copy(
+            getattr(child, "_fallback_chain", metadata.get("fallback_routes"))
+        ),
+    }
+    if getattr(child, "_session_init_model_config", None) is not None:
+        child._session_init_model_config["_delegate_from"] = owner
+
+    # Rebuild the callback because the initial builder generated a throwaway
+    # logical/session identity before this exact resumed identity was known.
+    child_progress_cb = _build_child_progress_callback(
+        0,
+        goal,
+        runtime_parent,
+        1,
+        subagent_id=logical_id,
+        parent_id=child._parent_subagent_id,
+        depth=max(0, int(getattr(child, "_delegate_depth", 1)) - 1),
+        model=model,
+        toolsets=list(getattr(child, "enabled_toolsets", None) or []),
+        session_ref=session_ref,
+    )
+    child.tool_progress_callback = child_progress_cb
+    if child_progress_cb:
+        def _resumed_thinking(text: str) -> None:
+            if text:
+                child_progress_cb("_thinking", text)
+
+        child.thinking_callback = _resumed_thinking
+    return child
+
+
+def prepare_resumed_child_session(bundle: Dict[str, Any]) -> Dict[str, str]:
+    """Validate a hydration bundle and allocate a distinct child segment.
+
+    This deliberately does not create the SQLite row. The standard AIAgent
+    persistence path creates/enriches it with the effective current runtime
+    configuration before the first resumed turn is stored.
+    """
+    if not isinstance(bundle, dict):
+        raise ValueError("missing subagent resume bundle")
+    prior = bundle.get("prior_child_session_id")
+    owner = bundle.get("parent_session_id")
+    history = bundle.get("history")
+    metadata = bundle.get("reconstruction_metadata")
+    if (
+        not isinstance(prior, str)
+        or not prior
+        or not isinstance(owner, str)
+        or not owner
+        or not isinstance(history, list)
+        or not history
+        or not isinstance(metadata, dict)
+        or metadata.get("parent_session_id") != owner
+    ):
+        raise ValueError("incomplete subagent resume bundle")
+    return {
+        "session_id": f"{time.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}",
+        "parent_session_id": prior,
+        "delegate_from": owner,
+    }
+
+
+def _safe_fallback_routes(value: Any) -> List[Dict[str, str]]:
+    """Persist named fallback routes without credentials or endpoint details."""
+    items = value if isinstance(value, list) else [value]
+    routes: List[Dict[str, str]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        provider = item.get("provider")
+        model = item.get("model")
+        if not isinstance(provider, str) or not isinstance(model, str):
+            continue
+        route = {"provider": provider, "model": model}
+        api_mode = item.get("api_mode")
+        if isinstance(api_mode, str):
+            route["api_mode"] = api_mode
+        routes.append(route)
+    return routes
+
+
 def _build_child_agent(
     task_index: int,
     goal: str,
@@ -1299,6 +1606,13 @@ def _build_child_agent(
     # ACP transport overrides from trusted delegation config.
     override_acp_command: Optional[str] = None,
     override_acp_args: Optional[List[str]] = None,
+    required_disabled_toolsets: Optional[List[str]] = None,
+    workspace_override: Optional[str] = None,
+    reasoning_config_override: Any = _UNSET,
+    fallback_model_override: Any = _UNSET,
+    provider_preferences_override: Optional[Dict[str, Any]] = None,
+    session_id_override: Optional[str] = None,
+    parent_session_id_override: Optional[str] = None,
     # Per-call role controlling whether the child can further delegate.
     # 'leaf' (default) cannot; 'orchestrator' retains the delegation
     # toolset subject to depth/kill-switch bounds applied below.
@@ -1334,6 +1648,8 @@ def _build_child_agent(
     # (nested orchestrator -> worker chain).
     subagent_id = f"sa-{task_index}-{_uuid.uuid4().hex[:8]}"
     parent_subagent_id = getattr(parent_agent, "_subagent_id", None)
+    if not isinstance(parent_subagent_id, str):
+        parent_subagent_id = None
     tui_depth = max(0, child_depth - 1)  # 0 = first-level child for the UI
 
     delegation_cfg = _load_config()
@@ -1393,7 +1709,9 @@ def _build_child_agent(
         ]
     child_disabled_toolsets = list(
         dict.fromkeys(
-            inherited_disabled + _blocked_toolsets_for_role(effective_role)
+            inherited_disabled
+            + list(required_disabled_toolsets or [])
+            + _blocked_toolsets_for_role(effective_role)
         )
     )
 
@@ -1404,7 +1722,7 @@ def _build_child_agent(
     if effective_role == "orchestrator" and "delegation" not in child_toolsets:
         child_toolsets.append("delegation")
 
-    workspace_hint = _resolve_workspace_hint(parent_agent)
+    workspace_hint = workspace_override or _resolve_workspace_hint(parent_agent)
     child_prompt = _build_child_system_prompt(
         goal,
         context,
@@ -1514,13 +1832,19 @@ def _build_child_agent(
 
     # Resolve reasoning config: delegation override > parent inherit
     parent_reasoning = getattr(parent_agent, "reasoning_config", None)
-    child_reasoning = parent_reasoning
+    child_reasoning = (
+        parent_reasoning
+        if reasoning_config_override is _UNSET
+        else _json_safe_copy(reasoning_config_override)
+    )
     try:
         # Keep the raw value — ``str(x or "")`` would coerce a YAML boolean
         # False (``reasoning_effort: false``) to "" and inherit the parent
         # instead of disabling thinking for children.
         delegation_effort = delegation_cfg.get("reasoning_effort")
-        if delegation_effort or delegation_effort is False:
+        if reasoning_config_override is _UNSET and (
+            delegation_effort or delegation_effort is False
+        ):
             from hermes_constants import parse_reasoning_effort
 
             parsed = parse_reasoning_effort(delegation_effort)
@@ -1538,7 +1862,11 @@ def _build_child_agent(
     # from rate-limits and credential exhaustion exactly like the top-level
     # agent does.  _fallback_chain is a list accepted by AIAgent's
     # fallback_model parameter (which handles both list and dict forms).
-    parent_fallback = getattr(parent_agent, "_fallback_chain", None) or None
+    parent_fallback = (
+        getattr(parent_agent, "_fallback_chain", None) or None
+        if fallback_model_override is _UNSET
+        else _json_safe_copy(fallback_model_override)
+    )
 
     # Inherit the parent's OpenRouter provider-preference filters by default
     # (so subagents routed to the same provider honour the same routing
@@ -1569,6 +1897,29 @@ def _build_child_agent(
         # openrouter/pareto-code), so we keep it inherited even when the
         # provider is overridden — it's a no-op on any other model.
 
+    if isinstance(provider_preferences_override, dict):
+        child_providers_allowed = _json_safe_copy(
+            provider_preferences_override.get("allowed")
+        )
+        child_providers_ignored = _json_safe_copy(
+            provider_preferences_override.get("ignored")
+        )
+        child_providers_order = _json_safe_copy(
+            provider_preferences_override.get("order")
+        )
+        child_provider_sort = _json_safe_copy(
+            provider_preferences_override.get("sort")
+        )
+        child_provider_require_parameters = bool(
+            provider_preferences_override.get("require_parameters", False)
+        )
+        child_provider_data_collection = str(
+            provider_preferences_override.get("data_collection") or ""
+        )
+        child_openrouter_min_coding_score = _json_safe_copy(
+            provider_preferences_override.get("openrouter_min_coding_score")
+        )
+
     child_max_tokens = (
         override_max_tokens
         if override_max_tokens is not None
@@ -1577,6 +1928,8 @@ def _build_child_agent(
     child_optional_kwargs: Dict[str, Any] = {}
     if isinstance(child_max_tokens, int):
         child_optional_kwargs["max_tokens"] = child_max_tokens
+    if session_id_override:
+        child_optional_kwargs["session_id"] = session_id_override
 
     child = AIAgent(
         base_url=effective_base_url,
@@ -1602,7 +1955,11 @@ def _build_child_agent(
         clarify_callback=None,
         thinking_callback=child_thinking_cb,
         session_db=getattr(parent_agent, "_session_db", None),
-        parent_session_id=getattr(parent_agent, "session_id", None),
+        parent_session_id=(
+            parent_session_id_override
+            if parent_session_id_override is not None
+            else getattr(parent_agent, "session_id", None)
+        ),
         providers_allowed=child_providers_allowed,
         providers_ignored=child_providers_ignored,
         providers_order=child_providers_order,
@@ -1634,6 +1991,46 @@ def _build_child_agent(
     child._parent_subagent_id = parent_subagent_id
     child._subagent_goal = goal
     child._parent_turn_id = getattr(parent_agent, "_current_turn_id", "") or ""
+    child._delegation_session_ref = child_session_ref
+    # Reconstruction metadata is an explicit allowlist. Never persist API
+    # keys, base URLs, request overrides, ACP commands/args, or provider
+    # credential-pool state.
+    child._delegation_runtime_metadata = {
+        "child_session_id": child_session_ref["session_id"],
+        "parent_session_id": (
+            getattr(parent_agent, "session_id", None)
+            if isinstance(getattr(parent_agent, "session_id", None), str)
+            else None
+        ),
+        "parent_logical_id": parent_subagent_id,
+        "depth": child_depth,
+        "role": effective_role,
+        "model": effective_model if isinstance(effective_model, str) else None,
+        "provider": effective_provider if isinstance(effective_provider, str) else None,
+        "api_mode": effective_api_mode if isinstance(effective_api_mode, str) else None,
+        "enabled_toolsets": list(child_toolsets),
+        "disabled_toolsets": list(child_disabled_toolsets),
+        "workdir": workspace_hint,
+        "max_iterations": max_iterations,
+        "max_tokens": child_max_tokens if isinstance(child_max_tokens, int) else None,
+        "reasoning_config": _json_safe_copy(child_reasoning),
+        "fallback_routes": _safe_fallback_routes(parent_fallback),
+        "provider_preferences": {
+            "allowed": _json_safe_copy(child_providers_allowed),
+            "ignored": _json_safe_copy(child_providers_ignored),
+            "order": _json_safe_copy(child_providers_order),
+            "sort": _json_safe_copy(child_provider_sort),
+            "require_parameters": bool(child_provider_require_parameters),
+            "data_collection": (
+                child_provider_data_collection
+                if isinstance(child_provider_data_collection, str)
+                else ""
+            ),
+            "openrouter_min_coding_score": _json_safe_copy(
+                child_openrouter_min_coding_score
+            ),
+        },
+    }
     # Stable sidebar marker: delegate subagent sessions must stay out of
     # session pickers even when a parent delete orphans them (parent_session_id
     # → NULL). Mirrors /branch's ``_branched_from`` pattern — see
@@ -2017,6 +2414,9 @@ def _run_single_child(
     Returns a structured result dict.
     """
     child_start = time.monotonic()
+    conversation_history = _kwargs.pop("conversation_history", None)
+    user_message = _kwargs.pop("resume_message", goal)
+    resume_workdir = _kwargs.pop("resume_workdir", None)
 
     # Get the progress callback from the child agent
     child_progress_cb = getattr(child, "tool_progress_callback", None)
@@ -2130,27 +2530,36 @@ def _run_single_child(
     # hand us a MagicMock don't carry stable ids; skip registration then.
     _raw_sid = getattr(child, "_subagent_id", None)
     _subagent_id = _raw_sid if isinstance(_raw_sid, str) else None
+    _raw_attempt_id = getattr(child, "_delegation_attempt_id", None)
+    _attempt_id = _raw_attempt_id if isinstance(_raw_attempt_id, str) else None
     if _subagent_id:
         _raw_depth = getattr(child, "_delegate_depth", 1)
         _tui_depth = max(0, _raw_depth - 1) if isinstance(_raw_depth, int) else 0
         _parent_sid = getattr(child, "_parent_subagent_id", None)
-        _register_subagent(
-            {
-                "subagent_id": _subagent_id,
-                "parent_id": _parent_sid if isinstance(_parent_sid, str) else None,
-                "depth": _tui_depth,
-                "goal": goal,
-                "model": (
-                    getattr(child, "model", None)
-                    if isinstance(getattr(child, "model", None), str)
-                    else None
-                ),
-                "started_at": time.time(),
-                "status": "running",
-                "tool_count": 0,
-                "agent": child,
-            }
-        )
+        _registration = {
+            "subagent_id": _subagent_id,
+            "parent_id": _parent_sid if isinstance(_parent_sid, str) else None,
+            "depth": _tui_depth,
+            "goal": goal,
+            "model": (
+                getattr(child, "model", None)
+                if isinstance(getattr(child, "model", None), str)
+                else None
+            ),
+            "started_at": time.time(),
+            "status": "running",
+            "tool_count": 0,
+            "agent": child,
+        }
+        runtime_metadata = getattr(child, "_delegation_runtime_metadata", None)
+        if isinstance(runtime_metadata, dict):
+            _registration.update(runtime_metadata)
+        if _attempt_id:
+            _registration["delegation_attempt_id"] = _attempt_id
+        _run_id = getattr(child, "_delegation_run_id", None)
+        if isinstance(_run_id, str):
+            _registration["delegation_run_id"] = _run_id
+        _register_subagent(_registration)
 
     try:
         _heartbeat_thread.start()
@@ -2160,13 +2569,16 @@ def _run_single_child(
             except Exception as e:
                 logger.debug("Progress callback start failed: %s", e)
 
-        # File-state coordination: reuse the stable subagent_id as the child's
-        # task_id so file_state writes, active-subagents registry, and TUI
-        # events all share one key.  Falls back to a fresh uuid only if the
-        # pre-built id is somehow missing.
+        # Attempt-local terminal cwd and file-state must never reuse a stable
+        # logical subagent id across resumes. The immutable attempt id is the
+        # runtime key; legacy synchronous children retain the old fallback.
         import uuid as _uuid
 
-        child_task_id = _subagent_id or f"subagent-{task_index}-{_uuid.uuid4().hex[:8]}"
+        child_task_id = (
+            _attempt_id
+            or _subagent_id
+            or f"subagent-{task_index}-{_uuid.uuid4().hex[:8]}"
+        )
         parent_task_id = getattr(parent_agent, "_current_task_id", None)
         # Seed the child's session-cwd record from the parent's (cwd rearch):
         # children share the parent's container, and today they inherit the
@@ -2177,7 +2589,14 @@ def _run_single_child(
         try:
             from tools.terminal_tool import get_session_cwd, record_session_cwd
 
-            record_session_cwd(child_task_id, get_session_cwd(parent_task_id))
+            inherited_cwd = get_session_cwd(parent_task_id)
+            if (
+                isinstance(resume_workdir, str)
+                and os.path.isabs(resume_workdir)
+                and os.path.isdir(resume_workdir)
+            ):
+                inherited_cwd = resume_workdir
+            record_session_cwd(child_task_id, inherited_cwd)
         except Exception as e:
             logger.debug("Child cwd seed failed: %s", e)
         wall_start = time.time()
@@ -2219,11 +2638,14 @@ def _run_single_child(
 
         def _run_with_thread_capture():
             _worker_thread_holder["t"] = threading.current_thread()
-            return child.run_conversation(
-                user_message=goal,
-                task_id=child_task_id,
-                stream_callback=_relay_child_text,
-            )
+            run_kwargs = {
+                "user_message": user_message,
+                "task_id": child_task_id,
+                "stream_callback": _relay_child_text,
+            }
+            if conversation_history is not None:
+                run_kwargs["conversation_history"] = conversation_history
+            return child.run_conversation(**run_kwargs)
 
         _child_future = _timeout_executor.submit(_run_with_thread_capture)
         try:
@@ -2577,7 +2999,7 @@ def _run_single_child(
         # Drop the TUI-facing registry entry.  Safe to call even if the
         # child was never registered (e.g. ID missing on test doubles).
         if _subagent_id:
-            _unregister_subagent(_subagent_id)
+            _unregister_subagent(_subagent_id, _attempt_id)
 
         if child_pool is not None and leased_cred_id is not None:
             try:
@@ -3215,6 +3637,18 @@ def delegate_task(
                 except Exception:
                     pass
 
+        def _bind_batch_attempts(run_id: str, attempt_ids: Dict[str, str]) -> None:
+            for _c in _child_agents:
+                _sid = getattr(_c, "_subagent_id", None)
+                if not isinstance(_sid, str) or _sid not in attempt_ids:
+                    continue
+                _attempt_id = attempt_ids[_sid]
+                _c._delegation_run_id = run_id
+                _c._delegation_attempt_id = _attempt_id
+                session_ref = getattr(_c, "_delegation_session_ref", None)
+                if isinstance(session_ref, dict):
+                    session_ref["run_id"] = run_id
+                    session_ref["attempt_id"] = _attempt_id
         _goals = [t["goal"] for t in task_list]
         dispatch = dispatch_async_delegation_batch(
             goals=_goals,
@@ -3238,6 +3672,7 @@ def delegate_task(
             # Reuse the live-transcript directory's id (when created) so the
             # returned delegation_id matches cache/delegation/live/<id>/.
             delegation_id=live_deleg_id,
+            _bind_attempts=_bind_batch_attempts,
         )
 
         if dispatch.get("status") == "dispatched":

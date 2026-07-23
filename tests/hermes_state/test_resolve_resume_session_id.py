@@ -215,3 +215,28 @@ def test_compression_tip_handles_pre_ended_real_child_and_ws_orphan_sibling(db):
     assert "real_cont" not in ids
     assert "ws_orphan" not in ids
 
+
+def test_control_owner_accepts_only_exact_or_compression_continuation(db):
+    db.create_session("origin", source="discord")
+    db.end_session("origin", "compression")
+    db.create_session("compressed", source="discord", parent_session_id="origin")
+    db.create_session(
+        "delegate",
+        source="subagent",
+        parent_session_id="origin",
+        model_config={"_delegate_from": "origin"},
+    )
+    db.create_session(
+        "branch",
+        source="discord",
+        parent_session_id="origin",
+        model_config={"_branched_from": "origin"},
+    )
+
+    assert db.control_session_candidates("compressed") == ["compressed", "origin"]
+    assert db.is_authorized_control_session("origin", "origin")
+    assert db.is_authorized_control_session("origin", "compressed")
+    assert not db.is_authorized_control_session("origin", "delegate")
+    assert not db.is_authorized_control_session("origin", "branch")
+    assert not db.is_authorized_control_session("origin", "foreign")
+
