@@ -279,9 +279,19 @@ def get_durable_delegation(delegation_id: str) -> Optional[Dict[str, Any]]:
 
 
 def get_async_delegation(
-    delegation_id: str, *, session_key: str
+    delegation_id: str, *, session_key: str, run_id: Optional[str] = None
 ) -> Optional[Dict[str, Any]]:
-    return _repository().snapshot(delegation_id, session_key=session_key)
+    return _repository().snapshot(
+        delegation_id, session_key=session_key, run_id=run_id
+    )
+
+
+def get_async_delegation_attempt(
+    delegation_id: str, attempt_id: str, *, session_key: str
+) -> Optional[Dict[str, Any]]:
+    return _repository().snapshot_for_attempt(
+        delegation_id, attempt_id, session_key=session_key
+    )
 
 
 def list_durable_delegations(
@@ -714,59 +724,79 @@ def release_event_delivery(evt: Dict[str, Any], claim_id: str) -> None:
 
 
 def hold_completion_for_wait(
-    delegation_id: str, claim_id: str, *, session_key: str
+    delegation_id: str, claim_id: str, *, session_key: str,
+    run_id: Optional[str] = None,
 ) -> bool:
     return _changed(
-        _repository().hold_for_wait(delegation_id, session_key, claim_id), "held"
+        _repository().hold_for_wait(
+            delegation_id, session_key, claim_id, run_id=run_id
+        ),
+        "held",
     )
 
 
 def consume_waited_completion(
-    delegation_id: str, claim_id: str, *, session_key: str
+    delegation_id: str, claim_id: str, *, session_key: str,
+    run_id: Optional[str] = None,
 ) -> bool:
     return _changed(
-        _repository().consume_wait_hold(delegation_id, session_key, claim_id),
+        _repository().consume_wait_hold(
+            delegation_id, session_key, claim_id, run_id=run_id
+        ),
         "consumed",
     )
 
 
 def release_wait_hold(
-    delegation_id: str, claim_id: str, *, session_key: str
+    delegation_id: str, claim_id: str, *, session_key: str,
+    run_id: Optional[str] = None,
 ) -> bool:
     return _changed(
-        _repository().release_wait_hold(delegation_id, session_key, claim_id),
+        _repository().release_wait_hold(
+            delegation_id, session_key, claim_id, run_id=run_id
+        ),
         "released",
     )
 
 
 def wait_for_delegation(
-    delegation_id: str, *, session_key: str, timeout_seconds: float = 30.0
+    delegation_id: str, *, session_key: str, timeout_seconds: float = 30.0,
+    run_id: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Boundedly wait, atomically consuming one otherwise-pending result."""
+    """Wait on the exact run selected at call start and consume it at most once."""
     timeout_seconds = max(0.0, float(timeout_seconds))
     deadline = time.monotonic() + timeout_seconds
     claim_id = f"wait:{os.getpid()}:{uuid.uuid4().hex}"
-    owns_hold = False
 
     recover_stale_wait_holds(delegation_id)
+    binding = _repository().hold_for_wait(
+        delegation_id, session_key, claim_id, run_id=run_id
+    )
+    if binding.get("status") == "not_found":
+        return {"status": "not_found", "delegation_id": delegation_id}
+    bound_run_id = binding.get("run_id")
+    if not isinstance(bound_run_id, str) or not bound_run_id:
+        return {"status": "not_found", "delegation_id": delegation_id}
+    owns_hold = binding.get("status") == "held"
+
     while True:
-        snapshot = get_async_delegation(delegation_id, session_key=session_key)
+        snapshot = get_async_delegation(
+            delegation_id, session_key=session_key, run_id=bound_run_id
+        )
         if snapshot is None:
-            return {"status": "not_found", "delegation_id": delegation_id}
-        if snapshot["delivery_state"] == "pending" and not owns_hold:
-            owns_hold = hold_completion_for_wait(
-                delegation_id, claim_id, session_key=session_key
-            )
             if owns_hold:
-                snapshot = get_async_delegation(
-                    delegation_id, session_key=session_key
-                ) or snapshot
+                release_wait_hold(
+                    delegation_id, claim_id, session_key=session_key,
+                    run_id=bound_run_id,
+                )
+            return {"status": "not_found", "delegation_id": delegation_id}
         if _terminal(snapshot):
             claimed = owns_hold and consume_waited_completion(
-                delegation_id, claim_id, session_key=session_key
+                delegation_id, claim_id, session_key=session_key,
+                run_id=bound_run_id,
             )
             current = get_async_delegation(
-                delegation_id, session_key=session_key
+                delegation_id, session_key=session_key, run_id=bound_run_id
             ) or snapshot
             current["claimed_delivery"] = bool(claimed)
             return current
@@ -774,21 +804,25 @@ def wait_for_delegation(
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             latest = get_async_delegation(
-                delegation_id, session_key=session_key
+                delegation_id, session_key=session_key, run_id=bound_run_id
             ) or snapshot
             if _terminal(latest):
                 claimed = owns_hold and consume_waited_completion(
-                    delegation_id, claim_id, session_key=session_key
+                    delegation_id, claim_id, session_key=session_key,
+                    run_id=bound_run_id,
                 )
                 current = get_async_delegation(
-                    delegation_id, session_key=session_key
+                    delegation_id, session_key=session_key, run_id=bound_run_id
                 ) or latest
                 current["claimed_delivery"] = bool(claimed)
                 return current
             if owns_hold:
-                release_wait_hold(delegation_id, claim_id, session_key=session_key)
+                release_wait_hold(
+                    delegation_id, claim_id, session_key=session_key,
+                    run_id=bound_run_id,
+                )
             current = get_async_delegation(
-                delegation_id, session_key=session_key
+                delegation_id, session_key=session_key, run_id=bound_run_id
             ) or latest
             current["status"] = "timeout"
             current["claimed_delivery"] = False
@@ -827,8 +861,12 @@ def interrupt_async_delegation(
     with _records_lock:
         record = _records.get(delegation_id)
         if record is None or record.get("session_key", "") != session_key:
-            return {"status": "interrupt_unavailable", "delegation_id": delegation_id}
-        interrupt_lock = record.setdefault("_interrupt_lock", threading.Lock())
+            record = None
+        interrupt_lock = (
+            record.setdefault("_interrupt_lock", threading.Lock())
+            if record is not None
+            else threading.Lock()
+        )
 
     # Durable request ownership and the live callback form one per-delegation
     # transaction. Never wait for this lock while holding _records_lock.
@@ -842,13 +880,12 @@ def interrupt_async_delegation(
                 "delegation_id": delegation_id,
                 "worker_status": snapshot["state"],
             }
-        with _records_lock:
-            current = _records.get(delegation_id)
-            if current is not record or current.get("session_key", "") != session_key:
-                return {"status": "interrupt_unavailable", "delegation_id": delegation_id}
-            fn = current.get("interrupt_fn")
-        if not callable(fn):
-            return {"status": "interrupt_unavailable", "delegation_id": delegation_id}
+        fn = None
+        if record is not None:
+            with _records_lock:
+                current = _records.get(delegation_id)
+                if current is record and current.get("session_key", "") == session_key:
+                    fn = current.get("interrupt_fn")
 
         requested_attempt_ids = []
         for child in snapshot["children"].values():
@@ -876,11 +913,32 @@ def interrupt_async_delegation(
                     "worker_status": current_snapshot["state"],
                 }
             status = (
-                "interrupt_requested"
-                if current_snapshot["state"] == "interrupt_requested"
-                else "interrupt_unavailable"
+                "interrupt_unavailable"
+                if record is None
+                else (
+                    "interrupt_requested"
+                    if current_snapshot["state"] == "interrupt_requested"
+                    else "interrupt_unavailable"
+                )
             )
             return {"status": status, "delegation_id": delegation_id}
+
+        if not callable(fn):
+            # Resumed runs are not represented by the legacy per-delegation
+            # closure. Their durable exact-attempt requests are authoritative;
+            # best-effort the live child registry when construction has finished.
+            from tools import delegate_tool as _delegate_tool
+
+            for child in snapshot["children"].values():
+                child_id = child.get("subagent_id")
+                if isinstance(child_id, str) and child_id:
+                    _delegate_tool.interrupt_subagent_status(child_id, reason=reason)
+            _notify_state_change()
+            return {
+                "status": "interrupt_requested",
+                "delegation_id": delegation_id,
+                "attempt_ids": requested_attempt_ids,
+            }
 
         with _records_lock:
             current = _records.get(delegation_id)
@@ -906,7 +964,12 @@ def interrupt_async_delegation(
                 "delegation_id": delegation_id,
                 "error": f"{type(exc).__name__}: {exc}",
             }
-        return {"status": "interrupt_requested", "delegation_id": delegation_id}
+        return {
+            "status": "interrupt_requested",
+            "delegation_id": delegation_id,
+            "attempt_ids": requested_attempt_ids,
+            "run_id": snapshot.get("active_run_id") or snapshot.get("run_id"),
+        }
 
 
 def abandon_async_delegation(

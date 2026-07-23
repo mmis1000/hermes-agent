@@ -7,6 +7,7 @@ import multiprocessing
 import os
 import threading
 import time
+import uuid
 from collections import OrderedDict
 from unittest.mock import AsyncMock, MagicMock
 
@@ -190,6 +191,147 @@ def test_resume_control_is_strict_and_forwards_live_parent(monkeypatch):
         "parent_agent": parent,
     }
     assert "reasoning" not in repr(payload)
+
+
+def _two_terminal_runs():
+    suffix = uuid.uuid4().hex
+    delegation_id = f"deleg-two-runs-{suffix}"
+    child_id = f"sa-two-runs-{suffix}"
+    record = {
+        "delegation_id": delegation_id,
+        "goal": "two runs",
+        "goals": ["two runs"],
+        "session_key": "owner",
+        "origin_ui_session_id": "ui-owner",
+        "parent_session_id": "owner",
+        "status": "running",
+        "dispatched_at": time.time(),
+        "root_subagent_ids": [child_id],
+        "is_batch": False,
+    }
+    ad._persist_dispatch(record)
+    repo = ad._repository()
+    first_run = record["run_id"]
+    first_attempt = record["attempt_ids"][0]
+    old_metadata = {
+        "child_session_id": f"child-old-{suffix}",
+        "assistant_text_tail": "old tail",
+        "events": [{"type": "tool.started", "name": "old-tool"}],
+    }
+    assert repo.transition_attempt(
+        first_attempt, {"starting"}, "completed", metadata=old_metadata
+    )["status"] == "updated"
+    assert repo.complete_run(
+        first_run,
+        {"type": "async_delegation", "delegation_id": delegation_id,
+         "run_id": first_run, "status": "completed"},
+        {"status": "completed", "summary": "old result"},
+    )["status"] == "completed"
+
+    reserved = repo.reserve_resumed_attempt(
+        child_id,
+        physical_worker_id=child_id,
+        owner_pid=os.getpid(),
+        metadata={"child_session_id": f"child-new-{suffix}"},
+    )
+    assert reserved["status"] == "reserved"
+    second_run = reserved["run_id"]
+    second_attempt = reserved["attempt_id"]
+    assert repo.transition_attempt(
+        second_attempt,
+        {"starting"},
+        "completed",
+        metadata={
+            "child_session_id": f"child-new-{suffix}",
+            "assistant_text_tail": "new tail",
+            "events": [{"type": "tool.completed", "name": "new-tool"}],
+        },
+    )["status"] == "updated"
+    assert repo.complete_run(
+        second_run,
+        {"type": "async_delegation", "delegation_id": delegation_id,
+         "run_id": second_run, "status": "completed"},
+        {"status": "completed", "summary": "new result"},
+    )["status"] == "completed"
+    return delegation_id, child_id, first_run, first_attempt, second_run, second_attempt
+
+
+def test_status_and_tail_project_exact_resumed_attempts(monkeypatch):
+    from tools.delegation_control import delegation_control
+
+    monkeypatch.setattr(dt, "list_active_subagents", lambda: [])
+    delegation_id, child_id, first_run, first_attempt, second_run, second_attempt = (
+        _two_terminal_runs()
+    )
+
+    status = json.loads(delegation_control(
+        action="status", delegation_id=delegation_id, session_key="owner"
+    ))
+    assert status["run_id"] == second_run
+    assert status["latest_run_id"] == second_run
+    assert status["active_run_id"] is None
+    assert status["pending_run_count"] == 2
+    assert status["subagents"][0]["attempt_id"] == second_attempt
+    assert status["subagents"][0]["resume_available"] is True
+
+    old_tail = json.loads(delegation_control(
+        action="tail",
+        delegation_id=delegation_id,
+        attempt_id=first_attempt,
+        session_key="owner",
+    ))
+    assert old_tail["run_id"] == first_run
+    assert old_tail["subagents"][0]["attempt_id"] == first_attempt
+    assert old_tail["subagents"][0]["assistant_text_tail"] == "old tail"
+    assert old_tail["subagents"][0]["events"][0]["name"] == "old-tool"
+
+    mismatch = json.loads(delegation_control(
+        action="tail",
+        delegation_id=delegation_id,
+        subagent_id=f"other-{child_id}",
+        attempt_id=first_attempt,
+        session_key="owner",
+    ))
+    assert mismatch["status"] == "not_found"
+
+
+def test_wait_is_fifo_by_default_and_exact_by_run(monkeypatch):
+    monkeypatch.setattr(dt, "list_active_subagents", lambda: [])
+    delegation_id, _child, first_run, _first_attempt, second_run, _second_attempt = (
+        _two_terminal_runs()
+    )
+    first = ad.wait_for_delegation(
+        delegation_id, session_key="owner", timeout_seconds=0
+    )
+    second = ad.wait_for_delegation(
+        delegation_id, session_key="owner", timeout_seconds=0
+    )
+    assert first["run_id"] == first_run and first["claimed_delivery"] is True
+    assert second["run_id"] == second_run and second["claimed_delivery"] is True
+
+    exact_id, _child, old_run, _old_attempt, new_run, _new_attempt = _two_terminal_runs()
+    exact = ad.wait_for_delegation(
+        exact_id, session_key="owner", timeout_seconds=0, run_id=new_run
+    )
+    assert exact["run_id"] == new_run and exact["claimed_delivery"] is True
+    assert ad._repository().inspect_delivery(exact_id, old_run)["delivery_state"] == "pending"
+
+
+def test_abandon_suppresses_every_pending_run(monkeypatch):
+    monkeypatch.setattr(dt, "list_active_subagents", lambda: [])
+    delegation_id, _child, first_run, _first_attempt, second_run, _second_attempt = (
+        _two_terminal_runs()
+    )
+    abandoned = ad.abandon_async_delegation(
+        delegation_id, session_key="owner", reason="obsolete"
+    )
+    assert abandoned["status"] == "abandoned"
+    assert ad._repository().inspect_delivery(
+        delegation_id, first_run
+    )["delivery_state"] == "suppressed"
+    assert ad._repository().inspect_delivery(
+        delegation_id, second_run
+    )["delivery_state"] == "suppressed"
 
 
 def _starting_steer_attempt(delegation_id: str, subagent_id: str):

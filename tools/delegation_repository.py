@@ -682,24 +682,72 @@ class DelegationRepository:
             ).rowcount
         return {"status": "delivered" if changed == 1 else "stale"}
 
-    def hold_for_wait(self, delegation_id: str, session_key: str, token: str, *, now: Optional[float] = None) -> Dict[str, Any]:
+    def hold_for_wait(
+        self,
+        delegation_id: str,
+        session_key: str,
+        token: str,
+        *,
+        run_id: Optional[str] = None,
+        now: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Bind one waiter to an exact run without later retargeting it."""
         claimed = float(time.time() if now is None else now)
         with self.write_txn() as conn:
             owner = conn.execute(
-                "SELECT 1 FROM async_delegations WHERE delegation_id=? AND origin_session=?", (delegation_id, session_key)
+                "SELECT 1 FROM async_delegations WHERE delegation_id=? AND origin_session=?",
+                (delegation_id, session_key),
             ).fetchone()
             if owner is None:
                 return {"status": "not_found"}
-            resolved = self._resolve_run(conn, delegation_id, None)
-            if resolved["status"] != "found":
-                return {"status": resolved["status"]}
+            if run_id:
+                row = conn.execute(
+                    "SELECT * FROM delegation_runs WHERE delegation_id=? AND run_id=?",
+                    (delegation_id, run_id),
+                ).fetchone()
+            else:
+                # FIFO terminal delivery wins. With none available, bind to the
+                # latest active run at call start and never jump to a later run.
+                row = conn.execute(
+                    """SELECT * FROM delegation_runs WHERE delegation_id=?
+                       AND completed_at IS NOT NULL AND delivery_state='pending'
+                       ORDER BY completed_at,run_number LIMIT 1""",
+                    (delegation_id,),
+                ).fetchone()
+                if row is None:
+                    row = conn.execute(
+                        """SELECT r.* FROM delegation_runs r
+                           WHERE r.delegation_id=? AND EXISTS (
+                             SELECT 1 FROM delegation_attempts a WHERE a.run_id=r.run_id
+                               AND a.state IN ('starting','running','finalizing','interrupt_requested'))
+                           ORDER BY r.run_number DESC LIMIT 1""",
+                        (delegation_id,),
+                    ).fetchone()
+                if row is None:
+                    row = conn.execute(
+                        "SELECT * FROM delegation_runs WHERE delegation_id=? ORDER BY run_number DESC LIMIT 1",
+                        (delegation_id,),
+                    ).fetchone()
+            if row is None:
+                return {"status": "not_found"}
+            if row["delivery_state"] == "held_by_wait" and row["delivery_claim"] == token:
+                return {"status": "held", "run_id": row["run_id"]}
             changed = conn.execute(
                 "UPDATE delegation_runs SET delivery_state='held_by_wait',delivery_claim=?,\n                   delivery_claimed_at=? WHERE run_id=? AND delivery_state='pending'",
-                (token, claimed, resolved["row"]["run_id"]),
+                (token, claimed, row["run_id"]),
             ).rowcount
-        return {"status": "held" if changed == 1 else "stale"}
+            if changed == 1:
+                return {"status": "held", "run_id": row["run_id"]}
+            return {
+                "status": "bound",
+                "run_id": row["run_id"],
+                "delivery_state": row["delivery_state"],
+            }
 
-    def consume_wait_hold(self, delegation_id: str, session_key: str, token: str, *, now: Optional[float] = None) -> Dict[str, Any]:
+    def consume_wait_hold(
+        self, delegation_id: str, session_key: str, token: str, *,
+        run_id: Optional[str] = None, now: Optional[float] = None,
+    ) -> Dict[str, Any]:
         completed = float(time.time() if now is None else now)
         with self.write_txn() as conn:
             owner = conn.execute(
@@ -707,55 +755,74 @@ class DelegationRepository:
             ).fetchone()
             if owner is None:
                 return {"status": "not_found"}
-            resolved = self._resolve_run(conn, delegation_id, None)
-            if resolved["status"] != "found":
-                return {"status": resolved["status"]}
+            row = conn.execute(
+                "SELECT run_id FROM delegation_runs WHERE delegation_id=? AND delivery_claim=?"
+                + (" AND run_id=?" if run_id else ""),
+                (delegation_id, token, run_id) if run_id else (delegation_id, token),
+            ).fetchone()
+            if row is None:
+                return {"status": "stale"}
             changed = conn.execute(
                 "UPDATE delegation_runs SET delivery_state='consumed',delivered_at=?,\n                   delivery_claim=NULL,delivery_claimed_at=NULL\n                   WHERE run_id=? AND completed_at IS NOT NULL AND event_json IS NOT NULL\n                     AND delivery_state='held_by_wait' AND delivery_claim=?",
-                (completed, resolved["row"]["run_id"], token),
+                (completed, row["run_id"], token),
             ).rowcount
         return {"status": "consumed" if changed == 1 else "stale"}
 
-    def release_wait_hold(self, delegation_id: str, session_key: str, token: str) -> Dict[str, Any]:
+    def release_wait_hold(
+        self, delegation_id: str, session_key: str, token: str, *,
+        run_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
         with self.write_txn() as conn:
             owner = conn.execute(
                 "SELECT 1 FROM async_delegations WHERE delegation_id=? AND origin_session=?", (delegation_id, session_key)
             ).fetchone()
             if owner is None:
                 return {"status": "not_found"}
-            resolved = self._resolve_run(conn, delegation_id, None)
-            if resolved["status"] != "found":
-                return {"status": resolved["status"]}
+            row = conn.execute(
+                "SELECT run_id FROM delegation_runs WHERE delegation_id=? AND delivery_claim=?"
+                + (" AND run_id=?" if run_id else ""),
+                (delegation_id, token, run_id) if run_id else (delegation_id, token),
+            ).fetchone()
+            if row is None:
+                return {"status": "stale"}
             changed = conn.execute(
                 "UPDATE delegation_runs SET delivery_state='pending',delivery_claim=NULL,\n                   delivery_claimed_at=NULL WHERE run_id=? AND delivery_state='held_by_wait'\n                     AND delivery_claim=?",
-                (resolved["row"]["run_id"], token),
+                (row["run_id"], token),
             ).rowcount
         return {"status": "released" if changed == 1 else "stale"}
 
     def suppress_delivery(self, delegation_id: str, session_key: str, reason: str = "") -> Dict[str, Any]:
+        """Suppress every still-pending run delivery for one logical delegation."""
         with self.write_txn() as conn:
             container = conn.execute(
-                "SELECT abandon_reason FROM async_delegations WHERE delegation_id=? AND origin_session=?", (delegation_id, session_key)
+                "SELECT abandon_reason FROM async_delegations WHERE delegation_id=? AND origin_session=?",
+                (delegation_id, session_key),
             ).fetchone()
             if container is None:
                 return {"status": "not_found"}
-            resolved = self._resolve_run(conn, delegation_id, None)
-            if resolved["status"] != "found":
-                return {"status": resolved["status"]}
-            row = resolved["row"]
-            if row["delivery_state"] == "suppressed":
-                if reason:
-                    conn.execute("UPDATE async_delegations SET abandon_reason=? WHERE delegation_id=?", (reason, delegation_id))
-                return {"status": "already_suppressed"}
-            if row["delivery_state"] not in {"pending", "held_by_wait"}:
-                return {"status": "too_late"}
+            now = time.time()
             changed = conn.execute(
-                "UPDATE delegation_runs SET delivery_state='suppressed',delivered_at=?,\n                   delivery_claim=NULL,delivery_claimed_at=NULL\n                   WHERE run_id=? AND delivery_state IN ('pending','held_by_wait')",
-                (time.time(), row["run_id"]),
+                """UPDATE delegation_runs SET delivery_state='suppressed',delivered_at=?,
+                     delivery_claim=NULL,delivery_claimed_at=NULL
+                   WHERE delegation_id=? AND delivery_state IN ('pending','held_by_wait')""",
+                (now, delegation_id),
             ).rowcount
-            if changed == 1:
-                conn.execute("UPDATE async_delegations SET abandon_reason=? WHERE delegation_id=?", (reason or None, delegation_id))
-        return {"status": "suppressed" if changed == 1 else "too_late"}
+            remaining = conn.execute(
+                """SELECT
+                     SUM(CASE WHEN delivery_state='suppressed' THEN 1 ELSE 0 END) AS suppressed,
+                     SUM(CASE WHEN delivery_state IN ('pending','held_by_wait') THEN 1 ELSE 0 END) AS pending
+                   FROM delegation_runs WHERE delegation_id=?""",
+                (delegation_id,),
+            ).fetchone()
+            conn.execute(
+                "UPDATE async_delegations SET abandon_reason=? WHERE delegation_id=?",
+                (reason or container["abandon_reason"], delegation_id),
+            )
+            if changed:
+                return {"status": "suppressed", "count": int(changed)}
+            if int(remaining["suppressed"] or 0) > 0 and int(remaining["pending"] or 0) == 0:
+                return {"status": "already_suppressed", "count": 0}
+            return {"status": "too_late", "count": 0}
 
     def recover_stale_wait_holds(self, *, cutoff: float, delegation_id: Optional[str] = None) -> int:
         where = " AND delegation_id=?" if delegation_id else ""
@@ -791,6 +858,49 @@ class DelegationRepository:
                     )})
         return {"status": "recovered", "attempts": recovered}
 
+    def snapshot_for_attempt(
+        self,
+        delegation_id: str,
+        attempt_id: str,
+        *,
+        session_key: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Return one authorized historical attempt projected through its run."""
+        conn = self._connect()
+        try:
+            params: List[Any] = [delegation_id, attempt_id]
+            owner_clause = ""
+            if session_key is not None:
+                owner_clause = " AND d.origin_session=?"
+                params.append(session_key)
+            row = conn.execute(
+                """SELECT a.run_id,a.logical_id FROM delegation_attempts a
+                   JOIN delegation_logical_subagents l ON l.logical_id=a.logical_id
+                   JOIN async_delegations d ON d.delegation_id=l.delegation_id
+                   WHERE d.delegation_id=? AND a.attempt_id=?"""
+                + owner_clause,
+                params,
+            ).fetchone()
+            if row is None:
+                return None
+            snapshot = self._snapshot_with_conn(
+                conn,
+                delegation_id,
+                session_key=session_key,
+                run_id=str(row["run_id"]),
+            )
+            if snapshot is None:
+                return None
+            logical_id = str(row["logical_id"])
+            child = snapshot.get("children", {}).get(logical_id)
+            if child is None:
+                return None
+            snapshot["children"] = {logical_id: child}
+            snapshot["root_subagent_ids"] = [logical_id]
+            return snapshot
+        finally:
+            conn.close()
+
     def snapshot(
         self, delegation_id: str, *, session_key: Optional[str] = None,
         run_id: Optional[str] = None,
@@ -821,6 +931,23 @@ class DelegationRepository:
             "SELECT * FROM delegation_runs WHERE delegation_id=?"
             + (" AND run_id=?" if run_id else " ORDER BY run_number DESC LIMIT 1"),
             (delegation_id, run_id) if run_id else (delegation_id,),
+        ).fetchone()
+        run_summary = conn.execute(
+            """SELECT
+                 SUM(CASE WHEN completed_at IS NOT NULL AND delivery_state IN
+                   ('pending','held_by_wait','delivering') THEN 1 ELSE 0 END)
+                   AS pending_count,
+                 MAX(run_number) AS latest_number
+               FROM delegation_runs WHERE delegation_id=?""",
+            (delegation_id,),
+        ).fetchone()
+        active_run = conn.execute(
+            """SELECT r.run_id FROM delegation_runs r
+               WHERE r.delegation_id=? AND EXISTS (
+                 SELECT 1 FROM delegation_attempts a WHERE a.run_id=r.run_id
+                   AND a.state IN ('starting','running','finalizing','interrupt_requested'))
+               ORDER BY r.run_number DESC LIMIT 1""",
+            (delegation_id,),
         ).fetchone()
         if run_id and run is None:
             return None
@@ -876,6 +1003,13 @@ class DelegationRepository:
                 "run_id": attempt["run_id"],
                 "steers": steers_by_child.get(str(attempt["logical_id"]), []),
             }
+            child["resume_available"] = (
+                attempt["state"] not in _ACTIVE_STATES
+                and isinstance(child.get("child_session_id"), str)
+                and bool(child.get("child_session_id"))
+            )
+            if child["resume_available"]:
+                child["suggested_action"] = "resume"
             children[attempt["logical_id"]] = child
             if attempt["root_ordinal"] is not None:
                 roots.append(attempt["logical_id"])
@@ -926,6 +1060,9 @@ class DelegationRepository:
             "delivery_claim": run["delivery_claim"] if run else None,
             "delivery_claimed_at": run["delivery_claimed_at"] if run else None,
             "run_id": run["run_id"] if run else None,
+            "latest_run_id": run["run_id"] if run else None,
+            "active_run_id": active_run["run_id"] if active_run else None,
+            "pending_run_count": int(run_summary["pending_count"] or 0),
             "root_subagent_ids": roots,
             "children": children,
             "interrupt_requests": interrupts,
