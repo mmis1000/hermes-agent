@@ -228,6 +228,8 @@ def test_reconstructed_child_uses_saved_policy_and_live_credentials_without_pare
         "allowed": ["one"],
         "sort": "price",
     }
+    assert build["session_id_override"] == "child-new"
+    assert build["parent_session_id_override"] == "child-old"
     assert build["override_max_tokens"] == 321
     assert child.session_id == "child-new"
     assert child._parent_session_id == "child-old"
@@ -285,6 +287,56 @@ def test_async_loader_is_authorized_and_keeps_provider_history_internal(
     assert foreign == {"status": "not_found"}
     assert "history" not in repr(projected)
     assert "private chain" not in repr(projected)
+    ad._reset_for_tests()
+
+
+def test_async_loader_falls_back_from_missing_completed_segment(tmp_path, monkeypatch):
+    from tools import async_delegation as ad
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    ad._reset_for_tests()
+    db = SessionDB()
+    _session(db, "parent", source="discord", owner=None)
+    _session(db, "child-valid", parent="parent")
+    db.append_message("child-valid", "user", "original goal")
+    db.append_message("child-valid", "assistant", "valid prior answer")
+
+    repository = ad._repository()
+    initial = repository.register_initial_dispatch(
+        {
+            "delegation_id": "deleg-missing-latest",
+            "session_key": "parent",
+            "dispatched_at": 1.0,
+            "root_subagent_ids": ["logical-child"],
+        }
+    )
+    first = initial["attempts"][0]
+    repository.transition_attempt(
+        first["attempt_id"],
+        {"starting"},
+        "completed",
+        metadata=_metadata(child="child-valid"),
+        completed_at=2.0,
+    )
+    second = repository.reserve_resumed_attempt(
+        "logical-child",
+        metadata=_metadata(child="child-valid"),
+    )
+    repository.transition_attempt(
+        second["attempt_id"],
+        {"starting"},
+        "completed",
+        metadata=_metadata(child="child-never-persisted"),
+        completed_at=3.0,
+    )
+
+    loaded = ad.load_subagent_resume_bundle(
+        "deleg-missing-latest", "logical-child", session_key="parent"
+    )
+
+    assert loaded["status"] == "ready"
+    assert loaded["bundle"]["prior_child_session_id"] == "child-valid"
+    assert loaded["bundle"]["history"][-1]["content"] == "valid prior answer"
     ad._reset_for_tests()
 
 

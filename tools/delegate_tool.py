@@ -1473,6 +1473,8 @@ def build_resumed_child_agent(
         reasoning_config_override=metadata.get("reasoning_config"),
         fallback_model_override=list(metadata.get("fallback_routes") or []),
         provider_preferences_override=metadata.get("provider_preferences"),
+        session_id_override=continuation["session_id"],
+        parent_session_id_override=continuation["parent_session_id"],
         role=str(metadata.get("role") or "leaf"),
     )
 
@@ -1606,6 +1608,8 @@ def _build_child_agent(
     reasoning_config_override: Any = _UNSET,
     fallback_model_override: Any = _UNSET,
     provider_preferences_override: Optional[Dict[str, Any]] = None,
+    session_id_override: Optional[str] = None,
+    parent_session_id_override: Optional[str] = None,
     # Per-call role controlling whether the child can further delegate.
     # 'leaf' (default) cannot; 'orchestrator' retains the delegation
     # toolset subject to depth/kill-switch bounds applied below.
@@ -1921,6 +1925,8 @@ def _build_child_agent(
     child_optional_kwargs: Dict[str, Any] = {}
     if isinstance(child_max_tokens, int):
         child_optional_kwargs["max_tokens"] = child_max_tokens
+    if session_id_override:
+        child_optional_kwargs["session_id"] = session_id_override
 
     child = AIAgent(
         base_url=effective_base_url,
@@ -1946,7 +1952,11 @@ def _build_child_agent(
         clarify_callback=None,
         thinking_callback=child_thinking_cb,
         session_db=getattr(parent_agent, "_session_db", None),
-        parent_session_id=getattr(parent_agent, "session_id", None),
+        parent_session_id=(
+            parent_session_id_override
+            if parent_session_id_override is not None
+            else getattr(parent_agent, "session_id", None)
+        ),
         providers_allowed=child_providers_allowed,
         providers_ignored=child_providers_ignored,
         providers_order=child_providers_order,

@@ -901,6 +901,32 @@ class DelegationRepository:
         finally:
             conn.close()
 
+    def resume_metadata_candidates(
+        self, delegation_id: str, logical_id: str
+    ) -> List[Dict[str, Any]]:
+        """Return newest-first durable attempt metadata for transcript recovery."""
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                "SELECT a.attempt_id,a.attempt_number,a.state,a.metadata_json "
+                "FROM delegation_attempts a "
+                "JOIN delegation_logical_subagents l ON l.logical_id=a.logical_id "
+                "WHERE a.logical_id=? AND l.delegation_id=? "
+                "ORDER BY a.attempt_number DESC",
+                (logical_id, delegation_id),
+            ).fetchall()
+            return [
+                {
+                    "attempt_id": str(row["attempt_id"]),
+                    "attempt_number": int(row["attempt_number"]),
+                    "state": str(row["state"]),
+                    "metadata": _json(row["metadata_json"], {}),
+                }
+                for row in rows
+            ]
+        finally:
+            conn.close()
+
     def snapshot(
         self, delegation_id: str, *, session_key: Optional[str] = None,
         run_id: Optional[str] = None,

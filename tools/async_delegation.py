@@ -340,15 +340,45 @@ def load_subagent_resume_bundle(
         for key in _RESUME_METADATA_FIELDS
         if key in child
     }
-    child_session_id = metadata.get("child_session_id")
-    try:
-        from hermes_state import SessionDB
+    candidates = [metadata]
+    latest_attempt_id = child.get("attempt_id")
+    for prior in _repository().resume_metadata_candidates(delegation_id, logical_id):
+        if prior.get("attempt_id") == latest_attempt_id:
+            continue
+        raw = prior.get("metadata")
+        if not isinstance(raw, dict):
+            continue
+        candidate = {
+            key: raw.get(key)
+            for key in _RESUME_METADATA_FIELDS
+            if key in raw
+        }
+        if candidate:
+            candidates.append(candidate)
 
-        bundle = SessionDB().get_subagent_resume_bundle(
-            child_session_id, metadata
-        )
-    except (OSError, RuntimeError, TypeError, ValueError) as exc:
-        return {"status": "resume_unavailable", "reason": str(exc)}
+    from hermes_state import SessionDB
+
+    bundle = None
+    last_missing_error = "missing subagent transcript"
+    for candidate in candidates:
+        child_session_id = str(candidate.get("child_session_id") or "")
+        try:
+            bundle = SessionDB().get_subagent_resume_bundle(
+                child_session_id, candidate
+            )
+            break
+        except ValueError as exc:
+            # A completed legacy attempt could advance its durable anchor before
+            # the continuation row was actually persisted. Recover from the
+            # newest older valid segment, but never bypass ownership/lineage
+            # failures by trying a different attempt.
+            if str(exc) != "missing subagent transcript":
+                return {"status": "resume_unavailable", "reason": str(exc)}
+            last_missing_error = str(exc)
+        except (OSError, RuntimeError, TypeError) as exc:
+            return {"status": "resume_unavailable", "reason": str(exc)}
+    if bundle is None:
+        return {"status": "resume_unavailable", "reason": last_missing_error}
     return {
         "status": "ready",
         "delegation_id": delegation_id,

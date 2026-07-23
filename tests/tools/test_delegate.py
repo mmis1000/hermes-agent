@@ -494,8 +494,13 @@ class TestDelegateTask(unittest.TestCase):
                 max_iterations=7,
                 parent_agent=parent,
                 task_count=1,
+                session_id_override="resume-segment",
+                parent_session_id_override="prior-segment",
             )
+            constructor_kwargs = MockAgent.call_args.kwargs
 
+        self.assertEqual(constructor_kwargs["session_id"], "resume-segment")
+        self.assertEqual(constructor_kwargs["parent_session_id"], "prior-segment")
         metadata = built._delegation_runtime_metadata
         self.assertEqual(metadata["child_session_id"], "child-session")
         self.assertEqual(metadata["parent_session_id"], "parent-session")
