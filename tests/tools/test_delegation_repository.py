@@ -56,6 +56,17 @@ def _open_snapshot(path: str, delegation_id: str, start, output) -> None:
         output.put(("error", f"{type(exc).__name__}: {exc}"))
 
 
+def _reserve_attempt(path: str, logical_id: str, worker_id: str, start, output) -> None:
+    start.wait()
+    try:
+        outcome = DelegationRepository(Path(path)).reserve_resumed_attempt(
+            logical_id, physical_worker_id=worker_id
+        )
+        output.put(outcome)
+    except BaseException as exc:  # pragma: no cover - asserted in parent
+        output.put({"status": "error", "error": f"{type(exc).__name__}: {exc}"})
+
+
 @pytest.fixture
 def repo(tmp_path: Path) -> DelegationRepository:
     return DelegationRepository(tmp_path / "state.db")
@@ -93,7 +104,8 @@ def test_initial_single_and_batch_shape_preserves_root_order(repo):
     assert snap["lifecycle_version"] == 2
     assert snap["root_subagent_ids"] == ["sa-z", "sa-a"]
     assert list(snap["children"]) == ["sa-z", "sa-a"]
-    assert snap["state"] == "starting"
+    assert snap["state"] == "running"
+    assert snap["children"]["sa-z"]["status"] == "starting"
 
 
 def test_batch_result_mapping_is_ordinal_not_uuid_order(repo):
@@ -161,11 +173,15 @@ def test_stale_run_completion_does_not_overwrite_or_publish(repo):
     old_attempt = initial["attempts"][0]["attempt_id"]
     repo.transition_attempt(old_attempt, {"starting"}, "completed")
     resumed = repo.reserve_resumed_attempt("sa-root")
+    stale_event = {"status": "error", "summary": "stale", "completed_at": 19.0}
+    assert repo.complete_run(initial["run_id"], stale_event, stale_event)["status"] == "stale"
+    assert repo.pending_events() == []
     fresh_event = {"status": "completed", "summary": "fresh", "completed_at": 20.0}
     assert repo.complete_run(resumed["run_id"], fresh_event, fresh_event)["status"] == "completed"
 
-    stale_event = {"status": "error", "summary": "stale", "completed_at": 21.0}
+    stale_event["completed_at"] = 21.0
     assert repo.complete_run(resumed["run_id"], stale_event, stale_event)["status"] == "stale"
+    assert len(repo.pending_events()) == 1
     snap = repo.snapshot("deleg-1")
     assert snap["event"]["summary"] == "fresh"
     assert snap["result"]["summary"] == "fresh"
@@ -290,27 +306,39 @@ def test_run_delivery_is_exact_and_omitted_run_fails_ambiguous(repo):
 
 
 def test_retention_protects_active_attempts_and_nonterminal_delivery(repo):
-    active = repo.register_initial_dispatch(
-        _record("deleg-active", ["sa-active"], dispatched_at=1.0)
-    )
-    pending = repo.register_initial_dispatch(
-        _record("deleg-pending", ["sa-pending"], dispatched_at=2.0)
-    )
-    repo.complete_run(pending["run_id"], {"status": "completed"}, {"summary": "keep"})
-    prune = repo.register_initial_dispatch(
-        _record("deleg-prune", ["sa-prune"], dispatched_at=3.0)
-    )
-    repo.complete_run(prune["run_id"], {"status": "completed"}, {"summary": "drop"})
-    claimed = repo.claim_run_delivery("deleg-prune", prune["run_id"], "claim")
-    assert claimed["status"] == "claimed"
-    repo.commit_run_delivery(prune["run_id"], "claim")
-
+    repo.register_initial_dispatch(_record("deleg-active", ["sa-active"], 1.0))
+    protected = {}
+    for index, state in enumerate(("pending", "held_by_wait", "delivering"), 2):
+        delegation_id = f"deleg-{state}"
+        created = repo.register_initial_dispatch(
+            _record(delegation_id, [f"sa-{state}"], float(index))
+        )
+        repo.complete_run(created["run_id"], {"status": "completed"}, {"summary": state})
+        if state == "held_by_wait":
+            repo.hold_for_wait(delegation_id, "owner", "hold")
+        elif state == "delivering":
+            repo.claim_run_delivery(delegation_id, created["run_id"], "claim")
+        protected[delegation_id] = state
+    for index, state in enumerate(("delivered", "consumed", "suppressed"), 5):
+        delegation_id = f"deleg-{state}"
+        created = repo.register_initial_dispatch(
+            _record(delegation_id, [f"sa-{state}"], float(index))
+        )
+        repo.complete_run(created["run_id"], {"status": "completed"}, {"summary": state})
+        if state == "delivered":
+            repo.acknowledge_pending(delegation_id)
+        elif state == "consumed":
+            repo.hold_for_wait(delegation_id, "owner", "hold")
+            repo.consume_wait_hold(delegation_id, "owner", "hold")
+        else:
+            repo.suppress_delivery(delegation_id, "owner")
     outcome = repo.prune(cutoff=time.time() + 100.0, max_terminal=0)
-    assert outcome["deleted"] == 1
+    assert outcome["deleted"] == 3
     assert repo.snapshot("deleg-active") is not None
-    assert repo.snapshot("deleg-pending") is not None
-    assert repo.snapshot("deleg-prune") is None
-    assert active["run_id"] and pending["run_id"]
+    for delegation_id, state in protected.items():
+        assert repo.snapshot(delegation_id)["delivery_state"] == state
+    for state in ("delivered", "consumed", "suppressed"):
+        assert repo.snapshot(f"deleg-{state}") is None
 
 
 def test_authorized_snapshot_derives_compatibility_fields(repo):
@@ -330,3 +358,118 @@ def test_authorized_snapshot_derives_compatibility_fields(repo):
     assert own["children"]["sa-root"]["tool_count"] == 2
     assert own["owner_pid"] is None
     assert repo.snapshot("deleg-1", session_key="foreign") is None
+
+
+@pytest.mark.parametrize(
+    ("legacy_state", "expected"),
+    [
+        ("starting", "starting"), ("running", "running"),
+        ("finalizing", "finalizing"), ("interrupt_requested", "interrupt_requested"),
+        ("completed", "completed"), ("success", "completed"),
+        ("error", "error"), ("failed", "error"), ("budget_exhausted", "error"),
+        ("interrupted", "interrupted"), ("cancelled", "interrupted"),
+        ("timeout", "timeout"), ("mystery", "unknown"),
+    ],
+)
+@pytest.mark.parametrize(
+    "delivery", ["pending", "held_by_wait", "delivering", "delivered", "consumed", "suppressed"]
+)
+def test_released_migration_matrix_and_frozen_legacy_fields(
+    tmp_path, legacy_state, expected, delivery
+):
+    path = tmp_path / "state.db"
+    _released_schema(str(path))
+    claim = "legacy-claim" if delivery in {"held_by_wait", "delivering"} else None
+    with sqlite3.connect(path) as conn:
+        conn.execute(
+            """INSERT INTO async_delegations
+               (delegation_id,origin_session,state,dispatched_at,updated_at,
+                completed_at,event_json,result_json,delivery_state,delivery_claim,
+                root_subagent_ids_json,children_json)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                "deleg-matrix", "owner", legacy_state, 1.0, 2.0,
+                None if legacy_state in {"starting", "running", "finalizing", "interrupt_requested"} else 2.0,
+                json.dumps({"status": legacy_state}), json.dumps({"status": legacy_state}),
+                delivery, claim, '["sa-root"]',
+                json.dumps({"sa-root": {"status": legacy_state}}),
+            ),
+        )
+    repository = DelegationRepository(path)
+    before = repository.snapshot("deleg-matrix")
+    assert before["children"]["sa-root"]["status"] == expected
+    assert before["delivery_state"] == delivery
+    with sqlite3.connect(path) as conn:
+        conn.execute(
+            """UPDATE async_delegations SET state='failed',delivery_state='suppressed',
+               children_json='{}',event_json='{}' WHERE delegation_id='deleg-matrix'"""
+        )
+    after = repository.snapshot("deleg-matrix")
+    assert after["children"] == before["children"]
+    assert after["delivery_state"] == delivery
+    assert after["event"] == before["event"]
+
+
+@pytest.mark.parametrize("repository_first", [True, False])
+def test_repository_and_session_db_bootstrap_in_either_order(tmp_path, repository_first):
+    from hermes_state import SessionDB
+
+    path = tmp_path / "state.db"
+    repository = DelegationRepository(path)
+    if repository_first:
+        assert repository.snapshot("missing") is None
+    database = SessionDB(db_path=path)
+    database.close()
+    if not repository_first:
+        assert repository.snapshot("missing") is None
+    assert repository.register_initial_dispatch(_record())["status"] == "registered"
+    assert repository.snapshot("deleg-1")["lifecycle_version"] == 2
+
+
+def test_preallocated_ids_survive_registration_archive_completion_and_event(repo):
+    record = _record()
+    record.update(run_id="run-preallocated", attempt_ids=["attempt-preallocated"])
+    created = repo.register_initial_dispatch(record)
+    assert created["run_id"] == "run-preallocated"
+    assert created["attempts"][0]["attempt_id"] == "attempt-preallocated"
+    registered = repo.register_subagent(
+        {"subagent_id": "sa-root", "status": "running", "tool_count": 1}
+    )
+    assert registered["attempt_id"] == "attempt-preallocated"
+    repo.transition_attempt(
+        "attempt-preallocated", {"running"}, "completed", metadata={"summary": "archived"}
+    )
+    event = {"status": "completed", "run_id": "run-preallocated", "completed_at": 5.0}
+    assert repo.complete_run("run-preallocated", event, {"summary": "done"})["status"] == "completed"
+    snapshot = repo.snapshot("deleg-1")
+    assert snapshot["children"]["sa-root"]["attempt_id"] == "attempt-preallocated"
+    assert snapshot["children"]["sa-root"]["summary"] == "archived"
+    assert repo.pending_events()[0] == {"run_id": "run-preallocated", "event": event}
+
+
+def test_repeated_multiprocess_resume_has_one_winner(tmp_path):
+    path = tmp_path / "state.db"
+    repository = DelegationRepository(path)
+    created = repository.register_initial_dispatch(_record())
+    repository.transition_attempt(created["attempts"][0]["attempt_id"], {"starting"}, "completed")
+    ctx = multiprocessing.get_context("spawn")
+    for round_number in range(3):
+        start, output = ctx.Event(), ctx.Queue()
+        workers = [
+            ctx.Process(
+                target=_reserve_attempt,
+                args=(str(path), "sa-root", f"worker-{round_number}-{index}", start, output),
+            )
+            for index in range(6)
+        ]
+        for worker in workers:
+            worker.start()
+        start.set()
+        outcomes = [output.get(timeout=20) for _ in workers]
+        for worker in workers:
+            worker.join(20)
+            assert worker.exitcode == 0
+        winners = [outcome for outcome in outcomes if outcome["status"] == "reserved"]
+        assert len(winners) == 1
+        assert [outcome["status"] for outcome in outcomes].count("already_running") == 5
+        repository.transition_attempt(winners[0]["attempt_id"], {"starting"}, "completed")

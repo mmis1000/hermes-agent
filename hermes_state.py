@@ -1060,8 +1060,6 @@ CREATE INDEX IF NOT EXISTS idx_sessions_handoff_state
     ON sessions(handoff_state, started_at);
 CREATE INDEX IF NOT EXISTS idx_async_delegations_owner_updated
     ON async_delegations(origin_session, updated_at DESC);
-CREATE INDEX IF NOT EXISTS idx_delegation_logical_container
-    ON delegation_logical_subagents(delegation_id, root_ordinal);
 CREATE INDEX IF NOT EXISTS idx_delegation_attempts_run
     ON delegation_attempts(run_id);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_delegation_one_active_attempt
