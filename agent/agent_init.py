@@ -532,7 +532,7 @@ _CONTROL_STATE: Dict[str, Any] = {
     "_supports_active_turn_redirect": True,
     # /steer: the drain hook appends the note to the last tool result after the current
     # batch — no interrupt, no new user turn (role alternation preserved).
-    "_pending_steer": None,
+    "_pending_steer": None, "_pending_steer_envelopes": [],
     "_pending_steer_lock": threading.Lock,
     # Active-turn redirect: keep the valid turn prefix, cancel only the in-flight request,
     # rebuild the tail with the correction. Drained at a role-safe boundary.

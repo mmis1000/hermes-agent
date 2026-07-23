@@ -16,7 +16,7 @@ Control existing children with `delegate_task(action=...)`.
   child's result re-enters the conversation as a new turn when it
   finishes.
 - **Control:** `list` / `steer` / `stop` for the live tree;
-  `status` / `tail` / `wait` / `interrupt` / `abandon`
+  `status` / `tail` / `wait` / `resume` / `interrupt` / `abandon`
   for a spawn handle. One bounded `wait` only when synchronization
   is required.
 - **Roles:** `leaf` (default; cannot re-delegate) vs `orchestrator`
