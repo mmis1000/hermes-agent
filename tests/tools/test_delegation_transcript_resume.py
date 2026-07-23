@@ -213,6 +213,7 @@ def test_reconstructed_child_uses_saved_policy_and_live_credentials_without_pare
     build = captured["build"]
     runtime_parent = build["parent_agent"]
     assert runtime_parent.session_id == "parent-owner"
+    assert isinstance(runtime_parent._session_db, SessionDB)
     assert runtime_parent.provider == "test-provider"
     assert runtime_parent.api_key == "live-key-never-persisted"
     assert runtime_parent.enabled_toolsets == ["file"]

@@ -1417,6 +1417,8 @@ def build_resumed_child_agent(
     )
     runtime_parent = parent_agent
     if runtime_parent is None:
+        from hermes_state import SessionDB
+
         # Durable resume must work after a gateway restart, where the original
         # parent AIAgent object no longer exists and native tool adapters may not
         # expose the newly-created controller object. Rebuild only the non-secret
@@ -1424,6 +1426,7 @@ def build_resumed_child_agent(
         # resolved fresh from the active provider configuration.
         runtime_parent = SimpleNamespace(
             session_id=continuation["delegate_from"],
+            _session_db=SessionDB(),
             model=model,
             provider=credentials.get("provider") or provider,
             base_url=credentials.get("base_url"),
