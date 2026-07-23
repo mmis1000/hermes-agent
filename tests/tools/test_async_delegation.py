@@ -553,6 +553,84 @@ def test_delegate_task_binds_exact_run_and_attempt_before_runner(tmp_path, monke
     }
 
 
+def test_background_child_persists_reconstruction_metadata_before_execution(
+    tmp_path, monkeypatch
+):
+    from unittest.mock import MagicMock
+    import tools.delegate_tool as dt
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    parent = MagicMock()
+    parent._delegate_depth = 0
+    parent.session_id = "sess-reconstruct"
+    parent._interrupt_requested = False
+    parent._active_children = []
+    parent._active_children_lock = None
+    parent._current_task_id = None
+
+    child = MagicMock()
+    child._delegate_role = "leaf"
+    child._delegate_depth = 1
+    child._subagent_id = "sa-reconstruct"
+    child._parent_subagent_id = None
+    child._credential_pool = None
+    child.tool_progress_callback = None
+    child.model = "model-safe"
+    child._delegation_session_ref = {"session_id": "child-session"}
+    child._delegation_runtime_metadata = {
+        "child_session_id": "child-session",
+        "provider": "provider-safe",
+        "model": "model-safe",
+        "enabled_toolsets": ["terminal"],
+        "disabled_toolsets": ["delegation"],
+        "workdir": "/workspace/repo",
+        "max_iterations": 8,
+        "fallback_routes": [
+            {"provider": "fallback-safe", "model": "fallback-model"}
+        ],
+    }
+    entered = threading.Event()
+    release = threading.Event()
+
+    def run_conversation(user_message, task_id=None, stream_callback=None):
+        entered.set()
+        assert release.wait(5)
+        return {"final_response": "done", "completed": True, "api_calls": 1}
+
+    child.run_conversation.side_effect = run_conversation
+    creds = {
+        "model": "model-safe", "provider": None, "base_url": None,
+        "api_key": None, "api_mode": None, "command": None, "args": None,
+    }
+    monkeypatch.setattr(dt, "_build_child_agent", lambda **_kwargs: child)
+    monkeypatch.setattr(dt, "_resolve_delegation_credentials", lambda *_a, **_k: creds)
+
+    payload = json.loads(
+        dt.delegate_task(
+            goal="persist reconstruction", background=True, parent_agent=parent
+        )
+    )
+    try:
+        assert entered.wait(5)
+        snapshot = ad.get_durable_delegation(payload["delegation_id"])
+        durable_child = snapshot["children"]["sa-reconstruct"]
+        assert durable_child["child_session_id"] == "child-session"
+        assert durable_child["provider"] == "provider-safe"
+        assert durable_child["enabled_toolsets"] == ["terminal"]
+        assert durable_child["workdir"] == "/workspace/repo"
+        assert durable_child["fallback_routes"] == [
+            {"provider": "fallback-safe", "model": "fallback-model"}
+        ]
+        assert child._delegation_session_ref == {
+            "session_id": "child-session",
+            "run_id": snapshot["run_id"],
+            "attempt_id": durable_child["attempt_id"],
+        }
+    finally:
+        release.set()
+    assert _drain_for(payload["delegation_id"]) is not None
+
+
 def test_delegate_task_background_uses_live_tui_agent_session_id(monkeypatch):
     """TUI async delegation must route to the live/compressed agent id.
 

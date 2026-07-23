@@ -187,8 +187,10 @@ def _register_subagent(record: Dict[str, Any]) -> None:
     record.setdefault("events", [])
     record.setdefault("assistant_text_tail", "")
     record.setdefault("assistant_text_raw_tail", "")
-    with _active_subagents_lock:
-        _active_subagents[sid] = record
+    durable_expected = (
+        "delegation_attempt_id" in record or "delegation_run_id" in record
+    )
+    delegation_id = None
     try:
         from tools.async_delegation import (
             register_subagent_lifecycle,
@@ -196,25 +198,39 @@ def _register_subagent(record: Dict[str, Any]) -> None:
         )
 
         delegation_id = register_subagent_lifecycle(record)
-        if delegation_id is not None:
-            pending, reason = take_pending_subagent_interrupt(sid)
-            if pending:
-                outcome = interrupt_subagent_status(sid, reason=reason)
-                if outcome != "interrupt_requested":
-                    logger.warning(
-                        "queued interrupt for starting subagent %s resolved as %s",
-                        sid,
-                        outcome,
-                    )
+        # An exact durable attempt that fails validation must never replace the
+        # current live entry for the same stable logical child.
+        if durable_expected and delegation_id is None:
+            return
     except Exception:
         logger.debug("subagent/delegation association failed", exc_info=True)
+        if durable_expected:
+            return
+
+    with _active_subagents_lock:
+        _active_subagents[sid] = record
+    if delegation_id is not None:
+        pending, reason = take_pending_subagent_interrupt(sid)
+        if pending:
+            outcome = interrupt_subagent_status(sid, reason=reason)
+            if outcome != "interrupt_requested":
+                logger.warning(
+                    "queued interrupt for starting subagent %s resolved as %s",
+                    sid,
+                    outcome,
+                )
 
 
-def _unregister_subagent(subagent_id: str) -> None:
+def _unregister_subagent(
+    subagent_id: str, attempt_id: Optional[str] = None
+) -> None:
     # Archive before removal to close the live-to-durable observability gap.
     with _active_subagents_lock:
         record = _active_subagents.get(subagent_id)
-    if record is None:
+    if record is None or (
+        attempt_id is not None
+        and record.get("delegation_attempt_id") != attempt_id
+    ):
         return
     tail = {
         "subagent_id": subagent_id,
@@ -442,12 +458,20 @@ def _bounded_live_preview(value: Any) -> str:
     return text[:_LIVE_PREVIEW_CHAR_LIMIT] + "…"
 
 
-def _append_live_event(subagent_id: Optional[str], event: Dict[str, Any]) -> None:
+def _append_live_event(
+    subagent_id: Optional[str],
+    event: Dict[str, Any],
+    *,
+    attempt_id: Optional[str] = None,
+) -> None:
     if not subagent_id:
         return
     with _active_subagents_lock:
         record = _active_subagents.get(subagent_id)
-        if record is None:
+        if record is None or (
+            attempt_id is not None
+            and record.get("delegation_attempt_id") != attempt_id
+        ):
             return
         events = record.setdefault("events", [])
         events.append(event)
@@ -456,13 +480,18 @@ def _append_live_event(subagent_id: Optional[str], event: Dict[str, Any]) -> Non
         record["last_activity_at"] = event.get("timestamp") or time.time()
 
 
-def _append_live_text(subagent_id: Optional[str], delta: Any) -> None:
+def _append_live_text(
+    subagent_id: Optional[str], delta: Any, *, attempt_id: Optional[str] = None
+) -> None:
     if not subagent_id or not delta:
         return
     text = _stringify_tool_content(delta)
     with _active_subagents_lock:
         record = _active_subagents.get(subagent_id)
-        if record is None:
+        if record is None or (
+            attempt_id is not None
+            and record.get("delegation_attempt_id") != attempt_id
+        ):
             return
         # Keep only a private bounded carry so split-delta credentials can be
         # recognized. This field is excluded from snapshots and archives.
@@ -1058,6 +1087,12 @@ def _build_child_progress_callback(
     _batch: List[str] = []
     _tool_count = [0]  # per-subagent running counter (list for closure mutation)
 
+    def _current_attempt_id() -> Optional[str]:
+        if not session_ref:
+            return None
+        value = session_ref.get("attempt_id")
+        return str(value) if value else None
+
     def _identity_kwargs() -> Dict[str, Any]:
         kw: Dict[str, Any] = {
             "task_index": task_index,
@@ -1079,6 +1114,10 @@ def _build_child_progress_callback(
         # event lets UIs open/inspect the subagent's session directly.
         if session_ref and session_ref.get("session_id"):
             kw["child_session_id"] = str(session_ref["session_id"])
+        if _current_attempt_id():
+            kw["attempt_id"] = _current_attempt_id()
+        if session_ref and session_ref.get("run_id"):
+            kw["run_id"] = str(session_ref["run_id"])
         kw["tool_count"] = _tool_count[0]
         return kw
 
@@ -1115,7 +1154,10 @@ def _build_child_progress_callback(
             if subagent_id is not None:
                 with _active_subagents_lock:
                     rec = _active_subagents.get(subagent_id)
-                    if rec is not None:
+                    if rec is not None and (
+                        _current_attempt_id() is None
+                        or rec.get("delegation_attempt_id") == _current_attempt_id()
+                    ):
                         rec["status"] = kwargs.get("status") or "completed"
                         rec["last_activity_at"] = time.time()
             _relay("subagent.complete", preview=preview, **kwargs)
@@ -1127,7 +1169,9 @@ def _build_child_progress_callback(
             # No spinner echo — the CLI shows the child via the tree, and the
             # CLI/TUI progress handlers ignore non-tool event types, so this is
             # inert there; only a gateway watch window consumes it.
-            _append_live_text(subagent_id, preview)
+            _append_live_text(
+                subagent_id, preview, attempt_id=_current_attempt_id()
+            )
             _relay("subagent.text", preview=preview)
             return
 
@@ -1167,6 +1211,7 @@ def _build_child_progress_callback(
                     "duration_seconds": float(kwargs.get("duration") or 0.0),
                     "timestamp": time.time(),
                 },
+                attempt_id=_current_attempt_id(),
             )
             return
 
@@ -1203,11 +1248,15 @@ def _build_child_progress_callback(
                 ),
                 "timestamp": time.time(),
             },
+            attempt_id=_current_attempt_id(),
         )
         if subagent_id is not None:
             with _active_subagents_lock:
                 rec = _active_subagents.get(subagent_id)
-                if rec is not None:
+                if rec is not None and (
+                    _current_attempt_id() is None
+                    or rec.get("delegation_attempt_id") == _current_attempt_id()
+                ):
                     rec["tool_count"] = _tool_count[0]
                     rec["last_tool"] = tool_name or ""
         if spinner:
@@ -1284,6 +1333,33 @@ def _inherit_parent_base_url(parent_agent, fallback_base_url: Optional[str]) -> 
     return fallback_base_url or None
 
 
+def _json_safe_copy(value: Any) -> Any:
+    """Return a detached JSON value or ``None`` for runtime-only objects."""
+    try:
+        return json.loads(json.dumps(value))
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _safe_fallback_routes(value: Any) -> List[Dict[str, str]]:
+    """Persist named fallback routes without credentials or endpoint details."""
+    items = value if isinstance(value, list) else [value]
+    routes: List[Dict[str, str]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        provider = item.get("provider")
+        model = item.get("model")
+        if not isinstance(provider, str) or not isinstance(model, str):
+            continue
+        route = {"provider": provider, "model": model}
+        api_mode = item.get("api_mode")
+        if isinstance(api_mode, str):
+            route["api_mode"] = api_mode
+        routes.append(route)
+    return routes
+
+
 def _build_child_agent(
     task_index: int,
     goal: str,
@@ -1338,6 +1414,8 @@ def _build_child_agent(
     # (nested orchestrator -> worker chain).
     subagent_id = f"sa-{task_index}-{_uuid.uuid4().hex[:8]}"
     parent_subagent_id = getattr(parent_agent, "_subagent_id", None)
+    if not isinstance(parent_subagent_id, str):
+        parent_subagent_id = None
     tui_depth = max(0, child_depth - 1)  # 0 = first-level child for the UI
 
     delegation_cfg = _load_config()
@@ -1638,6 +1716,46 @@ def _build_child_agent(
     child._parent_subagent_id = parent_subagent_id
     child._subagent_goal = goal
     child._parent_turn_id = getattr(parent_agent, "_current_turn_id", "") or ""
+    child._delegation_session_ref = child_session_ref
+    # Reconstruction metadata is an explicit allowlist. Never persist API
+    # keys, base URLs, request overrides, ACP commands/args, or provider
+    # credential-pool state.
+    child._delegation_runtime_metadata = {
+        "child_session_id": child_session_ref["session_id"],
+        "parent_session_id": (
+            getattr(parent_agent, "session_id", None)
+            if isinstance(getattr(parent_agent, "session_id", None), str)
+            else None
+        ),
+        "parent_logical_id": parent_subagent_id,
+        "depth": child_depth,
+        "role": effective_role,
+        "model": effective_model if isinstance(effective_model, str) else None,
+        "provider": effective_provider if isinstance(effective_provider, str) else None,
+        "api_mode": effective_api_mode if isinstance(effective_api_mode, str) else None,
+        "enabled_toolsets": list(child_toolsets),
+        "disabled_toolsets": list(child_disabled_toolsets),
+        "workdir": workspace_hint,
+        "max_iterations": max_iterations,
+        "max_tokens": child_max_tokens if isinstance(child_max_tokens, int) else None,
+        "reasoning_config": _json_safe_copy(child_reasoning),
+        "fallback_routes": _safe_fallback_routes(parent_fallback),
+        "provider_preferences": {
+            "allowed": _json_safe_copy(child_providers_allowed),
+            "ignored": _json_safe_copy(child_providers_ignored),
+            "order": _json_safe_copy(child_providers_order),
+            "sort": _json_safe_copy(child_provider_sort),
+            "require_parameters": bool(child_provider_require_parameters),
+            "data_collection": (
+                child_provider_data_collection
+                if isinstance(child_provider_data_collection, str)
+                else ""
+            ),
+            "openrouter_min_coding_score": _json_safe_copy(
+                child_openrouter_min_coding_score
+            ),
+        },
+    }
     # Stable sidebar marker: delegate subagent sessions must stay out of
     # session pickers even when a parent delete orphans them (parent_session_id
     # → NULL). Mirrors /branch's ``_branched_from`` pattern — see
@@ -2134,6 +2252,8 @@ def _run_single_child(
     # hand us a MagicMock don't carry stable ids; skip registration then.
     _raw_sid = getattr(child, "_subagent_id", None)
     _subagent_id = _raw_sid if isinstance(_raw_sid, str) else None
+    _raw_attempt_id = getattr(child, "_delegation_attempt_id", None)
+    _attempt_id = _raw_attempt_id if isinstance(_raw_attempt_id, str) else None
     if _subagent_id:
         _raw_depth = getattr(child, "_delegate_depth", 1)
         _tui_depth = max(0, _raw_depth - 1) if isinstance(_raw_depth, int) else 0
@@ -2153,8 +2273,10 @@ def _run_single_child(
             "tool_count": 0,
             "agent": child,
         }
-        _attempt_id = getattr(child, "_delegation_attempt_id", None)
-        if isinstance(_attempt_id, str):
+        runtime_metadata = getattr(child, "_delegation_runtime_metadata", None)
+        if isinstance(runtime_metadata, dict):
+            _registration.update(runtime_metadata)
+        if _attempt_id:
             _registration["delegation_attempt_id"] = _attempt_id
         _run_id = getattr(child, "_delegation_run_id", None)
         if isinstance(_run_id, str):
@@ -2169,13 +2291,16 @@ def _run_single_child(
             except Exception as e:
                 logger.debug("Progress callback start failed: %s", e)
 
-        # File-state coordination: reuse the stable subagent_id as the child's
-        # task_id so file_state writes, active-subagents registry, and TUI
-        # events all share one key.  Falls back to a fresh uuid only if the
-        # pre-built id is somehow missing.
+        # Attempt-local terminal cwd and file-state must never reuse a stable
+        # logical subagent id across resumes. The immutable attempt id is the
+        # runtime key; legacy synchronous children retain the old fallback.
         import uuid as _uuid
 
-        child_task_id = _subagent_id or f"subagent-{task_index}-{_uuid.uuid4().hex[:8]}"
+        child_task_id = (
+            _attempt_id
+            or _subagent_id
+            or f"subagent-{task_index}-{_uuid.uuid4().hex[:8]}"
+        )
         parent_task_id = getattr(parent_agent, "_current_task_id", None)
         # Seed the child's session-cwd record from the parent's (cwd rearch):
         # children share the parent's container, and today they inherit the
@@ -2586,7 +2711,7 @@ def _run_single_child(
         # Drop the TUI-facing registry entry.  Safe to call even if the
         # child was never registered (e.g. ID missing on test doubles).
         if _subagent_id:
-            _unregister_subagent(_subagent_id)
+            _unregister_subagent(_subagent_id, _attempt_id)
 
         if child_pool is not None and leased_cred_id is not None:
             try:
@@ -3229,9 +3354,13 @@ def delegate_task(
                 _sid = getattr(_c, "_subagent_id", None)
                 if not isinstance(_sid, str) or _sid not in attempt_ids:
                     continue
+                _attempt_id = attempt_ids[_sid]
                 _c._delegation_run_id = run_id
-                _c._delegation_attempt_id = attempt_ids[_sid]
-
+                _c._delegation_attempt_id = _attempt_id
+                session_ref = getattr(_c, "_delegation_session_ref", None)
+                if isinstance(session_ref, dict):
+                    session_ref["run_id"] = run_id
+                    session_ref["attempt_id"] = _attempt_id
         _goals = [t["goal"] for t in task_list]
         dispatch = dispatch_async_delegation_batch(
             goals=_goals,

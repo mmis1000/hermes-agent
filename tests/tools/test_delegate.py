@@ -465,6 +465,98 @@ class TestDelegateTask(unittest.TestCase):
             delegate_task(goal="Test depth", parent_agent=parent)
             self.assertEqual(mock_child._delegate_depth, 1)
 
+    def test_reconstruction_metadata_is_explicitly_allowlisted(self):
+        parent = _make_mock_parent(depth=0)
+        parent.session_id = "parent-session"
+        parent.reasoning_config = {"enabled": True, "effort": "medium"}
+        parent._fallback_chain = [
+            {
+                "provider": "anthropic",
+                "model": "claude-sonnet",
+                "api_mode": "anthropic_messages",
+                "api_key": "DO-NOT-PERSIST",
+                "base_url": "https://secret.invalid",
+            }
+        ]
+        parent.request_overrides = {"Authorization": "DO-NOT-PERSIST"}
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            child = MagicMock()
+            child.session_id = "child-session"
+            child._session_init_model_config = {}
+            MockAgent.return_value = child
+            built = _build_child_agent(
+                task_index=0,
+                goal="Resume safely",
+                context=None,
+                toolsets=["terminal"],
+                model=None,
+                max_iterations=7,
+                parent_agent=parent,
+                task_count=1,
+            )
+
+        metadata = built._delegation_runtime_metadata
+        self.assertEqual(metadata["child_session_id"], "child-session")
+        self.assertEqual(metadata["parent_session_id"], "parent-session")
+        self.assertEqual(metadata["role"], "leaf")
+        self.assertEqual(metadata["max_iterations"], 7)
+        self.assertEqual(
+            metadata["fallback_routes"],
+            [{
+                "provider": "anthropic",
+                "model": "claude-sonnet",
+                "api_mode": "anthropic_messages",
+            }],
+        )
+        encoded = json.dumps(metadata, sort_keys=True)
+        self.assertNotIn("DO-NOT-PERSIST", encoded)
+        self.assertNotIn("secret.invalid", encoded)
+        self.assertNotIn("request_overrides", encoded)
+        self.assertNotIn("api_key", encoded)
+        self.assertNotIn("base_url", encoded)
+        self.assertNotIn("acp_command", encoded)
+
+    def test_attempt_id_is_the_runtime_task_key(self):
+        from tools.delegate_tool import _run_single_child
+
+        parent = _make_mock_parent(depth=0)
+        parent._current_task_id = None
+        child = MagicMock()
+        child._subagent_id = "logical-child"
+        child._delegation_attempt_id = "attempt-immutable"
+        child._delegation_run_id = "run-current"
+        child._delegate_depth = 1
+        child._delegate_role = "leaf"
+        child._parent_subagent_id = None
+        child._delegation_runtime_metadata = {}
+        child._credential_pool = None
+        child.tool_progress_callback = None
+        child.model = "test-model"
+        captured = {}
+
+        def run_conversation(user_message, task_id=None, stream_callback=None):
+            captured["task_id"] = task_id
+            return {"final_response": "done", "completed": True, "api_calls": 1}
+
+        child.run_conversation.side_effect = run_conversation
+        with (
+            patch("tools.delegate_tool._register_subagent"),
+            patch("tools.delegate_tool._unregister_subagent") as unregister,
+            patch("tools.terminal_tool.get_session_cwd", return_value="/tmp"),
+            patch("tools.terminal_tool.record_session_cwd"),
+        ):
+            result = _run_single_child(
+                task_index=0,
+                goal="attempt-local state",
+                child=child,
+                parent_agent=parent,
+            )
+
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(captured["task_id"], "attempt-immutable")
+        unregister.assert_called_once_with("logical-child", "attempt-immutable")
+
     def test_active_children_tracking(self):
         """Verify children are registered/unregistered for interrupt propagation."""
         parent = _make_mock_parent(depth=0)

@@ -294,6 +294,55 @@ def test_invalid_attempt_registration_and_archive_fail_closed(supplied_attempt):
     assert current["status"] == "starting"
     assert current.get("goal") == "original"
 
+
+def test_stale_attempt_callbacks_cannot_replace_mutate_or_remove_live_resume():
+    repository = ad._repository()
+    initial = repository.register_initial_dispatch(
+        {
+            "delegation_id": "deleg-live-resume",
+            "session_key": "owner",
+            "dispatched_at": 1.0,
+            "root_subagent_ids": ["sa-resumed"],
+        }
+    )
+    old_attempt = initial["attempts"][0]["attempt_id"]
+    assert repository.transition_attempt(
+        old_attempt, {"starting"}, "completed"
+    )["status"] == "updated"
+    resumed = repository.reserve_resumed_attempt(
+        "sa-resumed", physical_worker_id="sa-resumed"
+    )
+    current_record = {
+        "subagent_id": "sa-resumed",
+        "delegation_attempt_id": resumed["attempt_id"],
+        "delegation_run_id": resumed["run_id"],
+        "status": "running",
+        "events": [],
+        "assistant_text_tail": "current",
+        "agent": MagicMock(),
+    }
+    dt._register_subagent(current_record)
+
+    stale_record = {
+        "subagent_id": "sa-resumed",
+        "delegation_attempt_id": old_attempt,
+        "delegation_run_id": initial["run_id"],
+        "status": "running",
+        "agent": MagicMock(),
+    }
+    dt._register_subagent(stale_record)
+    dt._append_live_event(
+        "sa-resumed", {"type": "tool.started"}, attempt_id=old_attempt
+    )
+    dt._append_live_text("sa-resumed", "stale", attempt_id=old_attempt)
+    dt._unregister_subagent("sa-resumed", old_attempt)
+
+    with dt._active_subagents_lock:
+        assert dt._active_subagents["sa-resumed"] is current_record
+        assert current_record["events"] == []
+        assert current_record["assistant_text_tail"] == "current"
+
+
 def test_nested_child_without_attempt_id_allocates_propagates_and_archives_exact_id():
     repository = ad._repository()
     repository.register_initial_dispatch(
