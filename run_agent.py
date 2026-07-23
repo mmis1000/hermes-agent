@@ -781,6 +781,96 @@ class AIAgent(
     from agent.background_review import _MEMORY_REVIEW_PROMPT, _SKILL_REVIEW_PROMPT, _COMBINED_REVIEW_PROMPT
     _summarize_background_review_actions = _forward_static("agent.background_review", "summarize_background_review_actions")
 
+
+    def steer(
+        self,
+        text: str,
+        *,
+        mailbox_id: Optional[str] = None,
+        outcome_callback=None,
+    ) -> bool:
+        """Queue one ordered steer envelope without interrupting the agent."""
+        if not isinstance(text, str) or not text.strip():
+            return False
+        cleaned = text.strip()
+        envelope = {
+            "text": cleaned,
+            "mailbox_id": mailbox_id if isinstance(mailbox_id, str) else None,
+            "outcome_callback": outcome_callback if callable(outcome_callback) else None,
+        }
+        lock = getattr(self, "_pending_steer_lock", None)
+        if lock is None:
+            if envelope["mailbox_id"] and getattr(
+                self, "_interrupt_requested", False
+            ):
+                self._ack_steer_envelopes(
+                    [envelope], "superseded_by_interrupt"
+                )
+                return False
+            queue = self._steer_queue_unlocked()
+            queue.append(envelope)
+            self._sync_pending_steer_text_unlocked(queue)
+            return True
+        with lock:
+            if envelope["mailbox_id"] and getattr(
+                self, "_interrupt_requested", False
+            ):
+                self._ack_steer_envelopes(
+                    [envelope], "superseded_by_interrupt"
+                )
+                return False
+            queue = self._steer_queue_unlocked()
+            queue.append(envelope)
+            self._sync_pending_steer_text_unlocked(queue)
+        return True
+
+    @staticmethod
+    def _steer_envelope_text(envelopes: list) -> Optional[str]:
+        return "\n".join(
+            str(item.get("text") or "") for item in envelopes if item.get("text")
+        ) or None
+
+    def _drain_pending_steer_envelopes(self) -> list:
+        lock = getattr(self, "_pending_steer_lock", None)
+        if lock is None:
+            queue = list(self._steer_queue_unlocked())
+            self._pending_steer_envelopes = []
+            self._pending_steer = None
+            return queue
+        with lock:
+            queue = list(self._steer_queue_unlocked())
+            self._pending_steer_envelopes = []
+            self._pending_steer = None
+        return queue
+
+    def _requeue_pending_steer_envelopes(self, envelopes: list) -> None:
+        if not envelopes:
+            return
+        lock = getattr(self, "_pending_steer_lock", None)
+        if lock is None:
+            queue = self._steer_queue_unlocked()
+            self._pending_steer_envelopes = list(envelopes) + queue
+            self._sync_pending_steer_text_unlocked(self._pending_steer_envelopes)
+            return
+        with lock:
+            queue = self._steer_queue_unlocked()
+            self._pending_steer_envelopes = list(envelopes) + queue
+            self._sync_pending_steer_text_unlocked(self._pending_steer_envelopes)
+
+    @staticmethod
+    def _ack_steer_envelopes(envelopes: list, outcome: str) -> None:
+        for envelope in envelopes:
+            callback = envelope.get("outcome_callback")
+            if callable(callback):
+                try:
+                    callback(outcome)
+                except Exception:
+                    logger.debug("steer outcome callback failed", exc_info=True)
+
+    def _drain_pending_steer(self) -> Optional[str]:
+        """Compatibility text drain for local callers without mailbox tracking."""
+        return self._steer_envelope_text(self._drain_pending_steer_envelopes())
+
     def _spawn_background_review(self, messages_snapshot: List[Dict], review_memory: bool = False,
                                  review_skills: bool = False, focus: Optional[str] = None, explicit: bool = False) -> None:
         """Post-turn review entry point: decide WHEN, then spawn.

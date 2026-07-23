@@ -53,6 +53,38 @@ def _wait_terminal(delegation_id, timeout=2.0):
     raise AssertionError("delegation did not become terminal")
 
 
+def _set_delivery(delegation_id, state, *, claimed_at=None):
+    repository = ad._repository()
+    token = "test-claim"
+    if state == "pending":
+        return
+    if state in {"held_by_wait", "consumed"}:
+        if repository.inspect_delivery(delegation_id).get("delivery_state") == "held_by_wait":
+            assert repository.release_wait_hold(
+                delegation_id, "owner", token
+            )["status"] == "released"
+        assert repository.hold_for_wait(
+            delegation_id, "owner", token, now=claimed_at
+        )["status"] == "held"
+        if state == "consumed":
+            assert repository.consume_wait_hold(
+                delegation_id, "owner", token
+            )["status"] == "consumed"
+        return
+    if state == "suppressed":
+        assert repository.suppress_delivery(
+            delegation_id, "owner"
+        )["status"] == "suppressed"
+        return
+    assert repository.claim_run_delivery(
+        delegation_id, None, token, now=claimed_at
+    )["status"] == "claimed"
+    if state == "delivered":
+        assert repository.commit_run_delivery(
+            repository.resolve_run_id(delegation_id)["run_id"], token
+        )["status"] == "delivered"
+
+
 def test_terminal_wait_consumes_once_and_auto_delivery_drops_it():
     dispatched = _dispatch(
         lambda: {"status": "completed", "summary": "one result"}
@@ -212,6 +244,36 @@ def test_foreign_session_is_indistinguishable_from_unknown():
         release.set()
 
 
+def test_exact_run_wrappers_preserve_missing_and_ambiguous_shapes():
+    assert ad.claim_async_delivery("missing") == {"status": "legacy"}
+    assert ad.claim_async_delivery("missing", managed=True) == {"status": "stale"}
+    assert ad.claim_completion_delivery("missing", "claim") is True
+    assert ad.inspect_async_delivery_claim("missing", "claim") == "not_found"
+    assert ad.mark_completion_delivered("missing") is False
+    assert ad.release_completion_delivery("missing", "claim") is False
+    assert ad.complete_completion_delivery("missing", "claim") is False
+
+    repository = ad._repository()
+    created = repository.register_initial_dispatch(
+        {
+            "delegation_id": "deleg-ambiguous", "session_key": "owner",
+            "dispatched_at": 1.0, "root_subagent_ids": ["sa-ambiguous"],
+        }
+    )
+    repository.transition_attempt(
+        created["attempts"][0]["attempt_id"], {"starting"}, "completed"
+    )
+    assert repository.reserve_resumed_attempt("sa-ambiguous")["status"] == "reserved"
+    assert ad.claim_async_delivery("deleg-ambiguous", managed=True) == {
+        "status": "stale", "reason": "ambiguous_run"
+    }
+    assert ad.claim_completion_delivery("deleg-ambiguous", "claim") is False
+    assert ad.inspect_async_delivery_claim("deleg-ambiguous", "claim") == "stale"
+    assert ad.mark_completion_delivered("deleg-ambiguous") is False
+    assert ad.release_completion_delivery("deleg-ambiguous", "claim") is False
+    assert ad.complete_completion_delivery("deleg-ambiguous", "claim") is False
+
+
 def test_pruning_keeps_all_undelivered_and_held_terminal_results(monkeypatch):
     monkeypatch.setattr(ad, "_MAX_RETAINED_COMPLETED", 1)
     states = ["pending", "held_by_wait", "delivering", "delivered", "consumed", "suppressed"]
@@ -235,15 +297,7 @@ def test_pruning_keeps_all_undelivered_and_held_terminal_results(monkeypatch):
             },
             {"status": "completed", "summary": delivery_state},
         )
-        with ad._DB_LOCK, ad._connect() as conn:
-            conn.execute(
-                "UPDATE async_delegations SET delivery_state=?, delivery_claim=? WHERE delegation_id=?",
-                (
-                    delivery_state,
-                    "claim" if delivery_state in {"held_by_wait", "delivering"} else None,
-                    delegation_id,
-                ),
-            )
+        _set_delivery(delegation_id, delivery_state)
 
     ad._prune_durable_records()
 
@@ -270,11 +324,7 @@ def test_restore_only_enqueues_pending_terminal_results():
             {"delegation_id": delegation_id, "status": "completed", "completed_at": float(index + 1)},
             {"status": "completed", "summary": state},
         )
-        with ad._DB_LOCK, ad._connect() as conn:
-            conn.execute(
-                "UPDATE async_delegations SET delivery_state=? WHERE delegation_id=?",
-                (state, delegation_id),
-            )
+        _set_delivery(delegation_id, state)
 
     restored = queue.Queue()
     assert ad.restore_undelivered_completions(restored) == 1
@@ -282,13 +332,7 @@ def test_restore_only_enqueues_pending_terminal_results():
 
 
 def _age_wait_hold(delegation_id, *, seconds):
-    with ad._DB_LOCK, ad._connect() as conn:
-        conn.execute(
-            """UPDATE async_delegations SET delivery_state='held_by_wait',
-                      delivery_claim='dead-waiter', delivery_claimed_at=?
-               WHERE delegation_id=?""",
-            (time.time() - seconds, delegation_id),
-        )
+    _set_delivery(delegation_id, "held_by_wait", claimed_at=time.time() - seconds)
 
 
 def test_stale_wait_hold_is_reclaimed_but_live_hold_is_not():

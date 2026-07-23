@@ -298,7 +298,8 @@ def _build_child_agent(
 
 def _run_single_child(
     task_index: int, goal: str, child=None, parent_agent=None, *, owner_session_id: Optional[str] = None,
-    owner_transport: Any = None, owner_session_record: Any = None, **_kwargs,
+    owner_transport: Any = None, owner_session_record: Any = None,
+    conversation_history: Optional[List[Dict[str, Any]]] = None, resume_message: Optional[str] = None, **_kwargs,
 ) -> Dict[str, Any]:
     """Run a pre-built child agent (called from a worker thread) and return its result entry.
 
@@ -324,7 +325,10 @@ def _run_single_child(
         child, parent_agent, goal, owner_session_id=owner_session_id, owner_transport=owner_transport,
         owner_session_record=owner_session_record,
     )
-    run = _ChildRun(child, parent_agent, task_index, goal, _subagent_id, child_progress_cb, heartbeat=heartbeat)
+    run = _ChildRun(
+        child, parent_agent, task_index, goal, _subagent_id, child_progress_cb, heartbeat=heartbeat,
+        conversation_history=conversation_history, resume_message=resume_message,
+    )
     # Set when a timed-out Future still owns the child: closing it from this
     # thread before the worker settles races the conversation's finally path.
     _child_close_deferred = False

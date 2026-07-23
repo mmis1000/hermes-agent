@@ -2478,12 +2478,14 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                 skip_pre_tool_call_hook=True, skip_tool_request_middleware=True,
                 enabled_toolsets=getattr(agent, "enabled_toolsets", None),
                 disabled_toolsets=getattr(agent, "disabled_toolsets", None),
+                parent_agent=agent,
                 tool_request_middleware_trace=list(_tool_middleware_trace),
             )
             if skip_tool_execution_middleware:
                 dispatch_kwargs["skip_tool_execution_middleware"] = True
             import model_tools
             return model_tools.handle_function_call(function_name, next_args, effective_task_id, **dispatch_kwargs)
+
     if skip_tool_execution_middleware:
         return _execute(function_args)
     from hermes_cli.middleware import run_tool_execution_middleware
@@ -3535,7 +3537,8 @@ def apply_pending_steer_to_tool_results(agent, messages: list, num_tool_msgs: in
     """
     if num_tool_msgs <= 0 or not messages:
         return
-    steer_text = agent._drain_pending_steer()
+    steer_envelopes = agent._drain_pending_steer_envelopes()
+    steer_text = agent._steer_envelope_text(steer_envelopes)
     if not steer_text:
         return
     # Skip non-tool messages in the tail in case something else is appended at the boundary.
@@ -3545,9 +3548,10 @@ def apply_pending_steer_to_tool_results(agent, messages: list, num_tool_msgs: in
         # No tool result in this batch (e.g. all skipped by interrupt);
         # requeue so the fallback path delivers it as a normal next-turn
         # user message (which persists like any other user turn).
-        _requeue_pending_steer(agent, steer_text)
+        agent._requeue_pending_steer_envelopes(steer_envelopes)
         return
     messages.append(steer_user_row(steer_text))
+    agent._ack_steer_envelopes(steer_envelopes, "injected")
     _ra().logger.info(
         "Delivered /steer to agent after tool batch (%d chars) as new user message: %s", len(steer_text),
         steer_text[:120] + ("..." if len(steer_text) > 120 else ""),
