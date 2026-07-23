@@ -28,6 +28,7 @@ import os
 import threading
 import time
 import uuid
+from types import SimpleNamespace
 from concurrent.futures import (
     ThreadPoolExecutor,
     TimeoutError as FuturesTimeoutError,
@@ -1403,8 +1404,6 @@ def build_resumed_child_agent(
     continuation: Optional[Dict[str, str]] = None,
 ):
     """Reconstruct a child using persisted non-secret policy and live credentials."""
-    if parent_agent is None:
-        raise ValueError("resume requires the live owning parent agent")
     metadata = dict(bundle.get("reconstruction_metadata") or {})
     model = str(metadata.get("model") or "").strip()
     provider = str(metadata.get("provider") or "").strip()
@@ -1416,6 +1415,38 @@ def build_resumed_child_agent(
     credentials = _resolve_delegation_credentials(
         {"provider": provider, "model": model}, parent_agent
     )
+    runtime_parent = parent_agent
+    if runtime_parent is None:
+        # Durable resume must work after a gateway restart, where the original
+        # parent AIAgent object no longer exists and native tool adapters may not
+        # expose the newly-created controller object. Rebuild only the non-secret
+        # policy surface consumed by _build_child_agent; credentials above were
+        # resolved fresh from the active provider configuration.
+        runtime_parent = SimpleNamespace(
+            session_id=continuation["delegate_from"],
+            model=model,
+            provider=credentials.get("provider") or provider,
+            base_url=credentials.get("base_url"),
+            api_key=credentials.get("api_key"),
+            api_mode=credentials.get("api_mode"),
+            _client_kwargs={
+                key: value
+                for key, value in {
+                    "base_url": credentials.get("base_url"),
+                    "api_key": credentials.get("api_key"),
+                }.items()
+                if value
+            },
+            _delegate_depth=max(0, int(metadata.get("depth") or 1) - 1),
+            _subagent_id=metadata.get("parent_logical_id"),
+            enabled_toolsets=list(metadata.get("enabled_toolsets") or []),
+            disabled_toolsets=list(metadata.get("disabled_toolsets") or []),
+            valid_tool_names=[],
+            reasoning_config=_json_safe_copy(metadata.get("reasoning_config")),
+            _fallback_chain=_json_safe_copy(metadata.get("fallback_routes")) or [],
+            acp_command=credentials.get("command"),
+            acp_args=list(credentials.get("args") or []),
+        )
     child = _build_child_agent(
         task_index=0,
         goal=goal,
@@ -1424,7 +1455,7 @@ def build_resumed_child_agent(
         model=model,
         max_iterations=int(metadata.get("max_iterations") or 50),
         task_count=1,
-        parent_agent=parent_agent,
+        parent_agent=runtime_parent,
         override_provider=credentials.get("provider"),
         override_base_url=credentials.get("base_url"),
         override_api_key=credentials.get("api_key"),
@@ -1482,7 +1513,7 @@ def build_resumed_child_agent(
     child_progress_cb = _build_child_progress_callback(
         0,
         goal,
-        parent_agent,
+        runtime_parent,
         1,
         subagent_id=logical_id,
         parent_id=child._parent_subagent_id,

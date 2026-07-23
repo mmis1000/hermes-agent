@@ -203,7 +203,7 @@ def test_resume_reserves_exact_attempt_and_runs_with_hydrated_history(
         logical_id,
         session_key=parent_session,
         message="continue from the partial answer",
-        parent_agent=object(),
+        parent_agent=None,
     )
     assert dispatched["status"] == "dispatched"
     assert dispatched["attempt_number"] == 2

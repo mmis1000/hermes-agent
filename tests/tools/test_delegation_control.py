@@ -192,35 +192,6 @@ def test_resume_control_is_strict_and_forwards_live_parent(monkeypatch):
     }
     assert "reasoning" not in repr(payload)
 
-    # Some gateway registry adapters do not preserve the optional parent_agent
-    # keyword. The authorized current session must still recover its exact live
-    # owner from the weak process-local registry.
-    from tools.live_agent_registry import (
-        clear_live_agents_for_tests,
-        register_live_agent,
-    )
-
-    class LiveParent:
-        session_id = "owner-durable-session"
-
-    recovered_parent = LiveParent()
-    clear_live_agents_for_tests()
-    register_live_agent(recovered_parent, session_keys=("owner",))
-    captured.clear()
-    recovered_payload = json.loads(
-        delegation_control(
-            action="resume",
-            delegation_id="deleg-resume-control",
-            subagent_id="sa-resume-control",
-            message="continue through gateway",
-            session_key="owner",
-            parent_agent=None,
-        )
-    )
-    clear_live_agents_for_tests()
-    assert recovered_payload["status"] == "dispatched"
-    assert captured["kwargs"]["parent_agent"] is recovered_parent
-
 
 def _two_terminal_runs():
     suffix = uuid.uuid4().hex

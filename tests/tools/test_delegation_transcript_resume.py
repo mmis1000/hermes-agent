@@ -123,7 +123,9 @@ def test_follows_marked_child_compression_and_sanitizes_dangling_tool_tail(db):
     assert bundle["history"][-1]["content"] == "after compression"
 
 
-def test_reconstructed_child_uses_saved_policy_but_live_credentials(monkeypatch):
+def test_reconstructed_child_uses_saved_policy_and_live_credentials_without_parent(
+    monkeypatch,
+):
     from types import SimpleNamespace
     from tools import delegate_tool
 
@@ -167,7 +169,7 @@ def test_reconstructed_child_uses_saved_policy_but_live_credentials(monkeypatch)
     monkeypatch.setattr(
         delegate_tool, "_build_child_progress_callback", lambda *a, **kw: callback
     )
-    parent = object()
+    parent = None
     bundle = {
         "prior_child_session_id": "child-old",
         "owner_parent_session_id": "parent-owner",
@@ -207,8 +209,14 @@ def test_reconstructed_child_uses_saved_policy_but_live_credentials(monkeypatch)
         "provider": "test-provider",
         "model": "test-model",
     }
-    assert captured["credential_parent"] is parent
+    assert captured["credential_parent"] is None
     build = captured["build"]
+    runtime_parent = build["parent_agent"]
+    assert runtime_parent.session_id == "parent-owner"
+    assert runtime_parent.provider == "test-provider"
+    assert runtime_parent.api_key == "live-key-never-persisted"
+    assert runtime_parent.enabled_toolsets == ["file"]
+    assert runtime_parent.disabled_toolsets == ["delegation", "terminal"]
     assert build["override_api_key"] == "live-key-never-persisted"
     assert build["required_disabled_toolsets"] == ["delegation", "terminal"]
     assert build["workspace_override"] == "/safe/workdir"

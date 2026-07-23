@@ -512,18 +512,6 @@ def delegation_control(
         )
 
     if action == "resume":
-        if parent_agent is None:
-            # Registry adapters may omit the optional live-agent kwarg. Resolve
-            # only after this delegation has passed durable session ownership
-            # checks, and only from exact identities registered for this turn.
-            try:
-                from tools.live_agent_registry import resolve_live_agent
-
-                parent_agent = resolve_live_agent(
-                    (caller_session, origin, *owner_candidates)
-                )
-            except Exception:
-                parent_agent = None
         resumed = _async.dispatch_resumed_subagent(
             target,
             str(child_target),

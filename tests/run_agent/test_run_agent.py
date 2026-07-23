@@ -3086,12 +3086,6 @@ class TestConcurrentToolExecution:
                 tool_request_middleware_trace=[],
             )
             assert result == "result"
-        from tools.live_agent_registry import (
-            clear_live_agents_for_tests,
-            resolve_live_agent,
-        )
-        assert resolve_live_agent(("task-1",)) is agent
-        clear_live_agents_for_tests()
 
     def test_sequential_tool_callbacks_fire_in_order(self, agent):
         tool_call = _mock_tool_call(name="web_search", arguments='{"query":"hello"}', call_id="c1")
