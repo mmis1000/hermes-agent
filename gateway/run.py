@@ -25137,7 +25137,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     def _completion_delivery_identity(evt: dict) -> Optional[tuple[str, str, object]]:
         """Return a producer-stable identity when one is available.
 
-        Delegation UUIDs identify one producer completion. Process session IDs
+        Delegation run IDs identify one producer completion; legacy events
+        without a run ID fall back to their delegation UUID. Process session IDs
         are normally unique too, but include the persisted spawn epoch so an
         explicitly reused ID represents a distinct process incarnation. Legacy
         process events without ``started_at`` are delivered without deduplication
@@ -25146,7 +25147,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         evt_type = str(evt.get("type") or "")
         if evt_type == "async_delegation":
             producer_id = str(evt.get("delegation_id") or "")
-            return (evt_type, producer_id, "") if producer_id else None
+            run_id = str(evt.get("run_id") or "")
+            return (evt_type, producer_id, run_id) if producer_id else None
         if evt_type == "completion":
             producer_id = str(evt.get("session_id") or "")
             started_at = evt.get("started_at")
@@ -25234,6 +25236,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         identity = self._completion_delivery_identity(evt)
         durable_delegation_id = ""
+        durable_run_id = str(evt.get("run_id") or "")
+        run_scope = {"run_id": durable_run_id} if durable_run_id else {}
         durable_authoritative = False
         durable_claim_id = str(evt.get("_gateway_async_delivery_claim") or "")
 
@@ -25265,6 +25269,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
                 if not complete_completion_delivery(
                     durable_delegation_id, durable_claim_id,
+                    **run_scope,
                 ) and durable_authoritative:
                     return False
             parent_session_id = str(evt.get("parent_session_id") or "").strip()
@@ -25383,6 +25388,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
                 if not complete_completion_delivery(
                     durable_delegation_id, durable_claim_id,
+                    **run_scope,
                 ) and durable_authoritative:
                     return False
                 evt.pop("_gateway_async_delivery_claim", None)
@@ -25398,6 +25404,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
                     if release_completion_delivery(
                         durable_delegation_id, durable_claim_id,
+                        **run_scope,
                     ):
                         evt.pop("_gateway_async_delivery_claim", None)
                 except Exception:
