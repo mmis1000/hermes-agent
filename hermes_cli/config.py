@@ -2480,6 +2480,13 @@ DEFAULT_CONFIG = {
     # always goes to ~/.hermes/skills/.
     "skills": {
         "external_dirs": [],   # e.g. ["~/.agents/skills", "/shared/team-skills"]
+        # Optional direct preload policy for slash-skill invocations. Keys and
+        # values are skill names (leading slash and underscores are accepted).
+        # Configured skills load immediately before the invoked skill when they
+        # are installed and enabled. Empty by default so built-in commands keep
+        # their standalone behavior; mappings are direct and non-recursive.
+        # Example: {"plan": ["brainstorming"]}
+        "command_preloads": {},
         # Substitute ${HERMES_SKILL_DIR} and ${HERMES_SESSION_ID} in SKILL.md
         # content with the absolute skill directory and the active session id
         # before the agent sees it.  Lets skill authors reference bundled
@@ -8640,6 +8647,13 @@ _DYNAMIC_TOP_LEVEL_KEYS = frozenset({
 # accepted because ``PlatformConfig`` carries an open ``extra`` mapping.
 _PLATFORM_CONTAINER_KEYS = frozenset({"platforms"})
 
+# Nested dictionaries whose next segment is intentionally user-defined. Keep
+# these path-specific so sibling typos (for example ``skills.command_preload``)
+# still receive the unknown-key warning.
+_OPEN_NESTED_DICT_PATHS = frozenset({
+    ("skills", "command_preloads"),
+})
+
 
 def _known_top_level_keys() -> set[str]:
     """Return the union of known top-level config keys for validation.
@@ -8740,6 +8754,8 @@ def _validate_config_key(key: str) -> tuple[bool, Optional[str]]:
     node: Any = DEFAULT_CONFIG.get(top)
     consumed = [top]
     for seg in segments[1:]:
+        if tuple(consumed) in _OPEN_NESTED_DICT_PATHS:
+            return True, None
         # ``gateway.platforms.<name>.<field>`` (and any other nested
         # ``platforms`` container) — the segment after ``platforms`` is a
         # user-supplied platform name, so accept everything below it.

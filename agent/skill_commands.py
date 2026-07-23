@@ -512,63 +512,117 @@ def resolve_skill_command_key(command: str) -> Optional[str]:
     return cmd_key if cmd_key in get_skill_commands() else None
 
 
-_PLAN_SKILL_NAME = "plan"
-_BRAINSTORMING_SKILL_NAME = "brainstorming"
+def _normalize_skill_command_name(value: Any) -> str:
+    """Normalize a configured skill name or slash command for matching."""
+    slug = str(value or "").strip().lower().lstrip("/")
+    slug = slug.replace("_", "-").replace(" ", "-")
+    slug = _SKILL_INVALID_CHARS.sub("", slug)
+    return _SKILL_MULTI_HYPHEN.sub("-", slug).strip("-")
 
 
-def _with_implicit_plan_brainstorming(
+def _configured_skill_command_preloads() -> Dict[str, list[str]]:
+    """Return validated direct skill-command preload mappings.
+
+    ``skills.command_preloads`` is intentionally empty by default. Operators
+    can map any invoked skill to one or more installed skills that should load
+    immediately before it, without encoding instance policy in runtime code.
+    Values may be a single skill name or an ordered list. Preloads are direct,
+    not recursive, so cyclic configuration cannot loop.
+    """
+    raw = _load_skills_config().get("command_preloads", {})
+    if not isinstance(raw, dict):
+        return {}
+
+    configured: Dict[str, list[str]] = {}
+    for target, values in raw.items():
+        target_name = _normalize_skill_command_name(target)
+        if not target_name:
+            continue
+        if isinstance(values, str):
+            values = [values]
+        if not isinstance(values, (list, tuple)):
+            continue
+        normalized = [
+            name
+            for value in values
+            if (name := _normalize_skill_command_name(value))
+        ]
+        if normalized:
+            configured[target_name] = normalized
+    return configured
+
+
+def _with_configured_skill_preloads(
     cmd_keys: list[str], commands: Dict[str, Dict[str, Any]]
 ) -> list[str]:
-    """Insert enabled brainstorming guidance immediately before plan.
+    """Insert configured, available skill preloads before invoked skills.
 
-    The command map is already filtered for unavailable, platform-incompatible,
-    environment-incompatible, and disabled skills. The direct disabled-skill
-    check also protects long-lived callers holding a command map populated
-    before a config change. Explicitly stacked brainstorming keeps its original
-    position and is never duplicated.
+    Explicitly invoked skills retain their original order and are never
+    duplicated. Missing, disabled, malformed, or self-referential preloads are
+    ignored. The final list respects the normal stacked-skill cap.
     """
     keys = list(cmd_keys)
-
-    def _skill_name(key: str) -> str:
-        info = commands.get(key) or {}
-        return str(info.get("name") or key.lstrip("/"))
-
-    names = [_skill_name(key) for key in keys]
-    if _PLAN_SKILL_NAME not in names or _BRAINSTORMING_SKILL_NAME in names:
+    configured = _configured_skill_command_preloads()
+    if not keys or not configured:
         return keys
+
+    aliases_to_key: Dict[str, str] = {}
+    key_aliases: Dict[str, tuple[str, str]] = {}
+    for key, info in commands.items():
+        command_name = _normalize_skill_command_name(key)
+        skill_name = _normalize_skill_command_name((info or {}).get("name"))
+        key_aliases[key] = (skill_name, command_name)
+        if command_name:
+            aliases_to_key.setdefault(command_name, key)
+        if skill_name:
+            aliases_to_key.setdefault(skill_name, key)
 
     try:
         from agent.skill_utils import get_disabled_skill_names
 
-        disabled_names = get_disabled_skill_names()
+        disabled_names = {
+            _normalize_skill_command_name(name)
+            for name in get_disabled_skill_names()
+        }
     except Exception:
         disabled_names = set()
 
-    brainstorming_key = next(
-        (
-            key
-            for key, info in commands.items()
-            if str((info or {}).get("name") or key.lstrip("/"))
-            == _BRAINSTORMING_SKILL_NAME
-        ),
-        None,
-    )
-    if brainstorming_key is None:
-        return keys
+    present = set(keys)
+    inserted: set[str] = set()
+    result: list[str] = []
+    additions_remaining = max(0, _MAX_STACKED_SKILLS - len(present))
 
-    brainstorming_info = commands.get(brainstorming_key) or {}
-    brainstorming_name = str(
-        brainstorming_info.get("name") or _BRAINSTORMING_SKILL_NAME
-    )
-    if (
-        _BRAINSTORMING_SKILL_NAME in disabled_names
-        or brainstorming_name in disabled_names
-    ):
-        return keys
+    for key in keys:
+        skill_name, command_name = key_aliases.get(
+            key,
+            ("", _normalize_skill_command_name(key)),
+        )
+        preload_names = configured.get(skill_name) or configured.get(command_name) or []
+        for preload_name in preload_names:
+            if additions_remaining <= 0:
+                break
+            preload_key = aliases_to_key.get(preload_name)
+            if (
+                preload_key is None
+                or preload_key in present
+                or preload_key in inserted
+                or preload_name in disabled_names
+            ):
+                continue
+            preload_skill_name, preload_command_name = key_aliases.get(
+                preload_key, (preload_name, preload_name)
+            )
+            if (
+                preload_skill_name in disabled_names
+                or preload_command_name in disabled_names
+            ):
+                continue
+            result.append(preload_key)
+            inserted.add(preload_key)
+            additions_remaining -= 1
+        result.append(key)
 
-    plan_index = names.index(_PLAN_SKILL_NAME)
-    keys.insert(plan_index, brainstorming_key)
-    return keys
+    return result
 
 
 def build_skill_invocation_message(
@@ -591,10 +645,10 @@ def build_skill_invocation_message(
     if not skill_info:
         return None
 
-    effective_cmd_keys = _with_implicit_plan_brainstorming([cmd_key], commands)
+    effective_cmd_keys = _with_configured_skill_preloads([cmd_key], commands)
     if effective_cmd_keys != [cmd_key]:
         stacked = build_stacked_skill_invocation_message(
-            effective_cmd_keys,
+            [cmd_key],
             user_instruction=user_instruction,
             task_id=task_id,
         )
@@ -698,7 +752,7 @@ def build_stacked_skill_invocation_message(
     """
     commands = get_skill_commands()
     typed_cmd_keys = list(cmd_keys)
-    cmd_keys = _with_implicit_plan_brainstorming(cmd_keys, commands)
+    cmd_keys = _with_configured_skill_preloads(cmd_keys, commands)
 
     loaded_names: list[str] = []
     missing: list[str] = []

@@ -395,6 +395,7 @@ Edit with `hermes config edit` or `hermes config set section.key value`.
 | `memory` | `memory_enabled`, `user_profile_enabled`, `provider` |
 | `security` | `tirith_enabled`, `website_blocklist` |
 | `delegation` | `model`, `provider`, `base_url`, `api_key`, `max_iterations` (50), `reasoning_effort` |
+| `skills` | `external_dirs`, `command_preloads`, `template_vars`, `inline_shell` |
 | `checkpoints` | `enabled`, `max_snapshots` (50) |
 | `curator` | `enabled`, `consolidate` (false — opt-in aux-model skill consolidation), `interval_hours`, `stale_after_days` |
 
