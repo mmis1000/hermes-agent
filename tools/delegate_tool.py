@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+_UNSET = object()
+
 """
 Delegate Tool -- Subagent Architecture
 
@@ -14,7 +16,9 @@ tool calls or reasoning.
 import json
 import logging
 import time
+import uuid
 import weakref
+from types import SimpleNamespace
 from typing import Any, Dict, List, Optional
 
 from tools.terminal_tool import set_approval_callback as _set_subagent_approval_cb  # noqa: F401  (used via _ChildRun.await_child)
@@ -169,7 +173,14 @@ def _build_child_agent(
     override_api_key: Optional[str] = None,
     override_api_mode: Optional[str] = None,
     override_request_overrides: Optional[Dict[str, Any]] = None,
-
+    override_max_tokens: Optional[int] = None,
+    required_disabled_toolsets: Optional[List[str]] = None,
+    workspace_override: Optional[str] = None,
+    reasoning_config_override: Any = _UNSET,
+    fallback_model_override: Any = _UNSET,
+    provider_preferences_override: Optional[Dict[str, Any]] = None,
+    session_id_override: Optional[str] = None,
+    parent_session_id_override: Optional[str] = None,
     # ACP transport overrides from trusted delegation config.
     override_acp_command: Optional[str] = None,
     override_acp_args: Optional[List[str]] = None,
@@ -195,14 +206,17 @@ def _build_child_agent(
     # the live registry; parent_id is set when THIS parent is itself a subagent.
     subagent_id = f"sa-{task_index}-{_uuid.uuid4().hex[:8]}"
     parent_subagent_id = getattr(parent_agent, "_subagent_id", None)
+    if not isinstance(parent_subagent_id, str):
+        parent_subagent_id = None
 
     # General delegation behavior (reasoning, compression, capabilities) stays
     # global. Only fallback policy follows the owner of a per-call route such
     # as auxiliary.review.
     delegation_cfg = _load_config()
     child_toolsets, child_disabled_toolsets = _resolve_child_toolsets(parent_agent, toolsets, effective_role)
+    child_disabled_toolsets = list(dict.fromkeys(child_disabled_toolsets + list(required_disabled_toolsets or [])))
     child_prompt = _build_child_system_prompt(
-        goal, context, workspace_path=_resolve_workspace_hint(parent_agent), role=effective_role,
+        goal, context, workspace_path=workspace_override or _resolve_workspace_hint(parent_agent), role=effective_role,
         max_spawn_depth=max_spawn, child_depth=child_depth,
     )
     parent_api_key = getattr(parent_agent, "api_key", None)
@@ -224,13 +238,24 @@ def _build_child_agent(
         override_acp_args=override_acp_args,
         routing_cfg=routing_cfg,
     )
+    if reasoning_config_override is not _UNSET:
+        rt["reasoning_config"] = _json_safe_copy(reasoning_config_override)
+    if fallback_model_override is not _UNSET:
+        rt["fallback_model"] = _json_safe_copy(fallback_model_override)
+    if override_max_tokens is not None:
+        rt["max_tokens"] = override_max_tokens
+    if session_id_override:
+        rt["session_id"] = session_id_override
+    if isinstance(provider_preferences_override, dict):
+        for key, target in {"allowed": "providers_allowed", "ignored": "providers_ignored", "order": "providers_order", "sort": "provider_sort", "require_parameters": "provider_require_parameters", "data_collection": "provider_data_collection", "openrouter_min_coding_score": "openrouter_min_coding_score"}.items():
+            rt[target] = _json_safe_copy(provider_preferences_override.get(key))
     if override_request_overrides is not None:
         # honored whenever set, incl. the inherit branch where
         # _resolve_delegation_credentials already merged OVER the parent's
         request_overrides = dict(override_request_overrides)
     else:
         request_overrides = {} if override_provider else dict(getattr(parent_agent, "request_overrides", {}) or {})
-    parent_sid = getattr(parent_agent, "session_id", None)
+    parent_sid = parent_session_id_override if parent_session_id_override is not None else getattr(parent_agent, "session_id", None)
     child_session_db = _open_child_session_db(parent_agent)
     with delegated_child_context():
         try:
@@ -265,6 +290,48 @@ def _build_child_agent(
     child._progress_identity_ref = child_session_ref
     child._delegate_depth, child._delegate_role = child_depth, effective_role  # post-degrade role
     child._subagent_id, child._parent_subagent_id = subagent_id, parent_subagent_id
+    child._subagent_goal = goal
+    child._parent_turn_id = getattr(parent_agent, "_current_turn_id", "") or ""
+    child._delegation_session_ref = child_session_ref
+    # Reconstruction metadata is an explicit allowlist. Never persist API
+    # keys, base URLs, request overrides, ACP commands/args, or provider
+    # credential-pool state.
+    child._delegation_runtime_metadata = {
+        "child_session_id": child_session_ref["session_id"],
+        "parent_session_id": (
+            getattr(parent_agent, "session_id", None)
+            if isinstance(getattr(parent_agent, "session_id", None), str)
+            else None
+        ),
+        "parent_logical_id": parent_subagent_id,
+        "depth": child_depth,
+        "role": effective_role,
+        "model": rt.get("model") if isinstance(rt.get("model"), str) else None,
+        "provider": rt.get("provider") if isinstance(rt.get("provider"), str) else None,
+        "api_mode": rt.get("api_mode") if isinstance(rt.get("api_mode"), str) else None,
+        "enabled_toolsets": list(child_toolsets),
+        "disabled_toolsets": list(child_disabled_toolsets),
+        "workdir": workspace_override or _resolve_workspace_hint(parent_agent),
+        "max_iterations": max_iterations,
+        "max_tokens": rt.get("max_tokens") if isinstance(rt.get("max_tokens"), int) else None,
+        "reasoning_config": _json_safe_copy(rt.get("reasoning_config")),
+        "fallback_routes": _safe_fallback_routes(rt.get("fallback_model")),
+        "provider_preferences": {
+            "allowed": _json_safe_copy(rt.get("providers_allowed")),
+            "ignored": _json_safe_copy(rt.get("providers_ignored")),
+            "order": _json_safe_copy(rt.get("providers_order")),
+            "sort": _json_safe_copy(rt.get("provider_sort")),
+            "require_parameters": bool(rt.get("provider_require_parameters")),
+            "data_collection": (
+                rt.get("provider_data_collection")
+                if isinstance(rt.get("provider_data_collection"), str)
+                else ""
+            ),
+            "openrouter_min_coding_score": _json_safe_copy(
+                rt.get("openrouter_min_coding_score")
+            ),
+        },
+    }
     _apply_child_compression_cap(child, delegation_cfg)
     # Ownership chain for action=list/steer/stop; weakref so a finished parent
     # can be collected while a detached child record lingers in the registry.
@@ -299,7 +366,8 @@ def _build_child_agent(
 
 def _run_single_child(
     task_index: int, goal: str, child=None, parent_agent=None, *, owner_session_id: Optional[str] = None,
-    owner_transport: Any = None, owner_session_record: Any = None, **_kwargs,
+    owner_transport: Any = None, owner_session_record: Any = None,
+    conversation_history: Optional[List[Dict[str, Any]]] = None, resume_message: Optional[str] = None, **_kwargs,
 ) -> Dict[str, Any]:
     """Run a pre-built child agent (called from a worker thread) and return its result entry.
 
@@ -325,7 +393,10 @@ def _run_single_child(
         child, parent_agent, goal, owner_session_id=owner_session_id, owner_transport=owner_transport,
         owner_session_record=owner_session_record,
     )
-    run = _ChildRun(child, parent_agent, task_index, goal, _subagent_id, child_progress_cb, heartbeat=heartbeat)
+    run = _ChildRun(
+        child, parent_agent, task_index, goal, _subagent_id, child_progress_cb, heartbeat=heartbeat,
+        conversation_history=conversation_history, resume_message=resume_message,
+    )
     # Set when a timed-out Future still owns the child: closing it from this
     # thread before the worker settles races the conversation's finally path.
     _child_close_deferred = False
@@ -443,8 +514,8 @@ def delegate_task(
     max_iterations: Optional[int] = None, role: Optional[str] = None, background: Optional[bool] = None,
     output_schema: Optional[Dict[str, Any]] = None, images: Optional[List[str]] = None, action: Optional[str] = None,
     subagent_id: Optional[str] = None, message: Optional[str] = None, parent_agent=None,
-    delegation_id: Optional[str] = None, timeout_seconds: Optional[float] = None, limit: Optional[int] = None,
-    cascade: Optional[bool] = None, reason: Optional[str] = None,
+    delegation_id: Optional[str] = None, attempt_id: Optional[str] = None, run_id: Optional[str] = None,
+    timeout_seconds: Optional[float] = None, limit: Optional[int] = None, cascade: Optional[bool] = None, reason: Optional[str] = None,
     credentials_cfg: Optional[Dict[str, Any]] = None,
 ) -> str:
     """Spawn child agents (single ``goal`` or ``tasks=[...]`` batch) or control running ones. ``action``
@@ -456,7 +527,7 @@ def delegate_task(
 
     normalized_action = (action or "").strip().lower()
     if normalized_action in _MERGED_CONTROL_ACTIONS:
-        return _route_delegate_control_action(normalized_action, parent_agent=parent_agent, subagent_id=subagent_id, message=message, delegation_id=delegation_id, timeout_seconds=timeout_seconds, limit=limit, cascade=cascade, reason=reason)
+        return _route_delegate_control_action(normalized_action, parent_agent=parent_agent, subagent_id=subagent_id, message=message, delegation_id=delegation_id, attempt_id=attempt_id, run_id=run_id, timeout_seconds=timeout_seconds, limit=limit, cascade=cascade, reason=reason)
     if normalized_action and normalized_action != "spawn":
         return tool_error(f"Unknown action '{action}'. Use spawn (default), list, steer, or stop.")
 
@@ -737,7 +808,7 @@ def _strip_model_hidden_task_fields(tasks: Any) -> Any:
     return [{k: v for k, v in t.items() if k not in _MODEL_HIDDEN_TASK_FIELDS} if isinstance(t, dict) else t for t in tasks]
 
 
-DELEGATE_TASK_SCHEMA["parameters"]["properties"].update({'action': {'type': 'string', 'enum': ['spawn', 'list', 'status', 'tail', 'wait', 'steer', 'interrupt', 'stop', 'abandon'], 'description': "Default 'spawn' (omit for normal delegation). Live orchestration without a delegation_id: 'list' shows this conversation's live children; 'steer' queues course-correction text (subagent_id + message); 'stop' ends one child early (subagent_id). Durable lifecycle on the same tool: 'status', 'tail', 'wait', 'interrupt', 'abandon' require the handle returned by spawn. 'stop' with a delegation_id is an alias for interrupt. Control actions return immediately; goal/tasks are ignored when action is not spawn."}, 'delegation_id': {'type': 'string', 'description': 'Handle returned by a spawn. Required for status/tail/wait/interrupt/abandon; omitted for live list/steer/stop.'}, 'timeout_seconds': {'type': 'number', 'description': 'Bounded wait duration; default 30 seconds. Zero checks immediately.'}, 'limit': {'type': 'integer', 'description': 'Recent events returned by tail; default 20.'}, 'cascade': {'type': 'boolean', 'description': 'Interrupt descendants of the delegation or selected child branch. Defaults true.'}, 'reason': {'type': 'string', 'description': 'Optional audit reason for interrupt or abandon.'}})
+DELEGATE_TASK_SCHEMA["parameters"]["properties"].update({'action': {'type': 'string', 'enum': ['spawn', 'list', 'status', 'tail', 'wait', 'steer', 'resume', 'interrupt', 'stop', 'abandon'], 'description': "Default 'spawn' (omit for normal delegation). Live orchestration without a delegation_id: 'list' shows this conversation's live children; 'steer' queues course-correction text (subagent_id + message); 'stop' ends one child early (subagent_id). Durable lifecycle on the same tool: 'status', 'tail', 'wait', 'resume', 'interrupt', 'abandon' require the handle returned by spawn. 'stop' with a delegation_id is an alias for interrupt. Control actions return immediately; goal/tasks are ignored when action is not spawn."}, 'delegation_id': {'type': 'string', 'description': 'Handle returned by a spawn. Required for status/tail/wait/resume/interrupt/abandon; omitted for live list/steer/stop.'}, 'attempt_id': {'type': 'string', 'description': 'Exact historical attempt selector; accepted only by tail.'}, 'run_id': {'type': 'string', 'description': 'Exact execution run selector; accepted only by wait.'}, 'timeout_seconds': {'type': 'number', 'description': 'Bounded wait duration; default 30 seconds. Zero checks immediately.'}, 'limit': {'type': 'integer', 'description': 'Recent events returned by tail; default 20.'}, 'cascade': {'type': 'boolean', 'description': 'Interrupt descendants of the delegation or selected child branch. Defaults true.'}, 'reason': {'type': 'string', 'description': 'Optional audit reason for interrupt or abandon.'}})
 
 registry.register(
     name="delegate_task",
@@ -748,7 +819,7 @@ registry.register(
         max_iterations=args.get("max_iterations"), role=args.get("role"),
         background=_model_background_value(args, kw.get("parent_agent")), output_schema=args.get("output_schema"),
         images=args.get("images"), action=args.get("action"), subagent_id=args.get("subagent_id"), message=args.get("message"),
-        **{key: args.get(key) for key in ("delegation_id", "timeout_seconds", "limit", "cascade", "reason")},
+        **{key: args.get(key) for key in ("delegation_id", "attempt_id", "run_id", "timeout_seconds", "limit", "cascade", "reason")},
         parent_agent=kw.get("parent_agent"),
     ),
     check_fn=check_delegate_requirements,
@@ -756,7 +827,7 @@ registry.register(
     dynamic_schema_overrides=_build_dynamic_schema_overrides,
 )
 
-from tools.delegate_tool_registry import (interrupt_subagent_status, _sanitize_live_value, redact_observable_text, _bounded_live_preview, _append_live_event, _append_live_text)
+from tools.delegate_tool_registry import (interrupt_subagent_status, forward_pending_subagent_steers, _sanitize_live_value, redact_observable_text, _bounded_live_preview, _append_live_event, _append_live_text)
 
 
 def _route_delegate_control_action(
@@ -766,6 +837,8 @@ def _route_delegate_control_action(
     subagent_id: Optional[str] = None,
     message: Optional[str] = None,
     delegation_id: Optional[str] = None,
+    attempt_id: Optional[str] = None,
+    run_id: Optional[str] = None,
     timeout_seconds: Optional[float] = None,
     limit: Optional[int] = None,
     cascade: Optional[bool] = None,
@@ -787,7 +860,9 @@ def _route_delegate_control_action(
         try:
             from tools.delegation_control import delegation_control
 
-            durable = json.loads(delegation_control(action="list"))
+            durable = json.loads(
+                delegation_control(action="list", parent_agent=parent_agent)
+            )
             live_payload["delegations"] = durable.get("delegations") or []
             live_payload["status"] = durable.get("status") or "ok"
         except Exception:
@@ -802,11 +877,216 @@ def _route_delegate_control_action(
         action=durable_action,
         delegation_id=delegation_id,
         subagent_id=subagent_id,
+        attempt_id=attempt_id,
+        run_id=run_id,
         timeout_seconds=timeout_seconds,
         limit=limit,
         cascade=cascade,
         reason=reason,
+        message=message,
+        parent_agent=parent_agent,
     )
 
 _LIVE_CONTROL_ACTIONS = frozenset({"list", "steer", "stop"})
-_MERGED_CONTROL_ACTIONS = frozenset({"list", "status", "tail", "wait", "steer", "interrupt", "stop", "abandon"})
+_MERGED_CONTROL_ACTIONS = frozenset({"list", "status", "tail", "wait", "steer", "resume", "interrupt", "stop", "abandon"})
+
+
+
+def prepare_resumed_child_session(bundle: Dict[str, Any]) -> Dict[str, str]:
+    """Validate a hydration bundle and allocate a distinct child segment.
+
+    This deliberately does not create the SQLite row. The standard AIAgent
+    persistence path creates/enriches it with the effective current runtime
+    configuration before the first resumed turn is stored.
+    """
+    if not isinstance(bundle, dict):
+        raise ValueError("missing subagent resume bundle")
+    prior = bundle.get("prior_child_session_id")
+    owner = bundle.get("parent_session_id")
+    history = bundle.get("history")
+    metadata = bundle.get("reconstruction_metadata")
+    if (
+        not isinstance(prior, str)
+        or not prior
+        or not isinstance(owner, str)
+        or not owner
+        or not isinstance(history, list)
+        or not history
+        or not isinstance(metadata, dict)
+        or metadata.get("parent_session_id") != owner
+    ):
+        raise ValueError("incomplete subagent resume bundle")
+    return {
+        "session_id": f"{time.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}",
+        "parent_session_id": prior,
+        "delegate_from": owner,
+    }
+
+
+def build_resumed_child_agent(
+    *,
+    bundle: Dict[str, Any],
+    logical_id: str,
+    goal: str,
+    parent_agent,
+    continuation: Optional[Dict[str, str]] = None,
+):
+    """Reconstruct a child using persisted non-secret policy and live credentials."""
+    metadata = dict(bundle.get("reconstruction_metadata") or {})
+    model = str(metadata.get("model") or "").strip()
+    provider = str(metadata.get("provider") or "").strip()
+    if not model or not provider:
+        raise ValueError("saved child provider/model is unavailable")
+    continuation = continuation or prepare_resumed_child_session(bundle)
+    # Re-resolve credentials and approval policy from current authorized config;
+    # no persisted secret is ever accepted from the resume bundle.
+    credentials = _resolve_delegation_credentials(
+        {"provider": provider, "model": model}, parent_agent
+    )
+    runtime_parent = parent_agent
+    if runtime_parent is None:
+        from hermes_state import SessionDB
+
+        # Durable resume must work after a gateway restart, where the original
+        # parent AIAgent object no longer exists and native tool adapters may not
+        # expose the newly-created controller object. Rebuild only the non-secret
+        # policy surface consumed by _build_child_agent; credentials above were
+        # resolved fresh from the active provider configuration.
+        runtime_parent = SimpleNamespace(
+            session_id=continuation["delegate_from"],
+            _session_db=SessionDB(),
+            model=model,
+            provider=credentials.get("provider") or provider,
+            base_url=credentials.get("base_url"),
+            api_key=credentials.get("api_key"),
+            api_mode=credentials.get("api_mode"),
+            _client_kwargs={
+                key: value
+                for key, value in {
+                    "base_url": credentials.get("base_url"),
+                    "api_key": credentials.get("api_key"),
+                }.items()
+                if value
+            },
+            _delegate_depth=max(0, int(metadata.get("depth") or 1) - 1),
+            _subagent_id=metadata.get("parent_logical_id"),
+            enabled_toolsets=list(metadata.get("enabled_toolsets") or []),
+            disabled_toolsets=list(metadata.get("disabled_toolsets") or []),
+            valid_tool_names=[],
+            reasoning_config=_json_safe_copy(metadata.get("reasoning_config")),
+            _fallback_chain=_json_safe_copy(metadata.get("fallback_routes")) or [],
+            acp_command=credentials.get("command"),
+            acp_args=list(credentials.get("args") or []),
+        )
+    child = _build_child_agent(
+        task_index=0,
+        goal=goal,
+        context=None,
+        toolsets=list(metadata.get("enabled_toolsets") or []),
+        model=model,
+        max_iterations=int(metadata.get("max_iterations") or 50),
+        task_count=1,
+        parent_agent=runtime_parent,
+        override_provider=credentials.get("provider"),
+        override_base_url=credentials.get("base_url"),
+        override_api_key=credentials.get("api_key"),
+        override_api_mode=credentials.get("api_mode"),
+        override_request_overrides=credentials.get("request_overrides"),
+        override_max_tokens=(
+            metadata.get("max_tokens")
+            if isinstance(metadata.get("max_tokens"), int)
+            else credentials.get("max_output_tokens")
+        ),
+        override_acp_command=credentials.get("command"),
+        override_acp_args=credentials.get("args"),
+        required_disabled_toolsets=list(metadata.get("disabled_toolsets") or []),
+        workspace_override=metadata.get("workdir"),
+        reasoning_config_override=metadata.get("reasoning_config"),
+        fallback_model_override=list(metadata.get("fallback_routes") or []),
+        provider_preferences_override=metadata.get("provider_preferences"),
+        session_id_override=continuation["session_id"],
+        parent_session_id_override=continuation["parent_session_id"],
+        role=str(metadata.get("role") or "leaf"),
+    )
+
+    owner = continuation["delegate_from"]
+    prior = continuation["parent_session_id"]
+    session_id = continuation["session_id"]
+    parent_logical_id = metadata.get("parent_logical_id")
+    child.session_id = session_id
+    child._parent_session_id = prior
+    child._subagent_id = logical_id
+    child._parent_subagent_id = (
+        parent_logical_id if isinstance(parent_logical_id, str) else None
+    )
+    if isinstance(metadata.get("depth"), int):
+        child._delegate_depth = metadata["depth"]
+    child._delegate_role = str(metadata.get("role") or "leaf")
+    child._subagent_goal = goal
+    session_ref = {"session_id": session_id}
+    child._delegation_session_ref = session_ref
+    child._delegation_runtime_metadata = {
+        **metadata,
+        "child_session_id": session_id,
+        "parent_session_id": owner,
+        "enabled_toolsets": list(getattr(child, "enabled_toolsets", None) or []),
+        "disabled_toolsets": list(getattr(child, "disabled_toolsets", None) or []),
+        "reasoning_config": _json_safe_copy(
+            getattr(child, "reasoning_config", metadata.get("reasoning_config"))
+        ),
+        "fallback_routes": _json_safe_copy(
+            getattr(child, "_fallback_chain", metadata.get("fallback_routes"))
+        ),
+    }
+    if getattr(child, "_session_init_model_config", None) is not None:
+        child._session_init_model_config["_delegate_from"] = owner
+
+    # Rebuild the callback because the initial builder generated a throwaway
+    # logical/session identity before this exact resumed identity was known.
+    child_progress_cb = _build_child_progress_callback(
+        0,
+        goal,
+        runtime_parent,
+        1,
+        subagent_id=logical_id,
+        parent_id=child._parent_subagent_id,
+        depth=max(0, int(getattr(child, "_delegate_depth", 1)) - 1),
+        model=model,
+        toolsets=list(getattr(child, "enabled_toolsets", None) or []),
+        session_ref=session_ref,
+    )
+    child.tool_progress_callback = child_progress_cb
+    if child_progress_cb:
+        def _resumed_thinking(text: str) -> None:
+            if text:
+                child_progress_cb("_thinking", text)
+
+        child.thinking_callback = _resumed_thinking
+    return child
+
+
+def _json_safe_copy(value: Any) -> Any:
+    """Return a detached JSON value or ``None`` for runtime-only objects."""
+    try:
+        return json.loads(json.dumps(value))
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _safe_fallback_routes(value: Any) -> List[Dict[str, str]]:
+    """Persist named fallback routes without credentials or endpoint details."""
+    items = value if isinstance(value, list) else [value]
+    routes: List[Dict[str, str]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        provider = item.get("provider")
+        model = item.get("model")
+        if not isinstance(provider, str) or not isinstance(model, str):
+            continue
+        route = {"provider": provider, "model": model}
+        api_mode = item.get("api_mode")
+        if isinstance(api_mode, str):
+            route["api_mode"] = api_mode
+        routes.append(route)
+    return routes

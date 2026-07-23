@@ -72,6 +72,62 @@ def _bare_agent() -> AIAgent:
 
 
 
+class TestSteerAcceptance:
+    def test_tracked_envelopes_preserve_identity_and_ack_injection(self):
+        agent = _bare_agent()
+        outcomes = []
+        agent.steer(
+            "first",
+            mailbox_id="mail-1",
+            outcome_callback=lambda outcome: outcomes.append(("mail-1", outcome)),
+        )
+        agent.steer(
+            "second",
+            mailbox_id="mail-2",
+            outcome_callback=lambda outcome: outcomes.append(("mail-2", outcome)),
+        )
+        messages = [{"role": "tool", "content": "output", "tool_call_id": "1"}]
+
+        agent._apply_pending_steer_to_tool_results(messages, num_tool_msgs=1)
+
+        assert messages[0]["content"] == "output"
+        assert messages[1]["role"] == "user"
+        assert messages[1]["content"].endswith(
+            "first\nsecond\n[/OUT-OF-BAND USER MESSAGE]"
+        )
+        assert outcomes == [
+            ("mail-1", "injected"),
+            ("mail-2", "injected"),
+        ]
+
+    def test_interrupt_acks_tracked_envelope_as_superseded(self):
+        agent = _bare_agent()
+        outcomes = []
+        agent.steer(
+            "do not deliver",
+            mailbox_id="mail-1",
+            outcome_callback=outcomes.append,
+        )
+
+        agent.interrupt(hard_cancel=True)
+        agent.clear_interrupt()
+
+        assert outcomes == ["superseded_by_interrupt"]
+        assert agent._pending_steer is None
+        assert agent._pending_steer_envelopes == []
+
+    def test_requeued_pre_api_steer_survives_for_the_next_drain(self):
+        from agent.turn_iteration_prep import _inject_steer_after_newest_tool_result
+
+        agent = _bare_agent()
+        agent._pending_steer_envelopes = []  # as agent_init leaves an initialized agent
+        agent.steer("change course")
+
+        _inject_steer_after_newest_tool_result(agent, [], agent._drain_pending_steer())
+
+        assert agent._drain_pending_steer() == "change course"
+
+
 class TestSteerDrain:
     def test_drain_returns_and_clears(self):
         agent = _bare_agent()

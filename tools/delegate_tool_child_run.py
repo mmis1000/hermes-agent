@@ -719,6 +719,8 @@ class _ChildRun:
     parent_task_id: Optional[str] = None
     wall_start: float = 0.0
     parent_reads_snapshot: list = field(default_factory=list)
+    conversation_history: Optional[List[Dict[str, Any]]] = None
+    resume_message: Optional[str] = None
 
     def elapsed(self) -> float:
         return round(time.monotonic() - self.child_start, 2)
@@ -848,7 +850,14 @@ class _ChildRun:
         worker_thread_holder: Dict[str, Optional[threading.Thread]] = {"t": None}
         # Resolved after seed_workspace so a multimodal goal's text part carries the worktree note too.
         _images = list(getattr(child, "_delegate_images", None) or [])
-        user_message: Any = _build_child_goal_message(self.goal, _images, child) if _images else self.goal
+        user_message: Any = (
+            self.resume_message if self.resume_message is not None
+            else _build_child_goal_message(self.goal, _images, child) if _images else self.goal
+        )
+        history_kwargs = (
+            {"conversation_history": self.conversation_history}
+            if self.conversation_history is not None else {}
+        )
 
         def _run_with_thread_capture():
             worker_thread_holder["t"] = threading.current_thread()
@@ -856,6 +865,7 @@ class _ChildRun:
             with delegated_child_context(str(getattr(child, "session_id", "") or "")):
                 return child.run_conversation(
                     user_message=user_message, task_id=self.child_task_id, stream_callback=self.relay_text,
+                    **history_kwargs,
                 )
 
         future = executor.submit(contextvars.copy_context().run, _run_with_thread_capture)
