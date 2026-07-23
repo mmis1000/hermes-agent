@@ -112,6 +112,24 @@ def test_duplicate_async_queue_replay_injects_once(monkeypatch, isolated_registr
     adapter.handle_message.assert_awaited_once()
 
 
+def test_distinct_runs_of_one_delegation_are_delivered_once_each():
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    runner = _runner(adapter)
+    first = _async_event("deleg_resumed") | {"run_id": "run-1"}
+    replay = dict(first)
+    resumed = _async_event("deleg_resumed") | {"run_id": "run-2"}
+
+    async def _exercise():
+        return (
+            await runner._deliver_completion_notification("first", first),
+            await runner._deliver_completion_notification("replay", replay),
+            await runner._deliver_completion_notification("resumed", resumed),
+        )
+
+    assert asyncio.run(_exercise()) == (True, None, True)
+    assert adapter.handle_message.await_count == 2
+
+
 def test_gateway_idle_watcher_restores_only_gateway_routable_wait_holds(
     monkeypatch, isolated_registry,
 ):

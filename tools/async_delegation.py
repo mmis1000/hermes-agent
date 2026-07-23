@@ -398,12 +398,20 @@ def _delivery_claim_action(
     return _changed(outcome, "delivered" if delivered else "released")
 
 
-def release_completion_delivery(delegation_id: str, claim_id: str) -> bool:
-    return _delivery_claim_action(delegation_id, claim_id, delivered=False)
+def release_completion_delivery(
+    delegation_id: str, claim_id: str, *, run_id: Optional[str] = None
+) -> bool:
+    return _delivery_claim_action(
+        delegation_id, claim_id, delivered=False, run_id=run_id
+    )
 
 
-def complete_completion_delivery(delegation_id: str, claim_id: str) -> bool:
-    return _delivery_claim_action(delegation_id, claim_id, delivered=True)
+def complete_completion_delivery(
+    delegation_id: str, claim_id: str, *, run_id: Optional[str] = None
+) -> bool:
+    return _delivery_claim_action(
+        delegation_id, claim_id, delivered=True, run_id=run_id
+    )
 
 
 def finish_async_delivery(
