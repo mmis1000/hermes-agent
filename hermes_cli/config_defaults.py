@@ -1998,6 +1998,9 @@ DEFAULT_CONFIG = {
     # always goes to ~/.hermes/skills/.
     "skills": {
         "external_dirs": [],   # e.g. ["~/.agents/skills", "/shared/team-skills"]
+        # Optional direct preload policy for slash-skill invocations. Keys and
+        # values are skill names. Example: {"plan": ["brainstorming"]}
+        "command_preloads": {},
         # Project-local skill discovery: when a session starts inside a git
         # checkout, ``<root>/.hermes/skills/`` and ``<root>/.agents/skills/``
         # are sourced as the highest-precedence skill tier — but ONLY when the
