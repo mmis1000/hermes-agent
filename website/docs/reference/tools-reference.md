@@ -60,7 +60,8 @@ These two tools live in the `browser` toolset but only register when a Chrome De
 
 | Tool | Description | Requires environment |
 |------|-------------|----------------------|
-| `delegate_task` | Spawn subagents in isolated contexts; each gets its own conversation, terminal session, and toolset, and only its final summary returns to you. Provide 'goal' for a single task or 'tasks' for a parallel batch (limits and nesting rules… | — |
+| `delegate_task` | Spawn one or more subagents to work on tasks in isolated contexts. Each subagent gets its own conversation, terminal session, and toolset. Only the final summary is returned -- intermediate tool results never enter your context window. TWO… | — |
+| `delegation` | Observe and control background subagents. Supports session-scoped list/status, exact-attempt tail, exact-run/FIFO wait, durable steer, transcript-based resume, interrupt, and abandon. Logical child IDs stay stable while each resumed execution receives immutable attempt and run IDs. | — |
 
 ## `feishu_doc` toolset
 

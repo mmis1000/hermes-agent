@@ -12,27 +12,33 @@ from tools import delegate_tool as _delegate
 from tools.approval import get_current_session_key
 from tools.registry import registry
 
-_ACTIONS = {"list", "status", "tail", "wait", "interrupt", "abandon"}
+_ACTIONS = {"list", "status", "tail", "wait", "steer", "resume", "interrupt", "abandon"}
 _TOOL_FIELDS = {
     "action",
     "delegation_id",
     "subagent_id",
+    "attempt_id",
+    "run_id",
     "timeout_seconds",
     "limit",
     "cascade",
     "reason",
+    "message",
 }
 _ACTION_FIELDS = {
     "list": set(),
     "status": {"delegation_id", "subagent_id"},
-    "tail": {"delegation_id", "subagent_id", "limit"},
-    "wait": {"delegation_id", "timeout_seconds"},
+    "tail": {"delegation_id", "subagent_id", "attempt_id", "limit"},
+    "wait": {"delegation_id", "run_id", "timeout_seconds"},
+    "steer": {"delegation_id", "subagent_id", "message"},
+    "resume": {"delegation_id", "subagent_id", "message"},
     "interrupt": {"delegation_id", "subagent_id", "cascade", "reason"},
     "abandon": {"delegation_id", "cascade", "reason"},
 }
 _MAX_WAIT_SECONDS = 300.0
 _MAX_TAIL_EVENTS = 64
 _MAX_REASON_CHARS = 1000
+_MAX_STEER_CHARS = 12000
 _MAX_ID_CHARS = 200
 
 
@@ -53,6 +59,19 @@ def _resolve_session_key(session_key: Optional[str]) -> str:
     return get_current_session_key(default="")
 
 
+def _control_session_candidates(session_key: str) -> List[str]:
+    """Exact controller plus proven compression ancestors, fail-closed."""
+    if not session_key:
+        return [session_key]
+    try:
+        from hermes_state import SessionDB
+
+        candidates = SessionDB().control_session_candidates(session_key)
+    except Exception:
+        candidates = []
+    return candidates or [session_key]
+
+
 def _redact_reason(reason: Optional[str]) -> str:
     text = str(reason or "")
     return _delegate.redact_observable_text(text) if text else ""
@@ -63,10 +82,13 @@ def _validate(
     action: str,
     delegation_id: Optional[str],
     subagent_id: Optional[str],
+    attempt_id: Optional[str],
+    run_id: Optional[str],
     timeout_seconds: Optional[float],
     limit: Optional[int],
     cascade: Optional[bool],
     reason: Optional[str],
+    message: Optional[str],
 ) -> Optional[str]:
     if action not in _ACTIONS:
         return f"Unknown action {action!r}; expected one of {sorted(_ACTIONS)}."
@@ -75,17 +97,25 @@ def _validate(
         for key, value in {
             "delegation_id": delegation_id,
             "subagent_id": subagent_id,
+            "attempt_id": attempt_id,
+            "run_id": run_id,
             "timeout_seconds": timeout_seconds,
             "limit": limit,
             "cascade": cascade,
             "reason": reason,
+            "message": message,
         }.items()
         if value is not None
     }
     disallowed = sorted(supplied - _ACTION_FIELDS[action])
     if disallowed:
         return f"Action {action!r} does not accept: {', '.join(disallowed)}."
-    for name, value in (("delegation_id", delegation_id), ("subagent_id", subagent_id)):
+    for name, value in (
+        ("delegation_id", delegation_id),
+        ("subagent_id", subagent_id),
+        ("attempt_id", attempt_id),
+        ("run_id", run_id),
+    ):
         if value is not None and not isinstance(value, str):
             return f"{name} must be a string."
         if isinstance(value, str) and len(value) > _MAX_ID_CHARS:
@@ -94,6 +124,18 @@ def _validate(
         return f"Action {action!r} requires delegation_id."
     if subagent_id is not None and not subagent_id.strip():
         return "subagent_id must not be empty."
+    if attempt_id is not None and not attempt_id.strip():
+        return "attempt_id must not be empty."
+    if run_id is not None and not run_id.strip():
+        return "run_id must not be empty."
+    if action in {"steer", "resume"} and not str(subagent_id or "").strip():
+        return f"Action {action!r} requires subagent_id."
+    if message is not None and not isinstance(message, str):
+        return "message must be a string."
+    if action in {"steer", "resume"} and not str(message or "").strip():
+        return f"Action {action!r} requires a non-empty message."
+    if isinstance(message, str) and len(message) > _MAX_STEER_CHARS:
+        return f"message must not exceed {_MAX_STEER_CHARS} characters."
     if timeout_seconds is not None:
         if isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, (int, float)):
             return "timeout_seconds must be a number."
@@ -154,6 +196,7 @@ def _children_for_record(
     session_key: str,
     subagent_id: Optional[str] = None,
     include_tail: bool = False,
+    include_live: bool = True,
     limit: int = 20,
 ) -> List[Dict[str, Any]]:
     delegation_id = str(record.get("delegation_id") or "")
@@ -170,11 +213,12 @@ def _children_for_record(
         item["live"] = False
         by_id[child_id] = item
 
-    for active in _active_children(delegation_id, session_key=session_key):
-        child_id = str(active.get("subagent_id") or "")
-        active = dict(active)
-        active["live"] = True
-        by_id[child_id] = active
+    if include_live:
+        for active in _active_children(delegation_id, session_key=session_key):
+            child_id = str(active.get("subagent_id") or "")
+            active = dict(active)
+            active["live"] = True
+            by_id[child_id] = {**by_id.get(child_id, {}), **active}
 
     roots = list(record.get("root_subagent_ids") or [])
     for child_id in roots:
@@ -229,6 +273,11 @@ def _children_for_record(
                 "model",
                 "started_at",
                 "status",
+                "attempt_id",
+                "attempt_number",
+                "run_id",
+                "resume_available",
+                "suggested_action",
                 "interrupt_reason",
                 "tool_count",
                 "last_tool",
@@ -240,6 +289,9 @@ def _children_for_record(
         activity = _safe_activity(child.get("activity"))
         if activity:
             item["activity"] = activity
+        steers = child.get("steers")
+        if isinstance(steers, list) and steers:
+            item["steers"] = [dict(steer) for steer in steers[-20:] if isinstance(steer, dict)]
         if include_tail:
             item["assistant_text_tail"] = _delegate.redact_observable_text(
                 child.get("assistant_text_tail") or ""
@@ -270,11 +322,15 @@ def delegation_control(
     action: str,
     delegation_id: Optional[str] = None,
     subagent_id: Optional[str] = None,
+    attempt_id: Optional[str] = None,
+    run_id: Optional[str] = None,
     timeout_seconds: Optional[float] = None,
     limit: Optional[int] = None,
     cascade: Optional[bool] = None,
     reason: Optional[str] = None,
+    message: Optional[str] = None,
     session_key: Optional[str] = None,
+    parent_agent=None,
 ) -> str:
     """Execute one session-scoped delegation lifecycle action."""
     if not isinstance(action, str):
@@ -284,20 +340,26 @@ def delegation_control(
         action=action,
         delegation_id=delegation_id,
         subagent_id=subagent_id,
+        attempt_id=attempt_id,
+        run_id=run_id,
         timeout_seconds=timeout_seconds,
         limit=limit,
         cascade=cascade,
         reason=reason,
+        message=message,
     )
     if error:
         return _invalid(action, error)
 
-    origin = _resolve_session_key(session_key)
+    caller_session = _resolve_session_key(session_key)
+    owner_candidates = _control_session_candidates(caller_session)
+    origin = caller_session
     audit_reason = _redact_reason(reason)
 
     if action == "list":
         delegations = []
-        for record in _async.list_async_delegations(session_key=origin):
+        for record in _async.list_durable_delegations(session_keys=owner_candidates):
+            record_origin = str(record.get("session_key") or "")
             delegations.append(
                 {
                     "delegation_id": record.get("delegation_id"),
@@ -308,7 +370,7 @@ def delegation_control(
                     "dispatched_at": record.get("dispatched_at"),
                     "completed_at": record.get("completed_at"),
                     "subagents": _children_for_record(
-                        record, session_key=origin, include_tail=False
+                        record, session_key=record_origin, include_tail=False
                     ),
                 }
             )
@@ -319,13 +381,34 @@ def delegation_control(
 
     target = str(delegation_id or "").strip()
     child_target = subagent_id.strip() if isinstance(subagent_id, str) else None
-    record = _async.get_async_delegation(target, session_key=origin)
+    record = None
+    for owner_candidate in owner_candidates:
+        record = _async.get_async_delegation(target, session_key=owner_candidate)
+        if record is not None:
+            origin = owner_candidate
+            break
     if record is None:
         return _not_found(action, target)
     if child_target and not _async.delegation_contains_subagent(
         target, child_target, session_key=origin
     ):
         return _not_found(action, target)
+
+    selected_attempt = (
+        attempt_id.strip() if isinstance(attempt_id, str) else None
+    )
+    if action == "tail" and selected_attempt:
+        historical = _async.get_async_delegation_attempt(
+            target, selected_attempt, session_key=origin
+        )
+        if historical is None:
+            return _not_found(action, target)
+        historical_child_ids = list((historical.get("children") or {}).keys())
+        if child_target and child_target not in historical_child_ids:
+            return _not_found(action, target)
+        record = historical
+        if not child_target and historical_child_ids:
+            child_target = historical_child_ids[0]
 
     if action in {"status", "tail"}:
         include_tail = action == "tail"
@@ -340,6 +423,10 @@ def delegation_control(
             "dispatched_at": record.get("dispatched_at"),
             "completed_at": record.get("completed_at"),
             "result_available": record.get("result") is not None,
+            "run_id": record.get("run_id"),
+            "latest_run_id": record.get("latest_run_id"),
+            "active_run_id": record.get("active_run_id"),
+            "pending_run_count": record.get("pending_run_count", 0),
             "interrupt_reason": record.get("interrupt_reason"),
             "abandon_reason": record.get("abandon_reason"),
             "subagents": _children_for_record(
@@ -347,6 +434,7 @@ def delegation_control(
                 session_key=origin,
                 subagent_id=child_target,
                 include_tail=include_tail,
+                include_live=not bool(selected_attempt),
                 limit=event_limit,
             ),
         }
@@ -357,6 +445,7 @@ def delegation_control(
             target,
             session_key=origin,
             timeout_seconds=30.0 if timeout_seconds is None else float(timeout_seconds),
+            run_id=run_id.strip() if isinstance(run_id, str) else None,
         )
         if waited.get("status") == "not_found":
             return _not_found(action, target)
@@ -367,11 +456,79 @@ def delegation_control(
             "worker_status": waited.get("worker_status"),
             "delivery_disposition": waited.get("delivery_disposition"),
             "claimed_delivery": bool(waited.get("claimed_delivery", False)),
+            "run_id": waited.get("run_id"),
+            "latest_run_id": waited.get("latest_run_id"),
+            "active_run_id": waited.get("active_run_id"),
+            "pending_run_count": waited.get("pending_run_count", 0),
             "result": waited.get("result"),
             "subagents": _children_for_record(
                 waited, session_key=origin, include_tail=True, limit=20
             ),
         }
+        return json.dumps(payload, ensure_ascii=False)
+
+    if action == "steer":
+        queued = _async.enqueue_subagent_steer(
+            target,
+            str(child_target),
+            session_key=origin,
+            message=str(message).strip(),
+        )
+        if queued.get("status") != "accepted":
+            payload = {
+                "action": action,
+                "status": queued.get("status"),
+                "delegation_id": target,
+                "subagent_id": child_target,
+            }
+            if queued.get("terminal_status"):
+                payload["terminal_status"] = queued.get("terminal_status")
+            return json.dumps(payload, ensure_ascii=False)
+
+        _delegate.forward_pending_subagent_steers(
+            str(child_target), str(queued["attempt_id"])
+        )
+        mailbox = _async.inspect_subagent_steer(str(queued["mailbox_id"]))
+        mailbox_status = str(mailbox.get("status") or "pending")
+        honest_status = (
+            mailbox_status
+            if mailbox_status in {
+                "superseded_by_interrupt",
+                "too_late_after_completion",
+            }
+            else "accepted"
+        )
+        return json.dumps(
+            {
+                "action": action,
+                "status": honest_status,
+                "delegation_id": target,
+                "subagent_id": child_target,
+                "attempt_id": queued.get("attempt_id"),
+                "mailbox_id": queued.get("mailbox_id"),
+                "steer_status": mailbox_status,
+            },
+            ensure_ascii=False,
+        )
+
+    if action == "resume":
+        resumed = _async.dispatch_resumed_subagent(
+            target,
+            str(child_target),
+            session_key=origin,
+            message=str(message).strip(),
+            parent_agent=parent_agent,
+        )
+        payload = {
+            "action": action,
+            **{
+                key: value
+                for key, value in resumed.items()
+                if key not in {"bundle", "error"}
+            },
+        }
+        if resumed.get("error"):
+            payload["error"] = _redact_reason(str(resumed["error"]))
         return json.dumps(payload, ensure_ascii=False)
 
     use_cascade = True if cascade is None else cascade
@@ -391,22 +548,33 @@ def delegation_control(
 
     if action == "interrupt":
         if child_target:
-            outcome = _delegate.interrupt_subagent_status(child_target, reason=audit_reason)
-            if outcome == "not_live":
-                outcome = _async.request_pending_subagent_interrupt(
-                    target,
-                    child_target,
-                    session_key=origin,
-                    reason=audit_reason,
-                )
-            if outcome == "not_found":
+            # Persist the exact-attempt interrupt first so it wins races with
+            # pending/forwarding steer mailboxes and survives process loss.
+            durable_outcome = _async.request_pending_subagent_interrupt(
+                target,
+                child_target,
+                session_key=origin,
+                reason=audit_reason,
+            )
+            if durable_outcome == "not_found":
                 return _not_found(action, target)
+            live_outcome = _delegate.interrupt_subagent_status(
+                child_target, reason=audit_reason
+            )
+            outcome = (
+                live_outcome
+                if live_outcome not in {"not_live", "already_terminal"}
+                else durable_outcome
+            )
             current = _async.get_async_delegation(target, session_key=origin) or record
+            current_child = (current.get("children") or {}).get(child_target, {})
             payload = {
                 "action": action,
                 "status": outcome,
                 "delegation_id": target,
                 "subagent_id": child_target,
+                "attempt_id": current_child.get("attempt_id"),
+                "run_id": current_child.get("run_id"),
                 "cascade": True,
                 "delivery_disposition": current.get("delivery_disposition"),
                 "reason": audit_reason,
@@ -432,7 +600,7 @@ def delegation_control(
     return json.dumps(payload, ensure_ascii=False)
 
 
-def _handle_delegation_args(args: Dict[str, Any]) -> str:
+def _handle_delegation_args(args: Dict[str, Any], *, parent_agent=None) -> str:
     if not isinstance(args, dict):
         return _invalid("delegation", "arguments must be an object.")
     unknown = sorted(set(args) - _TOOL_FIELDS)
@@ -444,10 +612,14 @@ def _handle_delegation_args(args: Dict[str, Any]) -> str:
         action=args.get("action", ""),
         delegation_id=args.get("delegation_id"),
         subagent_id=args.get("subagent_id"),
+        attempt_id=args.get("attempt_id"),
+        run_id=args.get("run_id"),
         timeout_seconds=args.get("timeout_seconds"),
         limit=args.get("limit"),
         cascade=args.get("cascade"),
         reason=args.get("reason"),
+        message=args.get("message"),
+        parent_agent=parent_agent,
     )
 
 
@@ -458,6 +630,8 @@ DELEGATION_CONTROL_SCHEMA = {
         "Actions are session-scoped: list/status inspect lifecycle state, tail "
         "returns bounded assistant text and tool previews (never hidden reasoning), "
         "wait blocks for a bounded time and consumes an unclaimed completed result, "
+        "steer durably queues guidance for one exact live child attempt, resume "
+        "starts a new attempt from a terminal child's persisted transcript, "
         "interrupt requests a cooperative stop while preserving delivery, and "
         "abandon suppresses stale delivery before requesting interruption."
     ),
@@ -478,7 +652,17 @@ DELEGATION_CONTROL_SCHEMA = {
             "subagent_id": {
                 "type": "string",
                 "maxLength": _MAX_ID_CHARS,
-                "description": "Optional child filter/branch target for status, tail, or interrupt.",
+                "description": "Child filter/branch target; required for steer/resume.",
+            },
+            "attempt_id": {
+                "type": "string",
+                "maxLength": _MAX_ID_CHARS,
+                "description": "Exact historical attempt selector; accepted only by tail.",
+            },
+            "run_id": {
+                "type": "string",
+                "maxLength": _MAX_ID_CHARS,
+                "description": "Exact execution run selector; accepted only by wait.",
             },
             "timeout_seconds": {
                 "type": "number",
@@ -504,6 +688,11 @@ DELEGATION_CONTROL_SCHEMA = {
                 "maxLength": _MAX_REASON_CHARS,
                 "description": "Optional audit reason for interrupt or abandon.",
             },
+            "message": {
+                "type": "string",
+                "maxLength": _MAX_STEER_CHARS,
+                "description": "Guidance for steer, or the next user instruction for resume.",
+            },
         },
         "required": ["action"],
     },
@@ -514,7 +703,9 @@ registry.register(
     name="delegation",
     toolset="delegation",
     schema=DELEGATION_CONTROL_SCHEMA,
-    handler=lambda args, **_kw: _handle_delegation_args(args),
+    handler=lambda args, **kw: _handle_delegation_args(
+        args, parent_agent=kw.get("parent_agent")
+    ),
     check_fn=check_delegation_control_requirements,
     emoji="🎛️",
     max_result_size_chars=24000,
