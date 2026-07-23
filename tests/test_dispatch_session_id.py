@@ -60,6 +60,22 @@ class TestSessionIdForwarding:
         assert "session_id" in captured
         assert captured["session_id"] is None
 
+    def test_parent_agent_forwarded_for_stateful_agent_tools(self):
+        """Registry handlers such as delegation resume receive the live caller."""
+        captured = {}
+        parent = object()
+        with patch("model_tools.registry", _make_registry(captured)):
+            from model_tools import handle_function_call
+            handle_function_call(
+                "delegation",
+                {"action": "resume", "delegation_id": "d", "subagent_id": "sa", "message": "next"},
+                task_id="task-parent",
+                session_id="sess-parent",
+                parent_agent=parent,
+                skip_pre_tool_call_hook=True,
+            )
+        assert captured.get("parent_agent") is parent
+
     def test_task_id_still_forwarded(self):
         """Existing task_id forwarding is not broken by this change."""
         captured = {}

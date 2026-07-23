@@ -305,8 +305,9 @@ _RESUME_METADATA_FIELDS = frozenset(
         "disabled_toolsets",
         "workdir",
         "max_iterations",
+        "max_tokens",
         "fallback_routes",
-        "provider_routing",
+        "provider_preferences",
     }
 )
 
@@ -346,6 +347,200 @@ def load_subagent_resume_bundle(
         "attempt_number": child.get("attempt_number"),
         "run_id": child.get("run_id"),
         "bundle": bundle,
+    }
+
+
+def dispatch_resumed_subagent(
+    delegation_id: str,
+    logical_id: str,
+    *,
+    session_key: str,
+    message: str,
+    parent_agent,
+    max_async_children: int = _DEFAULT_MAX_ASYNC_CHILDREN,
+) -> Dict[str, Any]:
+    """Reserve, reconstruct, and dispatch one persisted logical child."""
+    snapshot = get_async_delegation(delegation_id, session_key=session_key)
+    if snapshot is None:
+        return {"status": "not_found"}
+    child_snapshot = ((snapshot or {}).get("children") or {}).get(logical_id) or {}
+    if not child_snapshot:
+        return {"status": "not_found"}
+    if child_snapshot.get("status") in _ACTIVE_STATES:
+        return {
+            "status": "already_running",
+            "attempt_id": child_snapshot.get("attempt_id"),
+            "run_id": child_snapshot.get("run_id"),
+        }
+    loaded = load_subagent_resume_bundle(
+        delegation_id, logical_id, session_key=session_key
+    )
+    if loaded.get("status") != "ready":
+        return loaded
+
+    bundle = loaded["bundle"]
+    from tools import delegate_tool as _delegate
+
+    continuation = _delegate.prepare_resumed_child_session(bundle)
+    # Keep the last persisted segment as the durable anchor while this attempt
+    # is starting/running. The loader follows marked child continuations, so it
+    # still discovers a partially persisted new segment after process loss,
+    # without ever pointing durable state at a session that may not yet exist.
+    metadata = {
+        **dict(bundle["reconstruction_metadata"]),
+        "child_session_id": bundle["prior_child_session_id"],
+    }
+    try:
+        from gateway.status import get_process_start_time
+
+        owner_started_at = get_process_start_time(os.getpid())
+    except Exception:
+        owner_started_at = None
+    reserved = _repository().reserve_resumed_attempt(
+        logical_id,
+        physical_worker_id=logical_id,
+        owner_pid=os.getpid(),
+        owner_started_at=owner_started_at,
+        metadata=metadata,
+    )
+    if reserved.get("status") != "reserved":
+        return reserved
+    _notify_state_change()
+
+    run_id = str(reserved["run_id"])
+    attempt_id = str(reserved["attempt_id"])
+    dispatched_at = time.time()
+    event_record = {
+        "delegation_id": delegation_id,
+        "run_id": run_id,
+        "session_key": snapshot.get("session_key", ""),
+        "origin_ui_session_id": snapshot.get("origin_ui_session_id", ""),
+        "parent_session_id": snapshot.get("parent_session_id"),
+        "goal": child_snapshot.get("goal") or snapshot.get("goal", ""),
+        "context": snapshot.get("context"),
+        "toolsets": metadata.get("enabled_toolsets"),
+        "role": metadata.get("role"),
+        "model": metadata.get("model"),
+        "dispatched_at": dispatched_at,
+        "subagent_id": logical_id,
+        "attempt_id": attempt_id,
+        "attempt_number": reserved["attempt_number"],
+    }
+
+    def finish(result: Dict[str, Any], status: str) -> None:
+        completed = {**event_record, "completed_at": time.time()}
+        result.setdefault("subagent_id", logical_id)
+        result.setdefault("attempt_id", attempt_id)
+        result.setdefault("run_id", run_id)
+        _push_completion_event(completed, result, status)
+
+    try:
+        child = _delegate.build_resumed_child_agent(
+            bundle=bundle,
+            logical_id=logical_id,
+            goal=str(event_record["goal"] or "resumed subagent"),
+            parent_agent=parent_agent,
+            continuation=continuation,
+        )
+        child._delegation_run_id = run_id
+        child._delegation_attempt_id = attempt_id
+        child._delegation_session_ref.update(
+            {"run_id": run_id, "attempt_id": attempt_id}
+        )
+        metadata = dict(child._delegation_runtime_metadata)
+        metadata.update(
+            {"child_session_id": bundle["prior_child_session_id"]}
+        )
+        child._delegation_runtime_metadata = dict(metadata)
+    except Exception as exc:
+        result = {
+            "status": "error",
+            "summary": None,
+            "error": f"{type(exc).__name__}: {exc}",
+            # Construction failed before the continuation session existed;
+            # keep the last persisted child segment as the retry anchor.
+            "child_session_id": bundle["prior_child_session_id"],
+            "api_calls": 0,
+            "duration_seconds": round(time.time() - dispatched_at, 2),
+        }
+        finish(result, "error")
+        return {
+            "status": "dispatch_failed",
+            "delegation_id": delegation_id,
+            "subagent_id": logical_id,
+            "run_id": run_id,
+            "attempt_id": attempt_id,
+            "attempt_number": reserved["attempt_number"],
+            "error": result["error"],
+        }
+
+    executor = _get_executor(max_async_children)
+
+    def worker() -> None:
+        result: Dict[str, Any]
+        status = "error"
+        try:
+            _repository().transition_attempt(
+                attempt_id, {"starting"}, "running", metadata=metadata
+            )
+            result = _delegate._run_single_child(
+                0,
+                str(event_record["goal"] or "resumed subagent"),
+                child=child,
+                parent_agent=parent_agent,
+                conversation_history=bundle["history"],
+                resume_message=message,
+                resume_workdir=metadata.get("workdir"),
+            )
+            status = str(result.get("status") or "error")
+        except Exception as exc:
+            logger.exception("Resumed delegation %s/%s crashed", delegation_id, logical_id)
+            result = {
+                "status": "error",
+                "summary": None,
+                "error": f"{type(exc).__name__}: {exc}",
+                "api_calls": 0,
+                "duration_seconds": round(time.time() - dispatched_at, 2),
+            }
+            status = "error"
+        finish(result, status)
+
+    try:
+        executor.submit(propagate_context_to_thread(worker))
+    except Exception as exc:
+        try:
+            child.close()
+        except Exception:
+            pass
+        result = {
+            "status": "error",
+            "summary": None,
+            "error": f"{type(exc).__name__}: {exc}",
+            # Submission failed before run_conversation could persist the new
+            # segment, so preserve the prior retry anchor.
+            "child_session_id": bundle["prior_child_session_id"],
+            "api_calls": 0,
+            "duration_seconds": round(time.time() - dispatched_at, 2),
+        }
+        finish(result, "error")
+        return {
+            "status": "dispatch_failed",
+            "delegation_id": delegation_id,
+            "subagent_id": logical_id,
+            "run_id": run_id,
+            "attempt_id": attempt_id,
+            "attempt_number": reserved["attempt_number"],
+            "error": result["error"],
+        }
+
+    return {
+        "status": "dispatched",
+        "delegation_id": delegation_id,
+        "subagent_id": logical_id,
+        "run_id": run_id,
+        "attempt_id": attempt_id,
+        "attempt_number": reserved["attempt_number"],
+        "child_session_id": continuation["session_id"],
     }
 
 

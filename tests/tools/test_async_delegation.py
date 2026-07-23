@@ -70,6 +70,268 @@ def _drain_for(delegation_id, timeout=5.0):
     return None
 
 
+def test_resume_reserves_exact_attempt_and_runs_with_hydrated_history(
+    tmp_path, monkeypatch
+):
+    from types import SimpleNamespace
+    import uuid
+    from hermes_state import SessionDB
+    from tools import delegate_tool
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    ad._reset_for_tests()
+    suffix = uuid.uuid4().hex
+    delegation_id = f"deleg-resume-e2e-{suffix}"
+    logical_id = f"sa-resume-e2e-{suffix}"
+    parent_session = f"parent-resume-e2e-{suffix}"
+    child_session = f"child-resume-e2e-{suffix}"
+    db = SessionDB()
+    db.create_session(parent_session, source="discord")
+    db.create_session(
+        child_session,
+        source="subagent",
+        parent_session_id=parent_session,
+        model_config={"_delegate_from": parent_session},
+    )
+    db.append_message(child_session, "user", "original child goal")
+    db.append_message(child_session, "assistant", "partial answer")
+
+    record = {
+        "delegation_id": delegation_id,
+        "goal": "finish the original task",
+        "goals": ["finish the original task"],
+        "context": None,
+        "toolsets": ["file"],
+        "role": "leaf",
+        "model": "test-model",
+        "session_key": parent_session,
+        "origin_ui_session_id": "ui-parent",
+        "parent_session_id": parent_session,
+        "status": "running",
+        "dispatched_at": time.time(),
+        "root_subagent_ids": [logical_id],
+        "is_batch": False,
+    }
+    ad._persist_dispatch(record)
+    initial_run = record["run_id"]
+    initial_attempt = record["attempt_ids"][0]
+    metadata = {
+        "child_session_id": child_session,
+        "parent_session_id": parent_session,
+        "model": "test-model",
+        "provider": "test-provider",
+        "role": "leaf",
+        "depth": 1,
+        "enabled_toolsets": ["file"],
+        "disabled_toolsets": ["delegation"],
+        "max_iterations": 7,
+    }
+    assert ad._repository().transition_attempt(
+        initial_attempt, {"starting"}, "completed", metadata=metadata
+    )["status"] == "updated"
+    assert ad._repository().complete_run(
+        initial_run,
+        {
+            "delegation_id": delegation_id,
+            "run_id": initial_run,
+            "status": "completed",
+            "completed_at": time.time(),
+        },
+        {"status": "completed", "summary": "partial answer"},
+    )["status"] == "completed"
+
+    submitted = []
+
+    class CapturingExecutor:
+        def submit(self, fn):
+            submitted.append(fn)
+            return SimpleNamespace()
+
+    monkeypatch.setattr(ad, "_get_executor", lambda _limit: CapturingExecutor())
+    continuation = {
+        "session_id": f"child-resume-e2e-next-{suffix}",
+        "parent_session_id": child_session,
+        "delegate_from": parent_session,
+    }
+    monkeypatch.setattr(
+        delegate_tool, "prepare_resumed_child_session", lambda _bundle: continuation
+    )
+    built = SimpleNamespace(
+        _delegation_session_ref={},
+        _delegation_runtime_metadata=dict(metadata),
+        close=lambda: None,
+    )
+    build_calls = []
+
+    def fake_build(**kwargs):
+        build_calls.append(kwargs)
+        return built
+
+    monkeypatch.setattr(delegate_tool, "build_resumed_child_agent", fake_build)
+    run_calls = []
+
+    def fake_run(*args, **kwargs):
+        run_calls.append((args, kwargs))
+        return {
+            "status": "completed",
+            "summary": "resumed result",
+            "api_calls": 1,
+            "duration_seconds": 0.1,
+            "model": "test-model",
+        }
+
+    monkeypatch.setattr(delegate_tool, "_run_single_child", fake_run)
+
+    dispatched = ad.dispatch_resumed_subagent(
+        delegation_id,
+        logical_id,
+        session_key=parent_session,
+        message="continue from the partial answer",
+        parent_agent=object(),
+    )
+    assert dispatched["status"] == "dispatched"
+    assert dispatched["attempt_number"] == 2
+    assert dispatched["run_id"] != initial_run
+    assert dispatched["attempt_id"] != initial_attempt
+    assert len(submitted) == 1
+    assert build_calls[0]["logical_id"] == logical_id
+
+    duplicate = ad.dispatch_resumed_subagent(
+        delegation_id,
+        logical_id,
+        session_key=parent_session,
+        message="duplicate resume",
+        parent_agent=object(),
+    )
+    assert duplicate == {
+        "status": "already_running",
+        "attempt_id": dispatched["attempt_id"],
+        "run_id": dispatched["run_id"],
+    }
+
+    submitted[0]()
+    assert run_calls[0][1]["resume_message"] == "continue from the partial answer"
+    assert [item["content"] for item in run_calls[0][1]["conversation_history"]] == [
+        "original child goal",
+        "partial answer",
+    ]
+    event = _drain_for(delegation_id)
+    assert event["run_id"] == dispatched["run_id"]
+    assert event["status"] == "completed"
+    assert event["summary"] == "resumed result"
+    resumed_snapshot = ad._repository().snapshot(
+        delegation_id, run_id=dispatched["run_id"]
+    )
+    assert resumed_snapshot["children"][logical_id]["status"] == "completed"
+
+
+def test_resume_construction_failure_is_terminal_and_retryable(monkeypatch):
+    from types import SimpleNamespace
+    from tools import delegate_tool
+
+    delegation_id = "deleg-resume-build-failure"
+    logical_id = "sa-resume-build-failure"
+    record = {
+        "delegation_id": delegation_id,
+        "goal": "retryable task",
+        "session_key": "owner",
+        "status": "running",
+        "dispatched_at": time.time(),
+        "root_subagent_ids": [logical_id],
+    }
+    ad._persist_dispatch(record)
+    initial_attempt = record["attempt_ids"][0]
+    metadata = {
+        "child_session_id": "child-last-good",
+        "parent_session_id": "owner",
+        "provider": "provider",
+        "model": "model",
+        "role": "leaf",
+        "depth": 1,
+    }
+    ad._repository().transition_attempt(
+        initial_attempt, {"starting"}, "completed", metadata=metadata
+    )
+    bundle = {
+        "prior_child_session_id": "child-last-good",
+        "history": [{"role": "user", "content": "goal"}],
+        "reconstruction_metadata": dict(metadata),
+    }
+    monkeypatch.setattr(
+        ad,
+        "load_subagent_resume_bundle",
+        lambda *a, **kw: {
+            "status": "ready",
+            "delegation_id": delegation_id,
+            "subagent_id": logical_id,
+            "bundle": bundle,
+        },
+    )
+    counter = iter(("child-failed-segment", "child-retry-segment"))
+    monkeypatch.setattr(
+        delegate_tool,
+        "prepare_resumed_child_session",
+        lambda _bundle: {
+            "session_id": next(counter),
+            "parent_session_id": "child-last-good",
+            "delegate_from": "owner",
+        },
+    )
+    monkeypatch.setattr(
+        delegate_tool,
+        "build_resumed_child_agent",
+        lambda **kwargs: (_ for _ in ()).throw(RuntimeError("constructor failed")),
+    )
+
+    failed = ad.dispatch_resumed_subagent(
+        delegation_id,
+        logical_id,
+        session_key="owner",
+        message="try again",
+        parent_agent=object(),
+    )
+    assert failed["status"] == "dispatch_failed"
+    assert failed["attempt_number"] == 2
+    failed_event = _drain_for(delegation_id)
+    assert failed_event["run_id"] == failed["run_id"]
+    assert failed_event["status"] == "error"
+    failed_snapshot = ad._repository().snapshot(
+        delegation_id, run_id=failed["run_id"]
+    )
+    failed_child = failed_snapshot["children"][logical_id]
+    assert failed_child["status"] == "error"
+    assert failed_child["child_session_id"] == "child-last-good"
+
+    submitted = []
+
+    class CapturingExecutor:
+        def submit(self, fn):
+            submitted.append(fn)
+            return SimpleNamespace()
+
+    monkeypatch.setattr(ad, "_get_executor", lambda _limit: CapturingExecutor())
+    monkeypatch.setattr(
+        delegate_tool,
+        "build_resumed_child_agent",
+        lambda **kwargs: SimpleNamespace(
+            _delegation_session_ref={},
+            _delegation_runtime_metadata=dict(metadata),
+            close=lambda: None,
+        ),
+    )
+    retried = ad.dispatch_resumed_subagent(
+        delegation_id,
+        logical_id,
+        session_key="owner",
+        message="retry after repaired config",
+        parent_agent=object(),
+    )
+    assert retried["status"] == "dispatched"
+    assert retried["attempt_number"] == 3
+    assert retried["child_session_id"] == "child-retry-segment"
+    assert len(submitted) == 1
+
+
 def test_dispatch_returns_immediately_without_blocking():
     gate = threading.Event()
 

@@ -120,6 +120,78 @@ def test_tool_schema_and_runtime_validation_are_strict():
         assert payload["error"]
 
 
+def test_resume_control_is_strict_and_forwards_live_parent(monkeypatch):
+    from tools.delegation_control import _handle_delegation_args, delegation_control
+    from tools.registry import registry
+
+    definitions = registry.get_definitions({"delegation"})
+    control = next(item for item in definitions if item["function"]["name"] == "delegation")
+    assert "resume" in control["function"]["parameters"]["properties"]["action"]["enum"]
+    for args in (
+        {"action": "resume", "delegation_id": "d", "message": "next"},
+        {"action": "resume", "delegation_id": "d", "subagent_id": "sa"},
+        {
+            "action": "resume",
+            "delegation_id": "d",
+            "subagent_id": "sa",
+            "message": "next",
+            "reason": "not allowed",
+        },
+    ):
+        assert json.loads(_handle_delegation_args(args))["status"] == "invalid_arguments"
+
+    repository, initial, attempt = _starting_steer_attempt(
+        "deleg-resume-control", "sa-resume-control"
+    )
+    repository.transition_attempt(
+        attempt["attempt_id"], {"starting"}, "completed"
+    )
+    captured = {}
+
+    def fake_dispatch(*args, **kwargs):
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        return {
+            "status": "dispatched",
+            "delegation_id": args[0],
+            "subagent_id": args[1],
+            "run_id": "run-new",
+            "attempt_id": "attempt-new",
+            "attempt_number": 2,
+            "child_session_id": "child-new",
+            "bundle": {"history": [{"reasoning": "never expose"}]},
+        }
+
+    monkeypatch.setattr(ad, "dispatch_resumed_subagent", fake_dispatch)
+    parent = object()
+    payload = json.loads(
+        delegation_control(
+            action="resume",
+            delegation_id="deleg-resume-control",
+            subagent_id="sa-resume-control",
+            message=" continue now ",
+            session_key="owner",
+            parent_agent=parent,
+        )
+    )
+    assert payload == {
+        "action": "resume",
+        "status": "dispatched",
+        "delegation_id": "deleg-resume-control",
+        "subagent_id": "sa-resume-control",
+        "run_id": "run-new",
+        "attempt_id": "attempt-new",
+        "attempt_number": 2,
+        "child_session_id": "child-new",
+    }
+    assert captured["kwargs"] == {
+        "session_key": "owner",
+        "message": "continue now",
+        "parent_agent": parent,
+    }
+    assert "reasoning" not in repr(payload)
+
+
 def _starting_steer_attempt(delegation_id: str, subagent_id: str):
     repository = ad._repository()
     initial = repository.register_initial_dispatch(

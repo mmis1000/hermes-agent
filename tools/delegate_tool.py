@@ -40,6 +40,7 @@ from toolsets import TOOLSETS
 # not natively known (named custom providers, third-party aggregators, etc.).
 # Must match hermes_cli.runtime_provider.RUNTIME_PROVIDER_TYPE_CUSTOM.
 _RUNTIME_PROVIDER_CUSTOM = "custom"
+_UNSET = object()
 from tools import file_state
 from tools.terminal_tool import set_approval_callback as _set_subagent_approval_cb
 from utils import base_url_hostname, is_truthy_value
@@ -1393,6 +1394,113 @@ def _json_safe_copy(value: Any) -> Any:
         return None
 
 
+def build_resumed_child_agent(
+    *,
+    bundle: Dict[str, Any],
+    logical_id: str,
+    goal: str,
+    parent_agent,
+    continuation: Optional[Dict[str, str]] = None,
+):
+    """Reconstruct a child using persisted non-secret policy and live credentials."""
+    if parent_agent is None:
+        raise ValueError("resume requires the live owning parent agent")
+    metadata = dict(bundle.get("reconstruction_metadata") or {})
+    model = str(metadata.get("model") or "").strip()
+    provider = str(metadata.get("provider") or "").strip()
+    if not model or not provider:
+        raise ValueError("saved child provider/model is unavailable")
+    continuation = continuation or prepare_resumed_child_session(bundle)
+    # Re-resolve credentials and approval policy from current authorized config;
+    # no persisted secret is ever accepted from the resume bundle.
+    credentials = _resolve_delegation_credentials(
+        {"provider": provider, "model": model}, parent_agent
+    )
+    child = _build_child_agent(
+        task_index=0,
+        goal=goal,
+        context=None,
+        toolsets=list(metadata.get("enabled_toolsets") or []),
+        model=model,
+        max_iterations=int(metadata.get("max_iterations") or 50),
+        task_count=1,
+        parent_agent=parent_agent,
+        override_provider=credentials.get("provider"),
+        override_base_url=credentials.get("base_url"),
+        override_api_key=credentials.get("api_key"),
+        override_api_mode=credentials.get("api_mode"),
+        override_request_overrides=credentials.get("request_overrides"),
+        override_max_tokens=(
+            metadata.get("max_tokens")
+            if isinstance(metadata.get("max_tokens"), int)
+            else credentials.get("max_output_tokens")
+        ),
+        override_acp_command=credentials.get("command"),
+        override_acp_args=credentials.get("args"),
+        required_disabled_toolsets=list(metadata.get("disabled_toolsets") or []),
+        workspace_override=metadata.get("workdir"),
+        reasoning_config_override=metadata.get("reasoning_config"),
+        fallback_model_override=list(metadata.get("fallback_routes") or []),
+        provider_preferences_override=metadata.get("provider_preferences"),
+        role=str(metadata.get("role") or "leaf"),
+    )
+
+    owner = continuation["delegate_from"]
+    prior = continuation["parent_session_id"]
+    session_id = continuation["session_id"]
+    parent_logical_id = metadata.get("parent_logical_id")
+    child.session_id = session_id
+    child._parent_session_id = prior
+    child._subagent_id = logical_id
+    child._parent_subagent_id = (
+        parent_logical_id if isinstance(parent_logical_id, str) else None
+    )
+    if isinstance(metadata.get("depth"), int):
+        child._delegate_depth = metadata["depth"]
+    child._delegate_role = str(metadata.get("role") or "leaf")
+    child._subagent_goal = goal
+    session_ref = {"session_id": session_id}
+    child._delegation_session_ref = session_ref
+    child._delegation_runtime_metadata = {
+        **metadata,
+        "child_session_id": session_id,
+        "parent_session_id": owner,
+        "enabled_toolsets": list(getattr(child, "enabled_toolsets", None) or []),
+        "disabled_toolsets": list(getattr(child, "disabled_toolsets", None) or []),
+        "reasoning_config": _json_safe_copy(
+            getattr(child, "reasoning_config", metadata.get("reasoning_config"))
+        ),
+        "fallback_routes": _json_safe_copy(
+            getattr(child, "_fallback_chain", metadata.get("fallback_routes"))
+        ),
+    }
+    if getattr(child, "_session_init_model_config", None) is not None:
+        child._session_init_model_config["_delegate_from"] = owner
+
+    # Rebuild the callback because the initial builder generated a throwaway
+    # logical/session identity before this exact resumed identity was known.
+    child_progress_cb = _build_child_progress_callback(
+        0,
+        goal,
+        parent_agent,
+        1,
+        subagent_id=logical_id,
+        parent_id=child._parent_subagent_id,
+        depth=max(0, int(getattr(child, "_delegate_depth", 1)) - 1),
+        model=model,
+        toolsets=list(getattr(child, "enabled_toolsets", None) or []),
+        session_ref=session_ref,
+    )
+    child.tool_progress_callback = child_progress_cb
+    if child_progress_cb:
+        def _resumed_thinking(text: str) -> None:
+            if text:
+                child_progress_cb("_thinking", text)
+
+        child.thinking_callback = _resumed_thinking
+    return child
+
+
 def prepare_resumed_child_session(bundle: Dict[str, Any]) -> Dict[str, str]:
     """Validate a hydration bundle and allocate a distinct child segment.
 
@@ -1462,6 +1570,11 @@ def _build_child_agent(
     # ACP transport overrides from trusted delegation config.
     override_acp_command: Optional[str] = None,
     override_acp_args: Optional[List[str]] = None,
+    required_disabled_toolsets: Optional[List[str]] = None,
+    workspace_override: Optional[str] = None,
+    reasoning_config_override: Any = _UNSET,
+    fallback_model_override: Any = _UNSET,
+    provider_preferences_override: Optional[Dict[str, Any]] = None,
     # Per-call role controlling whether the child can further delegate.
     # 'leaf' (default) cannot; 'orchestrator' retains the delegation
     # toolset subject to depth/kill-switch bounds applied below.
@@ -1558,7 +1671,9 @@ def _build_child_agent(
         ]
     child_disabled_toolsets = list(
         dict.fromkeys(
-            inherited_disabled + _blocked_toolsets_for_role(effective_role)
+            inherited_disabled
+            + list(required_disabled_toolsets or [])
+            + _blocked_toolsets_for_role(effective_role)
         )
     )
 
@@ -1569,7 +1684,7 @@ def _build_child_agent(
     if effective_role == "orchestrator" and "delegation" not in child_toolsets:
         child_toolsets.append("delegation")
 
-    workspace_hint = _resolve_workspace_hint(parent_agent)
+    workspace_hint = workspace_override or _resolve_workspace_hint(parent_agent)
     child_prompt = _build_child_system_prompt(
         goal,
         context,
@@ -1679,13 +1794,19 @@ def _build_child_agent(
 
     # Resolve reasoning config: delegation override > parent inherit
     parent_reasoning = getattr(parent_agent, "reasoning_config", None)
-    child_reasoning = parent_reasoning
+    child_reasoning = (
+        parent_reasoning
+        if reasoning_config_override is _UNSET
+        else _json_safe_copy(reasoning_config_override)
+    )
     try:
         # Keep the raw value — ``str(x or "")`` would coerce a YAML boolean
         # False (``reasoning_effort: false``) to "" and inherit the parent
         # instead of disabling thinking for children.
         delegation_effort = delegation_cfg.get("reasoning_effort")
-        if delegation_effort or delegation_effort is False:
+        if reasoning_config_override is _UNSET and (
+            delegation_effort or delegation_effort is False
+        ):
             from hermes_constants import parse_reasoning_effort
 
             parsed = parse_reasoning_effort(delegation_effort)
@@ -1703,7 +1824,11 @@ def _build_child_agent(
     # from rate-limits and credential exhaustion exactly like the top-level
     # agent does.  _fallback_chain is a list accepted by AIAgent's
     # fallback_model parameter (which handles both list and dict forms).
-    parent_fallback = getattr(parent_agent, "_fallback_chain", None) or None
+    parent_fallback = (
+        getattr(parent_agent, "_fallback_chain", None) or None
+        if fallback_model_override is _UNSET
+        else _json_safe_copy(fallback_model_override)
+    )
 
     # Inherit the parent's OpenRouter provider-preference filters by default
     # (so subagents routed to the same provider honour the same routing
@@ -1733,6 +1858,29 @@ def _build_child_agent(
         # Note: openrouter_min_coding_score is model-gated (only emitted on
         # openrouter/pareto-code), so we keep it inherited even when the
         # provider is overridden — it's a no-op on any other model.
+
+    if isinstance(provider_preferences_override, dict):
+        child_providers_allowed = _json_safe_copy(
+            provider_preferences_override.get("allowed")
+        )
+        child_providers_ignored = _json_safe_copy(
+            provider_preferences_override.get("ignored")
+        )
+        child_providers_order = _json_safe_copy(
+            provider_preferences_override.get("order")
+        )
+        child_provider_sort = _json_safe_copy(
+            provider_preferences_override.get("sort")
+        )
+        child_provider_require_parameters = bool(
+            provider_preferences_override.get("require_parameters", False)
+        )
+        child_provider_data_collection = str(
+            provider_preferences_override.get("data_collection") or ""
+        )
+        child_openrouter_min_coding_score = _json_safe_copy(
+            provider_preferences_override.get("openrouter_min_coding_score")
+        )
 
     child_max_tokens = (
         override_max_tokens
@@ -2222,6 +2370,9 @@ def _run_single_child(
     Returns a structured result dict.
     """
     child_start = time.monotonic()
+    conversation_history = _kwargs.pop("conversation_history", None)
+    user_message = _kwargs.pop("resume_message", goal)
+    resume_workdir = _kwargs.pop("resume_workdir", None)
 
     # Get the progress callback from the child agent
     child_progress_cb = getattr(child, "tool_progress_callback", None)
@@ -2394,7 +2545,14 @@ def _run_single_child(
         try:
             from tools.terminal_tool import get_session_cwd, record_session_cwd
 
-            record_session_cwd(child_task_id, get_session_cwd(parent_task_id))
+            inherited_cwd = get_session_cwd(parent_task_id)
+            if (
+                isinstance(resume_workdir, str)
+                and os.path.isabs(resume_workdir)
+                and os.path.isdir(resume_workdir)
+            ):
+                inherited_cwd = resume_workdir
+            record_session_cwd(child_task_id, inherited_cwd)
         except Exception as e:
             logger.debug("Child cwd seed failed: %s", e)
         wall_start = time.time()
@@ -2436,11 +2594,14 @@ def _run_single_child(
 
         def _run_with_thread_capture():
             _worker_thread_holder["t"] = threading.current_thread()
-            return child.run_conversation(
-                user_message=goal,
-                task_id=child_task_id,
-                stream_callback=_relay_child_text,
-            )
+            run_kwargs = {
+                "user_message": user_message,
+                "task_id": child_task_id,
+                "stream_callback": _relay_child_text,
+            }
+            if conversation_history is not None:
+                run_kwargs["conversation_history"] = conversation_history
+            return child.run_conversation(**run_kwargs)
 
         _child_future = _timeout_executor.submit(_run_with_thread_capture)
         try:

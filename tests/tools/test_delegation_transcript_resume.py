@@ -123,6 +123,115 @@ def test_follows_marked_child_compression_and_sanitizes_dangling_tool_tail(db):
     assert bundle["history"][-1]["content"] == "after compression"
 
 
+def test_reconstructed_child_uses_saved_policy_but_live_credentials(monkeypatch):
+    from types import SimpleNamespace
+    from tools import delegate_tool
+
+    captured = {}
+
+    def fake_resolve(config, parent_agent):
+        captured["credential_config"] = config
+        captured["credential_parent"] = parent_agent
+        return {
+            "provider": "test-provider",
+            "api_key": "live-key-never-persisted",
+            "base_url": "https://current.example",
+            "api_mode": "chat_completions",
+            "request_overrides": {"safe": True},
+            "max_output_tokens": 999,
+            "command": None,
+            "args": None,
+        }
+
+    def fake_build(**kwargs):
+        captured["build"] = kwargs
+        return SimpleNamespace(
+            session_id="throwaway",
+            _parent_session_id="throwaway-parent",
+            _subagent_id="throwaway-id",
+            _parent_subagent_id=None,
+            _delegate_depth=1,
+            _delegate_role="leaf",
+            _subagent_goal="",
+            _delegation_session_ref={},
+            _delegation_runtime_metadata={},
+            _session_init_model_config={},
+            enabled_toolsets=["file"],
+            tool_progress_callback=None,
+            thinking_callback=None,
+        )
+
+    callback = lambda *_args, **_kwargs: None
+    monkeypatch.setattr(delegate_tool, "_resolve_delegation_credentials", fake_resolve)
+    monkeypatch.setattr(delegate_tool, "_build_child_agent", fake_build)
+    monkeypatch.setattr(
+        delegate_tool, "_build_child_progress_callback", lambda *a, **kw: callback
+    )
+    parent = object()
+    bundle = {
+        "prior_child_session_id": "child-old",
+        "owner_parent_session_id": "parent-owner",
+        "reconstruction_metadata": {
+            "child_session_id": "child-old",
+            "parent_session_id": "parent-owner",
+            "parent_logical_id": "sa-parent",
+            "provider": "test-provider",
+            "model": "test-model",
+            "role": "leaf",
+            "depth": 2,
+            "enabled_toolsets": ["file"],
+            "disabled_toolsets": ["delegation", "terminal"],
+            "workdir": "/safe/workdir",
+            "max_iterations": 17,
+            "max_tokens": 321,
+            "reasoning_config": {"effort": "low"},
+            "fallback_routes": [{"provider": "fallback", "model": "fallback-model"}],
+            "provider_preferences": {"allowed": ["one"], "sort": "price"},
+        },
+    }
+    continuation = {
+        "session_id": "child-new",
+        "parent_session_id": "child-old",
+        "delegate_from": "parent-owner",
+    }
+
+    child = delegate_tool.build_resumed_child_agent(
+        bundle=bundle,
+        logical_id="sa-stable",
+        goal="finish it",
+        parent_agent=parent,
+        continuation=continuation,
+    )
+
+    assert captured["credential_config"] == {
+        "provider": "test-provider",
+        "model": "test-model",
+    }
+    assert captured["credential_parent"] is parent
+    build = captured["build"]
+    assert build["override_api_key"] == "live-key-never-persisted"
+    assert build["required_disabled_toolsets"] == ["delegation", "terminal"]
+    assert build["workspace_override"] == "/safe/workdir"
+    assert build["reasoning_config_override"] == {"effort": "low"}
+    assert build["fallback_model_override"] == [
+        {"provider": "fallback", "model": "fallback-model"}
+    ]
+    assert build["provider_preferences_override"] == {
+        "allowed": ["one"],
+        "sort": "price",
+    }
+    assert build["override_max_tokens"] == 321
+    assert child.session_id == "child-new"
+    assert child._parent_session_id == "child-old"
+    assert child._subagent_id == "sa-stable"
+    assert child._parent_subagent_id == "sa-parent"
+    assert child._delegate_depth == 2
+    assert child._session_init_model_config["_delegate_from"] == "parent-owner"
+    assert child._delegation_runtime_metadata["child_session_id"] == "child-new"
+    assert "live-key-never-persisted" not in repr(child._delegation_runtime_metadata)
+    assert child.tool_progress_callback is callback
+
+
 def test_async_loader_is_authorized_and_keeps_provider_history_internal(
     tmp_path, monkeypatch
 ):

@@ -12,7 +12,7 @@ from tools import delegate_tool as _delegate
 from tools.approval import get_current_session_key
 from tools.registry import registry
 
-_ACTIONS = {"list", "status", "tail", "wait", "steer", "interrupt", "abandon"}
+_ACTIONS = {"list", "status", "tail", "wait", "steer", "resume", "interrupt", "abandon"}
 _TOOL_FIELDS = {
     "action",
     "delegation_id",
@@ -29,6 +29,7 @@ _ACTION_FIELDS = {
     "tail": {"delegation_id", "subagent_id", "limit"},
     "wait": {"delegation_id", "timeout_seconds"},
     "steer": {"delegation_id", "subagent_id", "message"},
+    "resume": {"delegation_id", "subagent_id", "message"},
     "interrupt": {"delegation_id", "subagent_id", "cascade", "reason"},
     "abandon": {"delegation_id", "cascade", "reason"},
 }
@@ -112,12 +113,12 @@ def _validate(
         return f"Action {action!r} requires delegation_id."
     if subagent_id is not None and not subagent_id.strip():
         return "subagent_id must not be empty."
-    if action == "steer" and not str(subagent_id or "").strip():
-        return "Action 'steer' requires subagent_id."
+    if action in {"steer", "resume"} and not str(subagent_id or "").strip():
+        return f"Action {action!r} requires subagent_id."
     if message is not None and not isinstance(message, str):
         return "message must be a string."
-    if action == "steer" and not str(message or "").strip():
-        return "Action 'steer' requires a non-empty message."
+    if action in {"steer", "resume"} and not str(message or "").strip():
+        return f"Action {action!r} requires a non-empty message."
     if isinstance(message, str) and len(message) > _MAX_STEER_CHARS:
         return f"message must not exceed {_MAX_STEER_CHARS} characters."
     if timeout_seconds is not None:
@@ -305,6 +306,7 @@ def delegation_control(
     reason: Optional[str] = None,
     message: Optional[str] = None,
     session_key: Optional[str] = None,
+    parent_agent=None,
 ) -> str:
     """Execute one session-scoped delegation lifecycle action."""
     if not isinstance(action, str):
@@ -457,6 +459,26 @@ def delegation_control(
             ensure_ascii=False,
         )
 
+    if action == "resume":
+        resumed = _async.dispatch_resumed_subagent(
+            target,
+            str(child_target),
+            session_key=origin,
+            message=str(message).strip(),
+            parent_agent=parent_agent,
+        )
+        payload = {
+            "action": action,
+            **{
+                key: value
+                for key, value in resumed.items()
+                if key not in {"bundle", "error"}
+            },
+        }
+        if resumed.get("error"):
+            payload["error"] = _redact_reason(str(resumed["error"]))
+        return json.dumps(payload, ensure_ascii=False)
+
     use_cascade = True if cascade is None else cascade
     if not use_cascade:
         return json.dumps(
@@ -523,7 +545,7 @@ def delegation_control(
     return json.dumps(payload, ensure_ascii=False)
 
 
-def _handle_delegation_args(args: Dict[str, Any]) -> str:
+def _handle_delegation_args(args: Dict[str, Any], *, parent_agent=None) -> str:
     if not isinstance(args, dict):
         return _invalid("delegation", "arguments must be an object.")
     unknown = sorted(set(args) - _TOOL_FIELDS)
@@ -540,6 +562,7 @@ def _handle_delegation_args(args: Dict[str, Any]) -> str:
         cascade=args.get("cascade"),
         reason=args.get("reason"),
         message=args.get("message"),
+        parent_agent=parent_agent,
     )
 
 
@@ -550,7 +573,8 @@ DELEGATION_CONTROL_SCHEMA = {
         "Actions are session-scoped: list/status inspect lifecycle state, tail "
         "returns bounded assistant text and tool previews (never hidden reasoning), "
         "wait blocks for a bounded time and consumes an unclaimed completed result, "
-        "steer durably queues guidance for one exact live child attempt, "
+        "steer durably queues guidance for one exact live child attempt, resume "
+        "starts a new attempt from a terminal child's persisted transcript, "
         "interrupt requests a cooperative stop while preserving delivery, and "
         "abandon suppresses stale delivery before requesting interruption."
     ),
@@ -571,7 +595,7 @@ DELEGATION_CONTROL_SCHEMA = {
             "subagent_id": {
                 "type": "string",
                 "maxLength": _MAX_ID_CHARS,
-                "description": "Child filter/branch target; required for steer.",
+                "description": "Child filter/branch target; required for steer/resume.",
             },
             "timeout_seconds": {
                 "type": "number",
@@ -600,7 +624,7 @@ DELEGATION_CONTROL_SCHEMA = {
             "message": {
                 "type": "string",
                 "maxLength": _MAX_STEER_CHARS,
-                "description": "User guidance to queue for the exact current child attempt.",
+                "description": "Guidance for steer, or the next user instruction for resume.",
             },
         },
         "required": ["action"],
@@ -612,7 +636,9 @@ registry.register(
     name="delegation",
     toolset="delegation",
     schema=DELEGATION_CONTROL_SCHEMA,
-    handler=lambda args, **_kw: _handle_delegation_args(args),
+    handler=lambda args, **kw: _handle_delegation_args(
+        args, parent_agent=kw.get("parent_agent")
+    ),
     check_fn=check_delegation_control_requirements,
     emoji="🎛️",
     max_result_size_chars=24000,
