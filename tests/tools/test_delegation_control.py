@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import multiprocessing
+import os
 import threading
 import time
 from collections import OrderedDict
@@ -14,6 +16,9 @@ from tools import async_delegation as ad
 from tools import delegate_tool as dt
 from tools.process_registry import process_registry
 
+def _observe_interrupt(home, delegation_id, output):
+    os.environ["HERMES_HOME"] = home
+    output.put(ad.interrupt_async_delegation(delegation_id, session_key="owner", reason="observer"))
 
 @pytest.fixture(autouse=True)
 def isolated_state(tmp_path, monkeypatch):
@@ -29,7 +34,6 @@ def isolated_state(tmp_path, monkeypatch):
         dt._active_subagents.clear()
     while not process_registry.completion_queue.empty():
         process_registry.completion_queue.get_nowait()
-
 
 def _dispatch(runner, *, session_key="owner", roots=None, interrupt_fn=None):
     return ad.dispatch_async_delegation(
@@ -47,7 +51,6 @@ def _dispatch(runner, *, session_key="owner", roots=None, interrupt_fn=None):
         max_async_children=4,
     )
 
-
 def _wait_terminal(delegation_id, timeout=2.0):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -56,7 +59,6 @@ def _wait_terminal(delegation_id, timeout=2.0):
             return row
         time.sleep(0.005)
     raise AssertionError("delegation did not become terminal")
-
 
 def _interrupt_twice(monkeypatch, delegation_id, while_running=None):
     barrier = threading.Barrier(2)
@@ -89,7 +91,6 @@ def _interrupt_twice(monkeypatch, delegation_id, while_running=None):
         assert not thread.is_alive()
     return outcomes
 
-
 def test_tool_schema_and_runtime_validation_are_strict():
     import tools.delegation_control  # noqa: F401
     from tools.delegation_control import _handle_delegation_args, delegation_control
@@ -117,7 +118,6 @@ def test_tool_schema_and_runtime_validation_are_strict():
         assert payload["status"] == "invalid_arguments"
         assert payload["action"]
         assert payload["error"]
-
 
 def test_list_and_status_hide_foreign_session_like_unknown():
     release = threading.Event()
@@ -149,7 +149,6 @@ def test_list_and_status_hide_foreign_session_like_unknown():
         assert hidden == unknown | {"delegation_id": dispatched["delegation_id"]}
     finally:
         release.set()
-
 
 def test_tail_filters_reasoning_and_redacts_split_stream_secret():
     release = threading.Event()
@@ -202,7 +201,6 @@ def test_tail_filters_reasoning_and_redacts_split_stream_secret():
         release.set()
         dt._unregister_subagent("sa-tail")
 
-
 def test_starting_child_interrupt_is_queued_then_applied_once():
     runner_started = threading.Event()
     allow_registration = threading.Event()
@@ -252,7 +250,6 @@ def test_starting_child_interrupt_is_queued_then_applied_once():
         allow_registration.set()
         allow_finish.set()
 
-
 @pytest.mark.parametrize("supplied_attempt", ["stale", None, "", 17, "attempt_missing"])
 def test_invalid_attempt_registration_and_archive_fail_closed(supplied_attempt):
     repository = ad._repository()
@@ -297,7 +294,6 @@ def test_invalid_attempt_registration_and_archive_fail_closed(supplied_attempt):
     assert current["status"] == "starting"
     assert current.get("goal") == "original"
 
-
 def test_nested_child_without_attempt_id_allocates_propagates_and_archives_exact_id():
     repository = ad._repository()
     repository.register_initial_dispatch(
@@ -329,41 +325,51 @@ def test_nested_child_without_attempt_id_allocates_propagates_and_archives_exact
         attempt_id, "completed", 3
     )
 
-
-def test_interrupt_callback_failure_rolls_back_pending_marker_for_retry():
+def test_cross_process_interrupt_cannot_claim_owner_callback_success():
     release = threading.Event()
+    callback_entered, release_callback = threading.Event(), threading.Event()
     successful_calls = []
 
     def failed_interrupt():
+        callback_entered.set()
+        assert release_callback.wait(5)
         raise RuntimeError("signal failed")
 
     dispatched = _dispatch(
-        lambda: (release.wait(2), {"status": "completed", "summary": "done"})[1],
+        lambda: (release.wait(10), {"status": "completed", "summary": "done"})[1],
         roots=["sa-interrupt-retry"],
         interrupt_fn=failed_interrupt,
     )
     delegation_id = dispatched["delegation_id"]
     try:
-        first = ad.interrupt_async_delegation(
-            delegation_id, session_key="owner", reason="first"
-        )
-        assert first["status"] == "interrupt_failed"
+        owner_outcome = []
+        owner = threading.Thread(target=lambda: owner_outcome.append(
+            ad.interrupt_async_delegation(delegation_id, session_key="owner", reason="first")
+        ))
+        owner.start()
+        assert callback_entered.wait(2)
+        ctx = multiprocessing.get_context("spawn"); output = ctx.Queue()
+        observer = ctx.Process(target=_observe_interrupt, args=(os.environ["HERMES_HOME"], delegation_id, output))
+        observer.start()
+        observer.join(10)
+        assert observer.exitcode == 0
+        assert output.get(timeout=1)["status"] == "interrupt_unavailable"
+        release_callback.set()
+        owner.join(2)
+        assert owner_outcome[0]["status"] == "interrupt_failed"
         snapshot = ad.get_durable_delegation(delegation_id)
-        assert snapshot["state"] == "running"
-        assert snapshot["interrupt_requests"] == {}
+        assert (snapshot["state"], snapshot["interrupt_requests"]) == ("running", {})
 
         with ad._records_lock:
             ad._records[delegation_id]["interrupt_fn"] = lambda: successful_calls.append(True)
-        second = ad.interrupt_async_delegation(
+        assert ad.interrupt_async_delegation(
             delegation_id, session_key="owner", reason="second"
-        )
-        assert second["status"] == "interrupt_requested"
+        )["status"] == "interrupt_requested"
         assert successful_calls == [True]
         assert ad.take_pending_subagent_interrupt("sa-interrupt-retry") == (True, "second")
-        assert ad.take_pending_subagent_interrupt("sa-interrupt-retry") == (False, "")
     finally:
+        release_callback.set()
         release.set()
-
 
 def test_concurrent_interrupt_callbacks_serialize_failure_then_success(monkeypatch):
     release = threading.Event()
@@ -412,7 +418,6 @@ def test_concurrent_interrupt_callbacks_serialize_failure_then_success(monkeypat
     finally:
         release.set()
 
-
 def test_concurrent_idempotent_interrupt_waits_for_callback_owner(monkeypatch):
     release = threading.Event()
     callback_entered, release_callback = threading.Event(), threading.Event()
@@ -446,7 +451,6 @@ def test_concurrent_idempotent_interrupt_waits_for_callback_owner(monkeypatch):
         release_callback.set()
         release.set()
 
-
 def test_wait_consumes_result_and_registry_auto_delivery_drops_it():
     dispatched = _dispatch(lambda: {"status": "completed", "summary": "one owner"})
     _wait_terminal(dispatched["delegation_id"])
@@ -464,7 +468,6 @@ def test_wait_consumes_result_and_registry_auto_delivery_drops_it():
     assert waited["result"]["summary"] == "one owner"
     assert process_registry.drain_notifications(session_key="owner") == []
 
-
 def test_formatter_failure_releases_claim_and_defers_without_spin(monkeypatch):
     dispatched = _dispatch(lambda: {"status": "completed", "summary": "retry"})
     _wait_terminal(dispatched["delegation_id"])
@@ -477,7 +480,6 @@ def test_formatter_failure_releases_claim_and_defers_without_spin(monkeypatch):
     row = ad.get_durable_delegation(dispatched["delegation_id"])
     assert row["delivery_state"] == "pending"
     assert process_registry.completion_queue.qsize() == 1
-
 
 def test_cli_style_commit_failure_retries_bookkeeping_only(monkeypatch):
     dispatched = _dispatch(lambda: {"status": "completed", "summary": "retry ack"})
@@ -501,7 +503,6 @@ def test_cli_style_commit_failure_retries_bookkeeping_only(monkeypatch):
     assert process_registry.drain_notifications(session_key="owner") == []
     row = ad.get_durable_delegation(dispatched["delegation_id"])
     assert row["delivery_state"] == "delivered"
-
 
 @pytest.mark.asyncio
 async def test_gateway_ack_failure_retries_without_duplicate_injection(monkeypatch):

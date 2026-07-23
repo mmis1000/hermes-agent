@@ -13,7 +13,6 @@ import pytest
 
 from tools.delegation_repository import DelegationRepository
 
-
 def _released_schema(path: str) -> None:
     conn = sqlite3.connect(path)
     conn.execute(
@@ -46,7 +45,6 @@ def _released_schema(path: str) -> None:
     conn.commit()
     conn.close()
 
-
 def _open_snapshot(path: str, delegation_id: str, start, output) -> None:
     start.wait()
     try:
@@ -54,7 +52,6 @@ def _open_snapshot(path: str, delegation_id: str, start, output) -> None:
         output.put(("ok", snap["lifecycle_version"] if snap else None))
     except BaseException as exc:  # pragma: no cover - asserted in parent
         output.put(("error", f"{type(exc).__name__}: {exc}"))
-
 
 def _reserve_attempt(path: str, logical_id: str, worker_id: str, start, output) -> None:
     start.wait()
@@ -66,11 +63,9 @@ def _reserve_attempt(path: str, logical_id: str, worker_id: str, start, output) 
     except BaseException as exc:  # pragma: no cover - asserted in parent
         output.put({"status": "error", "error": f"{type(exc).__name__}: {exc}"})
 
-
 @pytest.fixture
 def repo(tmp_path: Path) -> DelegationRepository:
     return DelegationRepository(tmp_path / "state.db")
-
 
 def _record(delegation_id="deleg-1", roots=None, dispatched_at=10.0):
     roots = ["sa-root"] if roots is None else roots
@@ -86,7 +81,6 @@ def _record(delegation_id="deleg-1", roots=None, dispatched_at=10.0):
         "model": "test",
         "root_subagent_ids": roots,
     }
-
 
 def test_initial_single_and_batch_shape_preserves_root_order(repo):
     single = repo.register_initial_dispatch(_record())
@@ -107,7 +101,6 @@ def test_initial_single_and_batch_shape_preserves_root_order(repo):
     assert snap["state"] == "running"
     assert snap["children"]["sa-z"]["status"] == "starting"
 
-
 def test_batch_result_mapping_is_ordinal_not_uuid_order(repo):
     created = repo.register_initial_dispatch(_record(roots=["sa-z", "sa-a"]))
     result = {
@@ -124,7 +117,6 @@ def test_batch_result_mapping_is_ordinal_not_uuid_order(repo):
     assert children["sa-z"]["summary"] == "first"
     assert children["sa-a"]["status"] == "error"
     assert children["sa-a"]["error"] == "second"
-
 
 def test_concurrent_resume_has_one_winner(repo):
     initial = repo.register_initial_dispatch(_record())
@@ -151,7 +143,6 @@ def test_concurrent_resume_has_one_winner(repo):
     assert [outcome["status"] for outcome in outcomes].count("reserved") == 1
     assert [outcome["status"] for outcome in outcomes].count("already_running") == 7
 
-
 def test_stale_attempt_and_interrupt_cannot_poison_new_attempt(repo):
     initial = repo.register_initial_dispatch(_record())
     old_id = initial["attempts"][0]["attempt_id"]
@@ -166,7 +157,6 @@ def test_stale_attempt_and_interrupt_cannot_poison_new_attempt(repo):
     assert repo.take_interrupt(current["attempt_id"]) == {"status": "taken", "reason": "stop"}
     assert repo.take_interrupt(current["attempt_id"])["status"] == "not_pending"
     assert repo.snapshot("deleg-1")["children"]["sa-root"]["status"] == "interrupt_requested"
-
 
 def test_exact_run_completion_is_independent_of_newer_reserved_run(repo):
     initial = repo.register_initial_dispatch(_record())
@@ -192,7 +182,6 @@ def test_exact_run_completion_is_independent_of_newer_reserved_run(repo):
     assert snap["event"]["summary"] == "fresh"
     assert snap["result"]["summary"] == "fresh"
 
-
 def test_owner_recovery_is_exact_and_allows_later_reserve(repo):
     initial = repo.register_initial_dispatch(
         _record(), owner_pid=999999, owner_started_at=1
@@ -200,12 +189,26 @@ def test_owner_recovery_is_exact_and_allows_later_reserve(repo):
     attempt_id = initial["attempts"][0]["attempt_id"]
 
     recovered = repo.recover_orphaned_attempts(lambda _pid, _started: False)
-    assert recovered["attempt_ids"] == [attempt_id]
+    assert recovered["attempts"] == [{"attempt_id": attempt_id, "run_id": initial["run_id"], "delegation_id": "deleg-1"}]
     assert repo.snapshot("deleg-1")["children"]["sa-root"]["status"] == "unknown"
     resumed = repo.reserve_resumed_attempt("sa-root", owner_pid=123, owner_started_at=2)
     assert resumed["status"] == "reserved"
     assert resumed["attempt_number"] == 2
 
+def test_initial_registration_logical_conflict_rolls_back_every_row(repo):
+    repo.register_initial_dispatch(_record("deleg-existing", ["sa-collision"]))
+    rejected = _record("deleg-rejected", ["sa-collision"])
+    rejected.update(run_id="run-rejected", attempt_ids=["attempt-rejected"])
+    outcome = repo.register_initial_dispatch(rejected)
+    assert outcome["status"] == "conflict"
+    assert repo.register_initial_dispatch(_record("deleg-existing", ["sa-other"]))["status"] == "already_exists"
+    with sqlite3.connect(repo.db_path) as conn:
+        counts = conn.execute("""SELECT
+            (SELECT COUNT(*) FROM async_delegations WHERE delegation_id='deleg-rejected'),
+            (SELECT COUNT(*) FROM delegation_runs WHERE run_id='run-rejected'),
+            (SELECT COUNT(*) FROM delegation_logical_subagents WHERE delegation_id='deleg-rejected'),
+            (SELECT COUNT(*) FROM delegation_attempts WHERE attempt_id='attempt-rejected')""").fetchone()
+        assert counts == (0, 0, 0, 0)
 
 def test_legacy_migration_is_idempotent_and_preserves_disposition(tmp_path):
     path = tmp_path / "state.db"
@@ -264,7 +267,6 @@ def test_legacy_migration_is_idempotent_and_preserves_disposition(tmp_path):
             "SELECT lifecycle_version FROM async_delegations WHERE delegation_id='deleg-old'"
         ).fetchone()[0] == 2
 
-
 def test_released_schema_migrates_under_concurrent_process_open(tmp_path):
     path = tmp_path / "state.db"
     _released_schema(str(path))
@@ -293,7 +295,6 @@ def test_released_schema_migrates_under_concurrent_process_open(tmp_path):
 
     assert outcomes == [("ok", 2)] * 6
 
-
 def test_run_delivery_is_exact_and_omitted_run_fails_ambiguous(repo):
     initial = repo.register_initial_dispatch(_record())
     repo.complete_run(initial["run_id"], {"status": "completed"}, {"summary": "initial"})
@@ -309,7 +310,6 @@ def test_run_delivery_is_exact_and_omitted_run_fails_ambiguous(repo):
     assert repo.claim_run_delivery("deleg-1", None, "claim-3") == {
         "status": "ambiguous_run"
     }
-
 
 def test_retention_protects_active_attempts_and_nonterminal_delivery(repo):
     repo.register_initial_dispatch(_record("deleg-active", ["sa-active"], 1.0))
@@ -346,7 +346,6 @@ def test_retention_protects_active_attempts_and_nonterminal_delivery(repo):
     for state in ("delivered", "consumed", "suppressed"):
         assert repo.snapshot(f"deleg-{state}") is None
 
-
 def test_authorized_snapshot_derives_compatibility_fields(repo):
     created = repo.register_initial_dispatch(_record())
     attempt_id = created["attempts"][0]["attempt_id"]
@@ -365,24 +364,28 @@ def test_authorized_snapshot_derives_compatibility_fields(repo):
     assert own["owner_pid"] is None
     assert repo.snapshot("deleg-1", session_key="foreign") is None
 
+def test_list_snapshots_hydrates_one_hundred_records_with_one_connection(repo):
+    for index in range(100):
+        repo.register_initial_dispatch(_record(f"deleg-{index}", [f"sa-{index}"]))
+    opened, connect = 0, repo._connect
+    def counted_connect():
+        nonlocal opened
+        opened += 1; return connect()
+    repo._connect = counted_connect
+    assert len(repo.list_snapshots(limit=100)) == 100
+    assert opened == 1
 
-@pytest.mark.parametrize(
-    ("legacy_state", "expected"),
-    [
-        ("starting", "starting"), ("running", "running"),
-        ("finalizing", "finalizing"), ("interrupt_requested", "interrupt_requested"),
-        ("completed", "completed"), ("success", "completed"),
-        ("error", "error"), ("failed", "error"), ("budget_exhausted", "error"),
-        ("interrupted", "interrupted"), ("cancelled", "interrupted"),
-        ("timeout", "timeout"), ("mystery", "unknown"),
-    ],
-)
-@pytest.mark.parametrize(
-    "delivery", ["pending", "held_by_wait", "delivering", "delivered", "consumed", "suppressed"]
-)
-def test_released_migration_matrix_and_frozen_legacy_fields(
-    tmp_path, legacy_state, expected, delivery
-):
+@pytest.mark.parametrize(("legacy_state", "expected"), [
+    ("starting", "starting"), ("running", "running"), ("finalizing", "finalizing"),
+    ("interrupt_requested", "interrupt_requested"), ("completed", "completed"),
+    ("success", "completed"), ("error", "error"), ("failed", "error"),
+    ("budget_exhausted", "error"), ("interrupted", "interrupted"),
+    ("cancelled", "interrupted"), ("timeout", "timeout"), ("mystery", "unknown"),
+])
+@pytest.mark.parametrize("delivery", [
+    "pending", "held_by_wait", "delivering", "delivered", "consumed", "suppressed"
+])
+def test_released_migration_matrix_and_frozen_legacy_fields(tmp_path, legacy_state, expected, delivery):
     path = tmp_path / "state.db"
     _released_schema(str(path))
     claim = "legacy-claim" if delivery in {"held_by_wait", "delivering"} else None
@@ -415,7 +418,6 @@ def test_released_migration_matrix_and_frozen_legacy_fields(
     assert after["delivery_state"] == delivery
     assert after["event"] == before["event"]
 
-
 @pytest.mark.parametrize("repository_first", [True, False])
 def test_repository_and_session_db_bootstrap_in_either_order(tmp_path, repository_first):
     from hermes_state import SessionDB
@@ -430,7 +432,6 @@ def test_repository_and_session_db_bootstrap_in_either_order(tmp_path, repositor
         assert repository.snapshot("missing") is None
     assert repository.register_initial_dispatch(_record())["status"] == "registered"
     assert repository.snapshot("deleg-1")["lifecycle_version"] == 2
-
 
 def test_preallocated_ids_survive_registration_archive_completion_and_event(repo):
     record = _record()
@@ -451,7 +452,6 @@ def test_preallocated_ids_survive_registration_archive_completion_and_event(repo
     assert snapshot["children"]["sa-root"]["attempt_id"] == "attempt-preallocated"
     assert snapshot["children"]["sa-root"]["summary"] == "archived"
     assert repo.pending_events()[0] == {"run_id": "run-preallocated", "event": event}
-
 
 def test_repeated_multiprocess_resume_has_one_winner(tmp_path):
     path = tmp_path / "state.db"

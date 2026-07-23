@@ -168,18 +168,18 @@ def recover_abandoned_delegations() -> int:
             return False
         return started is None or get_process_start_time(pid) == int(started)
 
-    before = {
-        snap["delegation_id"]: snap
-        for snap in list_durable_delegations()
-        if snap["state"] in _ACTIVE_STATES
-    }
-    recovered = _repository().recover_orphaned_attempts(owner_alive)["attempt_ids"]
+    repository = _repository()
+    recovered = repository.recover_orphaned_attempts(owner_alive)["attempts"]
     if not recovered:
         return 0
     affected = 0
-    for delegation_id, old in before.items():
-        current = get_durable_delegation(delegation_id)
-        if not current or current["state"] != "unknown" or current["completed_at"] is not None:
+    runs = {(item["delegation_id"], item["run_id"]) for item in recovered}
+    for delegation_id, run_id in runs:
+        current = repository.snapshot(delegation_id, run_id=run_id)
+        if (
+            not current or current["completed_at"] is not None
+            or any(child["status"] in _ACTIVE_STATES for child in current["children"].values())
+        ):
             continue
         now = time.time()
         error = "Delegation owner exited before recording a terminal result; outcome unknown."
@@ -187,25 +187,25 @@ def recover_abandoned_delegations() -> int:
             "type": "async_delegation",
             "delivery_managed": True,
             "delegation_id": delegation_id,
-            "run_id": current["run_id"],
-            "session_key": old["session_key"],
-            "origin_ui_session_id": old["origin_ui_session_id"],
-            "parent_session_id": old["parent_session_id"],
-            "goal": old.get("goal", ""),
-            "goals": old.get("goals"),
-            "context": old.get("context"),
-            "toolsets": old.get("toolsets"),
-            "role": old.get("role"),
-            "model": old.get("model"),
-            "is_batch": bool(old.get("is_batch")),
+            "run_id": run_id,
+            "session_key": current["session_key"],
+            "origin_ui_session_id": current["origin_ui_session_id"],
+            "parent_session_id": current["parent_session_id"],
+            "goal": current.get("goal", ""),
+            "goals": current.get("goals"),
+            "context": current.get("context"),
+            "toolsets": current.get("toolsets"),
+            "role": current.get("role"),
+            "model": current.get("model"),
+            "is_batch": bool(current.get("is_batch")),
             "status": "unknown",
             "summary": None,
             "error": error,
-            "dispatched_at": old["dispatched_at"],
+            "dispatched_at": current["dispatched_at"],
             "completed_at": now,
         }
         result = {"status": "unknown", "summary": None, "error": error}
-        if _repository().complete_run(current["run_id"], event, result).get("status") == "completed":
+        if repository.complete_run(run_id, event, result).get("status") == "completed":
             affected += 1
     if affected:
         _notify_state_change()
@@ -527,8 +527,6 @@ def interrupt_async_delegation(
     with _records_lock:
         record = _records.get(delegation_id)
         if record is None or record.get("session_key", "") != session_key:
-            if snapshot["state"] == "interrupt_requested":
-                return {"status": "interrupt_requested", "delegation_id": delegation_id}
             return {"status": "interrupt_unavailable", "delegation_id": delegation_id}
         interrupt_lock = record.setdefault("_interrupt_lock", threading.Lock())
 
@@ -547,8 +545,6 @@ def interrupt_async_delegation(
         with _records_lock:
             current = _records.get(delegation_id)
             if current is not record or current.get("session_key", "") != session_key:
-                if snapshot["state"] == "interrupt_requested":
-                    return {"status": "interrupt_requested", "delegation_id": delegation_id}
                 return {"status": "interrupt_unavailable", "delegation_id": delegation_id}
             fn = current.get("interrupt_fn")
         if not callable(fn):

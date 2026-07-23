@@ -371,27 +371,32 @@ def test_pending_retention_prunes_delivered_before_undelivered(tmp_path, monkeyp
     assert ad.get_durable_delegation("deleg_2") is not None
 
 
-def test_recover_marks_abandoned_running_record_unknown(tmp_path, monkeypatch):
+def test_recovery_completes_exact_old_run_without_mutating_live_new_run(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     record = {
-        "delegation_id": "deleg_abandoned",
-        "session_key": "owner",
-        "origin_ui_session_id": "",
-        "parent_session_id": None,
-        "dispatched_at": 1.0,
+        "delegation_id": "deleg_abandoned", "session_key": "owner",
+        "origin_ui_session_id": "", "parent_session_id": None, "dispatched_at": 1.0,
     }
-    record["root_subagent_ids"] = ["sa-abandoned"]
-    assert ad._repository().register_initial_dispatch(
+    record["root_subagent_ids"] = ["sa-abandoned", "sa-resumed"]
+    repository = ad._repository()
+    initial = repository.register_initial_dispatch(
         record, owner_pid=99999999
-    )["status"] == "registered"
-
-    assert ad.recover_abandoned_delegations() == 1
-    durable = ad.get_durable_delegation("deleg_abandoned")
-    assert durable["state"] == "unknown"
-    assert durable["delivery_state"] == "pending"
+    )
+    repository.transition_attempt(
+        initial["attempts"][1]["attempt_id"], {"starting"}, "completed"
+    )
+    resumed = repository.reserve_resumed_attempt(
+        "sa-resumed", owner_pid=os.getpid(), physical_worker_id="worker-live"
+    )
     restored = queue.Queue()
     assert ad.restore_undelivered_completions(restored) == 1
-    assert restored.get_nowait()["status"] == "unknown"
+    event = restored.get_nowait()
+    assert (event["run_id"], event["status"]) == (initial["run_id"], "unknown")
+    assert repository.inspect_delivery("deleg_abandoned", initial["run_id"])["completed_at"]
+    live = repository.inspect_delivery("deleg_abandoned", resumed["run_id"])
+    assert live["completed_at"] is None
+    assert repository.snapshot("deleg_abandoned")["children"]["sa-resumed"]["status"] == "starting"
+    assert ad.recover_abandoned_delegations() == 0
 
 
 def test_durable_delivery_claim_is_exclusive_and_retryable(tmp_path, monkeypatch):

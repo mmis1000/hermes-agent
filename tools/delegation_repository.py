@@ -191,8 +191,8 @@ class DelegationRepository:
         now = time.time()
         dispatched = float(record.get("dispatched_at") or now)
         task = {key: record.get(key) for key in ("goal", "goals", "context", "toolsets", "role", "model", "is_batch") if key in record}
-        with self.write_txn() as conn:
-            try:
+        try:
+            with self.write_txn() as conn:
                 conn.execute(
                     "INSERT INTO async_delegations\n                       (delegation_id,origin_session,origin_ui_session_id,\n                        parent_session_id,state,dispatched_at,updated_at,\n                        delivery_state,delivery_attempts,task_json,lifecycle_version)\n                       VALUES (?,?,?,?,'running',?,?,'pending',0,?,2)",
                     (
@@ -223,8 +223,16 @@ class DelegationRepository:
                         "INSERT INTO delegation_attempts\n                           (attempt_id,logical_id,run_id,attempt_number,physical_worker_id,\n                            state,owner_pid,owner_started_at,created_at,updated_at,metadata_json)\n                           VALUES (?,?,?,1,?,'starting',?,?,?,?,'{}')",
                         (attempt_id, logical_id, run_id, logical_id, owner_pid, owner_started_at, dispatched, now),
                     )
-            except sqlite3.IntegrityError:
-                return {"status": "already_exists"}
+        except sqlite3.IntegrityError:
+            conn = self._connect()
+            try:
+                exists = conn.execute(
+                    "SELECT 1 FROM async_delegations WHERE delegation_id=?",
+                    (record["delegation_id"],),
+                ).fetchone()
+            finally:
+                conn.close()
+            return {"status": "already_exists" if exists else "conflict"}
         attempts = [
             {"attempt_id": attempt_id, "logical_id": logical_id, "attempt_number": 1} for logical_id, attempt_id in zip(roots, attempt_ids)
         ]
@@ -576,11 +584,11 @@ class DelegationRepository:
         return changed
 
     def recover_orphaned_attempts(self, owner_alive: Callable[[int, Optional[int]], bool]) -> Dict[str, Any]:
-        recovered: List[str] = []
+        recovered: List[Dict[str, str]] = []
         now = time.time()
         with self.write_txn() as conn:
             rows = conn.execute(
-                "SELECT a.* FROM delegation_attempts a\n                   WHERE a.state IN ('starting','running','finalizing','interrupt_requested')\n                     AND a.attempt_number=(SELECT MAX(x.attempt_number)\n                         FROM delegation_attempts x WHERE x.logical_id=a.logical_id)"
+                "SELECT a.*,l.delegation_id FROM delegation_attempts a\n                   JOIN delegation_logical_subagents l ON l.logical_id=a.logical_id\n                   WHERE a.state IN ('starting','running','finalizing','interrupt_requested')\n                     AND a.attempt_number=(SELECT MAX(x.attempt_number)\n                         FROM delegation_attempts x WHERE x.logical_id=a.logical_id)"
             ).fetchall()
             for row in rows:
                 pid = row["owner_pid"]
@@ -591,29 +599,53 @@ class DelegationRepository:
                     (now, now, row["attempt_id"], row["state"], pid, row["owner_started_at"]),
                 ).rowcount
                 if changed == 1:
-                    recovered.append(str(row["attempt_id"]))
-        return {"status": "recovered", "attempt_ids": recovered}
+                    recovered.append({key: str(row[key]) for key in (
+                        "attempt_id", "run_id", "delegation_id"
+                    )})
+        return {"status": "recovered", "attempts": recovered}
 
-    def snapshot(self, delegation_id: str, *, session_key: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    def snapshot(
+        self, delegation_id: str, *, session_key: Optional[str] = None,
+        run_id: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
         conn = self._connect()
         try:
-            params: List[Any] = [delegation_id]
-            owner_clause = ""
-            if session_key is not None:
-                owner_clause = " AND origin_session=?"
-                params.append(session_key)
-            container = conn.execute("SELECT * FROM async_delegations WHERE delegation_id=?" + owner_clause, params).fetchone()
-            if container is None:
-                return None
-            run = conn.execute(
-                "SELECT * FROM delegation_runs WHERE delegation_id=? ORDER BY run_number DESC LIMIT 1", (delegation_id,)
-            ).fetchone()
-            attempts = conn.execute(
-                "SELECT a.*,l.parent_logical_id,l.root_ordinal,l.spec_json\n                   FROM delegation_attempts a JOIN delegation_logical_subagents l\n                     ON l.logical_id=a.logical_id\n                   WHERE l.delegation_id=? AND a.attempt_number=(\n                     SELECT MAX(x.attempt_number) FROM delegation_attempts x\n                     WHERE x.logical_id=a.logical_id)\n                   ORDER BY l.root_ordinal IS NULL,l.root_ordinal,l.created_at,l.logical_id",
-                (delegation_id,),
-            ).fetchall()
+            return self._snapshot_with_conn(
+                conn, delegation_id, session_key=session_key, run_id=run_id
+            )
         finally:
             conn.close()
+
+    def _snapshot_with_conn(
+        self, conn: sqlite3.Connection, delegation_id: str, *,
+        session_key: Optional[str] = None, run_id: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        params: List[Any] = [delegation_id]
+        owner_clause = ""
+        if session_key is not None:
+            owner_clause = " AND origin_session=?"
+            params.append(session_key)
+        container = conn.execute(
+            "SELECT * FROM async_delegations WHERE delegation_id=?" + owner_clause, params
+        ).fetchone()
+        if container is None:
+            return None
+        run = conn.execute(
+            "SELECT * FROM delegation_runs WHERE delegation_id=?"
+            + (" AND run_id=?" if run_id else " ORDER BY run_number DESC LIMIT 1"),
+            (delegation_id, run_id) if run_id else (delegation_id,),
+        ).fetchone()
+        if run_id and run is None:
+            return None
+        attempt_clause = (
+            "a.run_id=?" if run_id else
+            "a.attempt_number=(SELECT MAX(x.attempt_number) FROM delegation_attempts x WHERE x.logical_id=a.logical_id)"
+        )
+        attempts = conn.execute(
+            "SELECT a.*,l.parent_logical_id,l.root_ordinal,l.spec_json\n               FROM delegation_attempts a JOIN delegation_logical_subagents l\n                 ON l.logical_id=a.logical_id\n               WHERE l.delegation_id=? AND " + attempt_clause +
+            " ORDER BY l.root_ordinal IS NULL,l.root_ordinal,l.created_at,l.logical_id",
+            (delegation_id, run_id) if run_id else (delegation_id,),
+        ).fetchall()
         children: Dict[str, Dict[str, Any]] = {}
         roots: List[str] = []
         active_states: List[str] = []
@@ -707,9 +739,12 @@ class DelegationRepository:
                     f"SELECT delegation_id FROM async_delegations {where} ORDER BY dispatched_at DESC,delegation_id LIMIT ?", params
                 )
             ]
+            return [
+                snap for item in ids
+                if (snap := self._snapshot_with_conn(conn, item)) is not None
+            ]
         finally:
             conn.close()
-        return [snap for item in ids if (snap := self.snapshot(item)) is not None]
 
     def prune(self, *, cutoff: float, max_terminal: int) -> Dict[str, Any]:
         with self.write_txn() as conn:
