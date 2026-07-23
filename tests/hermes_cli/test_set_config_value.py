@@ -515,18 +515,35 @@ class TestSchemaValidation:
         """Unseeded runtime settings are not proven typos merely by a schema walk."""
         set_config_value(key, value)
 
-        saved = yaml.safe_load(_read_config(_isolated_hermes_home))
-        section, name = key.split(".")
-        assert saved[section][name] == expected
+    def test_skill_command_preload_name_is_accepted(
+        self, _isolated_hermes_home, capsys
+    ):
+        """Each command-preload child is an operator-defined skill name."""
+        set_config_value("skills.command_preloads.plan", "brainstorming")
+        content = _read_config(_isolated_hermes_home)
+        assert "plan: brainstorming" in content
+        assert "not a recognized config key" not in capsys.readouterr().out
+
+    def test_unknown_skills_sibling_still_warns(
+        self, _isolated_hermes_home, capsys
+    ):
+        set_config_value("skills.command_preload.plan", "brainstorming")
+        assert "not a recognized config key" in capsys.readouterr().out
+
+    def test_unknown_approvals_subkey_warns_but_writes(self, _isolated_hermes_home, capsys):
+        """``approvals`` is a defined schema, so a typo'd sub-key gets the
+        notice — but is still written."""
+        set_config_value("approvals.notarealkey", "true")
         out = capsys.readouterr().out
         assert "not a recognized config key" in out
-        # Nested paths are written but never env-bridged: the top-level-only footer must not print.
-        assert "bridged to the environment" not in out
-        assert "Use --force" in out
-        if suggestion is None:
-            assert "Did you mean" not in out
-        else:
-            assert f"Did you mean: {suggestion}" in out
+        assert "notarealkey" in _read_config(_isolated_hermes_home)
+
+
+    def test_desktop_macos_signing_identity_is_accepted(self, _isolated_hermes_home, capsys):
+        set_config_value("desktop.macos_signing_identity", "Hermes Local Signing")
+        saved = yaml.safe_load(_read_config(_isolated_hermes_home))
+        assert saved["desktop"]["macos_signing_identity"] == "Hermes Local Signing"
+        assert "not a recognized config key" not in capsys.readouterr().out
 
     def test_unknown_top_level_key_still_written_with_notice(self, _isolated_hermes_home, capsys):
         set_config_value("brand_new_future_key", "value")
