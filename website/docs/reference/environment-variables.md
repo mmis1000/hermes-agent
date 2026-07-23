@@ -192,6 +192,20 @@ Environment variables for the bundled [`observability/langfuse`](/user-guide/fea
 | `HERMES_LANGFUSE_DEBUG` | `true` enables verbose plugin logging to `agent.log` |
 | `LANGFUSE_PUBLIC_KEY` / `LANGFUSE_SECRET_KEY` / `LANGFUSE_BASE_URL` | Standard Langfuse SDK names. Accepted as fallbacks when the `HERMES_LANGFUSE_*` equivalents are unset. |
 
+### Local Token Usage Report
+
+Environment variables for the bundled
+[`observability/token_usage_report`](/user-guide/features/built-in-plugins#observabilitytoken_usage_report)
+plugin. The plugin is file-only and must be enabled separately with
+`hermes plugins enable observability/token_usage_report`.
+
+| Variable | Description |
+|----------|-------------|
+| `HERMES_TOKEN_USAGE_REPORT_DIR` | Override the report directory (default: `$HERMES_HOME/reports/token_usage`). |
+| `HERMES_TOKEN_USAGE_REPORT_MAX_EVENTS` | Recent JSONL events scanned when rebuilding the Markdown summary (default: `20000`). |
+| `HERMES_TOKEN_USAGE_REPORT_RECENT_ROWS` | Recent request rows shown in the summary (default: `25`). |
+| `HERMES_TOKEN_USAGE_REPORT_TARGETS` | Comma-separated exact reasoning-token values to count (default: `516,1034,1552`; these are diagnostic targets, not caps). |
+
 ### Nous Tool Gateway
 
 These variables configure the [Tool Gateway](/user-guide/features/tool-gateway) for paid Nous subscribers or self-hosted gateway deployments. Most users don't need to set these — the gateway is configured automatically via `hermes model` or `hermes tools`.
@@ -208,6 +222,7 @@ These variables configure the [Tool Gateway](/user-guide/features/tool-gateway) 
 | Variable | Description |
 |----------|-------------|
 | `TERMINAL_ENV` | Backend: `local`, `docker`, `ssh`, `singularity`, `modal`, `daytona` |
+| `HERMES_CHILD_OOM_SCORE_ADJ` | Linux `oom_score_adj` for supported Hermes-launched tool/browser/process children (default: `300`, valid: `1..1000`, `0` disables). Does not set a memory limit or report memory use. |
 | `HERMES_DOCKER_BINARY` | Override the container binary Hermes shells out to (e.g. `podman`, `/usr/local/bin/docker`). When unset, Hermes auto-discovers `docker` or `podman` on `PATH`. Needed when both are installed and you want the non-default, or when the binary lives outside `PATH`. |
 | `TERMINAL_DOCKER_IMAGE` | Docker image (default: `nikolaik/python-nodejs:python3.11-nodejs20`) |
 | `TERMINAL_DOCKER_FORWARD_ENV` | JSON array of env var names to explicitly forward into Docker terminal sessions. Note: skill-declared `required_environment_variables` are forwarded automatically — you only need this for vars not declared by any skill. |

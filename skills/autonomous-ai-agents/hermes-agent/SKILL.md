@@ -386,7 +386,7 @@ Edit with `hermes config edit` or `hermes config set section.key value`.
 | Section | Key options |
 |---------|-------------|
 | `model` | `default`, `provider`, `base_url`, `api_key`, `context_length` |
-| `agent` | `max_turns` (90), `tool_use_enforcement` |
+| `agent` | `max_turns` (90), `max_iteration_auto_continue_chain` (8), `tool_use_enforcement` |
 | `terminal` | `backend` (local/docker/ssh/modal), `cwd`, `timeout` (180) |
 | `compression` | `enabled`, `threshold` (0.50), `target_ratio` (0.20) |
 | `display` | `skin`, `interface` (cli/tui), `tool_progress`, `show_reasoning`, `show_cost`, `language` |
@@ -396,10 +396,63 @@ Edit with `hermes config edit` or `hermes config set section.key value`.
 | `security` | `tirith_enabled`, `website_blocklist` |
 | `delegation` | `model`, `provider`, `base_url`, `api_key`, `max_iterations` (50), `reasoning_effort` |
 | `skills` | `external_dirs`, `command_preloads`, `template_vars`, `inline_shell` |
+| `task_intents` | opt-in `relationship_judge` and `status_guard` micro-judges |
 | `checkpoints` | `enabled`, `max_snapshots` (50) |
 | `curator` | `enabled`, `consolidate` (false — opt-in aux-model skill consolidation), `interval_hours`, `stale_after_days` |
 
 Full config reference: https://hermes-agent.nousresearch.com/docs/user-guide/configuration
+
+### Long tasks, intent guards, and resource evidence
+
+**Iteration-budget exhaustion (gateway):** `agent.max_turns` is one pass, not
+necessarily the whole task. When a clean pass reaches its limit, Hermes runs a
+bounded, tool-free review and may continue from the saved transcript. Each
+continuation is reviewed again; queued real user messages take priority. Use
+`agent.max_iteration_auto_continue_chain` to cap extra passes (`8` by default,
+`0` to disable). Do not tell users to increase `max_turns` merely because one
+healthy long task reached the limit; first distinguish forward progress from a
+stuck/repetitive loop.
+
+**Raw task intent:** gateway sessions preserve exact inbound user wording before
+platform wrappers. Do not replace that source contract with a summary. By
+default, ambiguous follow-ups do not destructively replace or cancel the active
+task. Two optional, tool-free judges are available:
+
+```yaml
+task_intents:
+  relationship_judge:
+    enabled: true       # classify direct-user follow-ups conservatively
+  status_guard:
+    enabled: true       # check final status/coverage claims before delivery
+```
+
+Both default off and add an auxiliary model call. The relationship judge never
+rewrites task text and treats malformed/unclear output as no destructive change.
+The status guard checks the complete buffered final draft against a bounded,
+secret-redacted operation synopsis; interim progress delivery still works. If it
+rejects a draft, Hermes sends an explicit blocked-response warning and next step.
+Recommend these guards when task-boundary mistakes or unsupported completion
+claims are a measured problem, not as a universal latency-free default.
+
+**Linux memory pressure:** supported terminal/background/browser children get
+`oom_score_adj=300` by default, making them more disposable than the long-lived
+Hermes parent. Override with `HERMES_CHILD_OOM_SCORE_ADJ=1..1000`; set `0` to
+disable. This is a Linux process-environment setting, so gateway-service changes
+require a restart. It is not a memory limit and must not be used to infer how much
+RAM or VRAM a child consumed.
+
+**Local token evidence:** enable `observability/token_usage_report` when diagnosing
+per-request or reasoning-token behavior without an external telemetry service:
+
+```bash
+hermes plugins enable observability/token_usage_report
+# restart the gateway or start a new CLI session
+```
+
+Read `$HERMES_HOME/reports/token_usage/latest.md` for the rolling summary and
+`events.jsonl` for raw request rows. The default `516,1034,1552` reasoning-token
+counts are diagnostic target boundaries, not caps. Environment overrides are
+documented on the Built-in Plugins page and in the plugin README.
 
 ### Providers
 

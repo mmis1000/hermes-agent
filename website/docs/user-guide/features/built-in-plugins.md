@@ -59,6 +59,7 @@ The repo ships these bundled plugins under `plugins/`. All are opt-in — enable
 | `security-guidance` | hooks | Pattern-match dangerous code on `write_file`/`patch` and append a security warning (or block) — 25 rules (Apache-2.0 fork of Anthropic's `claude-plugins-official` patterns) |
 | `observability/langfuse` | hooks | Trace turns / LLM calls / tools to [Langfuse](https://langfuse.com) |
 | `observability/nemo_relay` | hooks | Relay observability events (turns / LLM calls / tools) to an NVIDIA NeMo endpoint |
+| `observability/token_usage_report` | hooks | Write per-request token events and a rolling local Markdown report |
 | `teams_pipeline` | standalone | Microsoft Teams meeting pipeline — Graph-backed, transcript-first meeting summaries |
 | `spotify` | backend (7 tools) | Native Spotify playback, queue, search, playlists, albums, library |
 | `google_meet` | standalone | Join Meet calls, live-caption transcription, optional realtime duplex audio |
@@ -202,6 +203,40 @@ Hermes-prefixed and standard SDK env vars (`LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECR
 **Performance:** the Langfuse client is cached after the first hook call. If credentials or SDK are missing, that decision is also cached — subsequent hooks fast-return without re-checking env vars or reloading config.
 
 **Disabling:** `hermes plugins disable observability/langfuse`. The plugin module is still discovered, but no module code runs until you re-enable.
+
+### observability/token_usage_report
+
+Writes local, file-only token usage telemetry after each model request. It needs
+no external service, credentials, or optional dependency.
+
+```bash
+hermes plugins enable observability/token_usage_report
+# restart the gateway or start a new CLI session
+```
+
+The default outputs are:
+
+- `$HERMES_HOME/reports/token_usage/events.jsonl` — append-only request events
+- `$HERMES_HOME/reports/token_usage/latest.md` — rolling per-model summary and
+  recent-request table
+
+The summary includes reasoning-token statistics and exact-boundary counts for
+`516`, `1034`, and `1552` by default. Those boundaries are diagnostic defaults,
+not token limits.
+
+Optional environment tuning:
+
+| Variable | Default | Purpose |
+|---|---:|---|
+| `HERMES_TOKEN_USAGE_REPORT_DIR` | `$HERMES_HOME/reports/token_usage` | Override the output directory |
+| `HERMES_TOKEN_USAGE_REPORT_MAX_EVENTS` | `20000` | Recent JSONL events scanned when rebuilding `latest.md` |
+| `HERMES_TOKEN_USAGE_REPORT_RECENT_ROWS` | `25` | Recent request rows shown in the Markdown report |
+| `HERMES_TOKEN_USAGE_REPORT_TARGETS` | `516,1034,1552` | Comma-separated exact reasoning-token values to count |
+
+Use this plugin when you need local evidence about model/token behavior without
+shipping prompts or usage records to another observability service. Disable it
+with `hermes plugins disable observability/token_usage_report`; existing report
+files are retained.
 
 ### google_meet
 
