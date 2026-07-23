@@ -347,6 +347,56 @@ def _starting_steer_attempt(delegation_id: str, subagent_id: str):
     return repository, initial, initial["attempts"][0]
 
 
+def test_deterministic_dispatch_steer_complete_resume_interrupt_smoke():
+    suffix = uuid.uuid4().hex
+    delegation_id = f"deleg-lifecycle-smoke-{suffix}"
+    child_id = f"sa-lifecycle-smoke-{suffix}"
+    repository, initial, first = _starting_steer_attempt(
+        delegation_id, child_id
+    )
+    steered = repository.enqueue_steer(
+        delegation_id, child_id, "owner", "finish with the latest constraint"
+    )
+    assert steered["status"] == "accepted"
+
+    assert repository.transition_attempt(
+        first["attempt_id"],
+        {"starting"},
+        "completed",
+        metadata={"child_session_id": f"child-smoke-{suffix}"},
+    )["status"] == "updated"
+    assert repository.complete_run(
+        initial["run_id"],
+        {"type": "async_delegation", "delegation_id": delegation_id,
+         "run_id": initial["run_id"], "status": "completed"},
+        {"status": "completed", "summary": "first completion"},
+    )["status"] == "completed"
+
+    resumed = repository.reserve_resumed_attempt(
+        child_id,
+        physical_worker_id=child_id,
+        owner_pid=os.getpid(),
+        metadata={"child_session_id": f"child-smoke-{suffix}"},
+    )
+    assert resumed["status"] == "reserved"
+    assert resumed["attempt_number"] == 2
+    assert resumed["attempt_id"] != first["attempt_id"]
+    assert resumed["run_id"] != initial["run_id"]
+    current = repository.find_attempt(
+        child_id, delegation_id=delegation_id, session_key="owner"
+    )
+    assert current["attempt_id"] == resumed["attempt_id"]
+    assert current["logical_id"] == child_id
+
+    interrupted = repository.request_interrupt(
+        resumed["attempt_id"], "stop resumed attempt"
+    )
+    assert interrupted["status"] == "interrupt_requested"
+    snapshot = repository.snapshot(delegation_id, session_key="owner")
+    assert snapshot["children"][child_id]["attempt_id"] == resumed["attempt_id"]
+    assert snapshot["children"][child_id]["status"] == "interrupt_requested"
+
+
 def test_steer_queues_while_starting_then_forwards_in_order_and_acks_injection():
     from tools.delegation_control import delegation_control
 
