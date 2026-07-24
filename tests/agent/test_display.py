@@ -209,6 +209,93 @@ class TestBuildToolPreview:
         assert result == "2 tasks: AAAAAAAAAAAAAAAAAA..."
         assert len(result) == 30
 
+    @pytest.mark.parametrize(
+        ("action", "extra", "expected"),
+        [
+            ("list", {}, "list"),
+            ("status", {}, "status"),
+            ("tail", {}, "tail"),
+            ("wait", {"timeout_seconds": 30}, "wait · 30s"),
+            ("steer", {"message": "Focus on the lifecycle tests"}, "steer: Focus on the lifecycle tests"),
+            ("resume", {"message": "Continue from the saved transcript"}, "resume: Continue from the saved transcript"),
+            ("interrupt", {"reason": "superseded by newer work"}, "interrupt: superseded by newer work"),
+            ("abandon", {"reason": "obsolete branch"}, "abandon: obsolete branch"),
+        ],
+    )
+    def test_delegation_preview_shows_action_and_relevant_detail(self, action, extra, expected):
+        result = build_tool_preview("delegation", {"action": action, **extra})
+        assert result == expected
+
+    def test_delegation_preview_collapses_multiline_message(self):
+        result = build_tool_preview(
+            "delegation",
+            {"action": "steer", "message": "Focus on tests\nthen inspect   the diff"},
+        )
+        assert result == "steer: Focus on tests then inspect the diff"
+
+    def test_delegation_preview_force_redacts_message_secrets(self):
+        secret = "sk-proj-abcdefghijklmnopqrstuvwxyz123456"
+        result = build_tool_preview(
+            "delegation",
+            {"action": "resume", "message": f"Continue with token {secret}"},
+        )
+        assert result is not None
+        assert secret not in result
+        assert "abcdefghijklmnopqrstuvwxyz" not in result
+        assert "sk-pro...3456" in result
+
+    def test_delegation_display_args_redact_without_mutating_execution_args(self):
+        secret = "sk-proj-abcdefghijklmnopqrstuvwxyz123456"
+        raw = {
+            "action": "interrupt",
+            "message": f"Use {secret}",
+            "reason": f"Superseded after {secret}",
+        }
+        safe = redact_tool_args_for_display("delegation", raw)
+        assert isinstance(safe, dict)
+        assert safe is not raw
+        assert secret in raw["message"]
+        assert secret in raw["reason"]
+        assert secret not in safe["message"]
+        assert secret not in safe["reason"]
+
+    @pytest.mark.parametrize("detail_key", ["message", "reason"])
+    def test_delegation_preview_redacts_secrets_in_malformed_detail_values(self, detail_key):
+        secret = "sk-proj-abcdefghijklmnopqrstuvwxyz123456"
+        action = "resume" if detail_key == "message" else "interrupt"
+        raw_detail = ["Continue", {"token": secret}]
+        args = {"action": action, detail_key: raw_detail}
+
+        result = build_tool_preview("delegation", args)
+
+        assert result is not None
+        assert secret not in result
+        assert "abcdefghijklmnopqrstuvwxyz" not in result
+        assert args[detail_key] is raw_detail
+        assert secret in raw_detail[1]["token"]
+
+    def test_delegation_preview_respects_complete_preview_limit(self):
+        result = build_tool_preview(
+            "delegation",
+            {"action": "steer", "message": "A" * 80},
+            max_len=24,
+        )
+        assert result == "steer: AAAAAAAAAAAAAA..."
+        assert len(result) == 24
+
+    @pytest.mark.parametrize(
+        "args",
+        [{}, {"action": None}, {"action": 123}, {"action": "launch"}],
+    )
+    def test_delegation_preview_uses_manage_for_missing_or_malformed_action(self, args):
+        assert build_tool_preview("delegation", args) == "manage"
+
+    def test_delegation_preview_normalizes_supported_action(self):
+        assert build_tool_preview(
+            "delegation",
+            {"action": "  STEER  ", "message": "Focus on tests"},
+        ) == "steer: Focus on tests"
+
     def test_false_like_args_zero(self):
         """Non-dict falsy values should return None, not crash."""
         assert build_tool_preview("terminal", 0) is None
@@ -217,6 +304,16 @@ class TestBuildToolPreview:
 
 
 class TestCuteToolMessagePreviewLength:
+
+    def test_delegation_completion_shows_action_and_message(self):
+        line = get_cute_tool_message(
+            "delegation",
+            {"action": "steer", "message": "Focus on lifecycle tests"},
+            0.1,
+        )
+        assert "steer" in line
+        assert "Focus on lifecycle tests" in line
+
     def test_terminal_preview_unlimited_when_config_is_zero(self):
         set_tool_preview_max_len(0)
         command = "curl -s http://localhost:9222/json/list | jq -r '.[] | select(.type==\"page\")' | head -5"
@@ -441,6 +538,17 @@ class TestBuildToolLabel:
         from agent.display import build_tool_label
         label = build_tool_label("browser_navigate", {"url": "https://news.site"})
         assert label == "Browsing https://news.site"
+
+    def test_delegation_label_includes_action_and_message(self):
+        from agent.display import build_status_phrase, build_tool_label
+
+        args = {"action": "steer", "message": "Focus on lifecycle tests"}
+        assert build_tool_label("delegation", args) == (
+            "Controlling delegation steer: Focus on lifecycle tests"
+        )
+        assert build_status_phrase("delegation", args, max_len=100) == (
+            "is controlling delegation steer: Focus on lifecycle tests…"
+        )
 
     def test_read_file_uses_basename(self):
         from agent.display import build_tool_label

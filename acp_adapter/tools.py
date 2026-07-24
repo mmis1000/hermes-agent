@@ -51,6 +51,7 @@ TOOL_KIND_MAP: Dict[str, ToolKind] = {
     "browser_get_images": "read",
     # Agent internals
     "delegate_task": "execute",
+    "delegation": "execute",
     "vision_analyze": "read",
     "image_generate": "execute",
     "text_to_speech": "execute",
@@ -61,7 +62,7 @@ TOOL_KIND_MAP: Dict[str, ToolKind] = {
 
 _POLISHED_TOOLS = {
     # Core operator loop
-    "todo", "memory", "session_search", "delegate_task",
+    "todo", "memory", "session_search", "delegate_task", "delegation",
     # Files / execution
     "read_file", "write_file", "patch", "search_files", "terminal", "process", "execute_code",
     # Skills / web / browser / media
@@ -132,6 +133,11 @@ def build_tool_title(tool_name: str, args: Dict[str, Any]) -> str:
         if goal and len(goal) > 60:
             goal = goal[:57] + "..."
         return f"delegate: {goal}" if goal else "delegate task"
+    if tool_name == "delegation":
+        from agent.display import build_tool_preview
+
+        preview = build_tool_preview(tool_name, args, max_len=80)
+        return f"delegation: {preview}" if preview else "delegation"
     if tool_name == "session_search":
         query = str(args.get("query") or "").strip()
         return f"session search: {query}" if query else "recent sessions"
@@ -1250,6 +1256,16 @@ def _build_tool_start(
             content = [_text("Delegating task" + (f":\n{_truncate_text(goal, limit=800)}" if goal else ""))]
         return acp.start_tool_call(
             tool_call_id, title, kind=kind, content=content, locations=locations,
+        )
+
+    if tool_name == "delegation":
+        from agent.display import build_tool_preview
+
+        preview = build_tool_preview(tool_name, arguments, max_len=500)
+        content = [_text(preview)] if preview else None
+        return acp.start_tool_call(
+            tool_call_id, title, kind=kind, content=content, locations=locations,
+            raw_input=None,
         )
 
     if tool_name == "session_search":

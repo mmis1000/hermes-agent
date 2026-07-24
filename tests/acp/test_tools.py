@@ -147,6 +147,13 @@ class TestBuildToolTitle:
         )
         assert title == "skill patch: hermes-agent-operations/references/acp.md"
 
+    def test_delegation_title_includes_action_and_message(self):
+        title = build_tool_title(
+            "delegation",
+            {"action": "resume", "message": "Continue from the saved transcript"},
+        )
+        assert title == "delegation: resume: Continue from the saved transcript"
+
     def test_unknown_tool_uses_name(self):
         title = build_tool_title("some_new_tool", {"foo": "bar"})
         assert title == "some_new_tool"
@@ -295,6 +302,33 @@ class TestBuildToolStart:
         assert result.title == "python: print('hello')"
         assert "```python" in result.content[0].content.text
         assert "print('hello')" in result.content[0].content.text
+        assert result.raw_input is None
+
+    def test_build_tool_start_for_delegation_uses_redacted_action_preview(self):
+        secret = "sk-proj-abcdefghijklmnopqrstuvwxyz123456"
+        result = build_tool_start(
+            "tc-delegation",
+            "delegation",
+            {"action": "resume", "message": f"Continue with token {secret}"},
+        )
+        rendered = str(result)
+        assert result.kind == "execute"
+        assert "resume" in result.title
+        assert secret not in rendered
+        assert "abcdefghijklmnopqrstuvwxyz" not in rendered
+        assert result.raw_input is None
+
+    def test_build_tool_start_for_delegation_redacts_malformed_message(self):
+        secret = "sk-proj-abcdefghijklmnopqrstuvwxyz123456"
+        result = build_tool_start(
+            "tc-delegation-malformed",
+            "delegation",
+            {"action": "resume", "message": [{"token": secret}]},
+        )
+        rendered = str(result)
+        assert result.title.startswith("delegation: resume:")
+        assert secret not in rendered
+        assert "abcdefghijklmnopqrstuvwxyz" not in rendered
         assert result.raw_input is None
 
     def test_build_tool_start_for_skill_manage_patch_shows_diff(self):

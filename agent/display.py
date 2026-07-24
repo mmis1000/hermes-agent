@@ -390,16 +390,23 @@ def redact_browser_typed_text_for_display(value: Any, typed_text: Any) -> Any:
 def redact_tool_args_for_display(tool_name: str, args: dict | None) -> dict | None:
     """Return a copy of tool args safe for logs/progress UI.
 
-    For ``browser_type`` the ``text`` argument is run through the same
-    secret-pattern redactor used for logs.  Recognizable credentials (API
-    keys, tokens) are masked before the value reaches tool progress
-    notifications; normal typed text is left intact for debuggability.
+    ``browser_type`` and delegation control messages are run through the same
+    secret-pattern redactor used for logs. Recognizable credentials (API keys,
+    tokens) are masked before values reach tool progress notifications; normal
+    text is left intact for debuggability. Delegation values are stringified in
+    the display-only copy so malformed model arguments cannot bypass redaction.
     """
     if not isinstance(args, dict):
         return args
     if tool_name == "browser_type" and isinstance(args.get("text"), str):
         safe_args = dict(args)
         safe_args["text"] = redact_sensitive_text(args["text"], force=True)
+        return safe_args
+    if tool_name == "delegation":
+        safe_args = dict(args)
+        for key in ("message", "reason"):
+            if safe_args.get(key) is not None:
+                safe_args[key] = redact_sensitive_text(str(safe_args[key]), force=True)
         return safe_args
     return args
 
@@ -417,6 +424,41 @@ def _delegate_task_goal_parts(tasks: Any, *, per_goal_len: int) -> tuple[int, li
     return len(goals), goals
 
 
+_DELEGATION_ACTIONS = frozenset({
+    "abandon", "interrupt", "list", "resume", "status", "steer", "tail", "wait",
+})
+
+
+def _delegation_action_preview(args: dict, *, max_len: int | None) -> str:
+    """Summarize a durable delegation control without hiding its action."""
+    raw_action = args.get("action")
+    action = _oneline(raw_action).lower() if isinstance(raw_action, str) else "manage"
+    if action not in _DELEGATION_ACTIONS:
+        action = "manage"
+    preview = action
+
+    detail_key = None
+    if action in {"steer", "resume"}:
+        detail_key = "message"
+    elif action in {"interrupt", "abandon"}:
+        detail_key = "reason"
+
+    if detail_key is not None and args.get(detail_key) is not None:
+        detail = redact_sensitive_text(_oneline(str(args[detail_key])), force=True)
+        if detail:
+            preview = f"{action}: {detail}"
+    elif action == "wait":
+        timeout_seconds = args.get("timeout_seconds")
+        if (
+            isinstance(timeout_seconds, (int, float))
+            and not isinstance(timeout_seconds, bool)
+            and timeout_seconds > 0
+        ):
+            preview = f"wait · {timeout_seconds:g}s"
+
+    return _truncate_preview(preview, max_len)
+
+
 def build_tool_preview(tool_name: str, args: dict, max_len: int | None = None) -> str | None:
     """Build a short preview of a tool call's primary argument for display.
 
@@ -425,6 +467,11 @@ def build_tool_preview(tool_name: str, args: dict, max_len: int | None = None) -
     """
     if max_len is None:
         max_len = _tool_preview_max_len
+    if tool_name == "delegation":
+        safe_args = redact_tool_args_for_display(
+            tool_name, args if isinstance(args, dict) else {},
+        ) or {}
+        return _delegation_action_preview(safe_args, max_len=max_len)
     if not args:
         return None
     args = redact_tool_args_for_display(tool_name, args) or args
@@ -589,6 +636,7 @@ _TOOL_VERBS: dict[str, str] = {
     "skills_list": "Listing skills",
     "skill_manage": "Updating skill",
     "delegate_task": "Delegating",
+    "delegation": "Controlling delegation",
     "cronjob": "Scheduling",
     "clarify": "Asking",
     "memory": "Updating memory",
@@ -1485,6 +1533,9 @@ def _get_cute_tool_message(
             count_label = task_count or len(tasks)
             return _wrap(f"┊ 🔀 delegate  {count_label}x: {_trunc(detail, 35)}  {dur}")
         return _wrap(f"┊ 🔀 delegate  {_trunc(args.get('goal', ''), 35)}  {dur}")
+    if tool_name == "delegation":
+        preview = build_tool_preview(tool_name, args) or "manage"
+        return _wrap(f"┊ 🔀 control   {_trunc(preview, 35)}  {dur}")
 
     preview = build_tool_preview(tool_name, args) or ""
     return _wrap(f"┊ ⚡ {tool_name[:9]:9} {_trunc(preview, 35)}  {dur}")
