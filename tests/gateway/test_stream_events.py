@@ -88,6 +88,36 @@ def test_tool_call_chunk_renders_default_chrome():
     assert "ls -la" in lines[0]
 
 
+def test_delegation_tool_chrome_shows_action_and_message():
+    from agent.display import build_tool_preview
+
+    lines = []
+    d = GatewayEventDispatcher(
+        _base_adapter(), _FakeSink(),
+        enqueue_tool_line=lines.append, tool_mode="all", preview_max_len=80,
+    )
+    args = {"action": "steer", "message": "Focus on lifecycle tests"}
+    d.dispatch(ToolCallChunk(
+        tool_name="delegation",
+        preview=build_tool_preview("delegation", args),
+        args=args,
+    ))
+    assert len(lines) == 1
+    assert 'delegation: "steer: Focus on lifecycle tests"' in lines[0]
+
+
+def test_tool_preview_truncated_to_cap():
+    lines = []
+    d = GatewayEventDispatcher(
+        _base_adapter(), _FakeSink(),
+        enqueue_tool_line=lines.append, tool_mode="all", preview_max_len=10,
+    )
+    d.dispatch(ToolCallChunk(tool_name="x", preview="0123456789ABCDEF"))
+    # capped at 10 → 7 chars + "..." (then wrapped in quotes by the renderer)
+    assert '"0123456..."' in lines[0]
+    assert "89ABCDEF" not in lines[0]
+
+
 def test_new_mode_dedups_same_tool():
     lines = []
     d = GatewayEventDispatcher(
