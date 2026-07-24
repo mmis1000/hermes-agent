@@ -328,11 +328,26 @@ def redact_browser_typed_text_for_display(value: Any, typed_text: Any) -> Any:
 
 
 def redact_tool_args_for_display(tool_name: str, args: dict | None) -> dict | None:
-    """Return a copy of tool args safe for logs/progress UI (masks ``browser_type`` secrets)."""
+    """Return a copy of tool args safe for logs/progress UI.
+
+    ``browser_type`` and delegation control messages are run through the same
+    secret-pattern redactor used for logs. Recognizable credentials (API keys,
+    tokens) are masked before values reach tool progress notifications; normal
+    text is left intact for debuggability. Delegation values are stringified in
+    the display-only copy so malformed model arguments cannot bypass redaction.
+    """
     if not isinstance(args, dict):
         return args
     if tool_name == "browser_type" and isinstance(args.get("text"), str):
-        return {**args, "text": redact_sensitive_text(args["text"], force=True)}
+        safe_args = dict(args)
+        safe_args["text"] = redact_sensitive_text(args["text"], force=True)
+        return safe_args
+    if tool_name in {"delegate_task", "delegation"}:
+        safe_args = dict(args)
+        for key in ("message", "reason"):
+            if safe_args.get(key) is not None:
+                safe_args[key] = redact_sensitive_text(str(safe_args[key]), force=True)
+        return safe_args
     return args
 
 
@@ -474,6 +489,41 @@ _PREVIEW_BUILDERS = {
 }
 
 
+_DELEGATION_ACTIONS = frozenset({
+    "abandon", "interrupt", "list", "resume", "status", "steer", "tail", "wait",
+})
+
+
+def _delegation_action_preview(args: dict, *, max_len: int | None) -> str:
+    """Summarize a durable delegation control without hiding its action."""
+    raw_action = args.get("action")
+    action = _oneline(raw_action).lower() if isinstance(raw_action, str) else "manage"
+    if action not in _DELEGATION_ACTIONS:
+        action = "manage"
+    preview = action
+
+    detail_key = None
+    if action in {"steer", "resume"}:
+        detail_key = "message"
+    elif action in {"interrupt", "abandon"}:
+        detail_key = "reason"
+
+    if detail_key is not None and args.get(detail_key) is not None:
+        detail = redact_sensitive_text(_oneline(str(args[detail_key])), force=True)
+        if detail:
+            preview = f"{action}: {detail}"
+    elif action == "wait":
+        timeout_seconds = args.get("timeout_seconds")
+        if (
+            isinstance(timeout_seconds, (int, float))
+            and not isinstance(timeout_seconds, bool)
+            and timeout_seconds > 0
+        ):
+            preview = f"wait · {timeout_seconds:g}s"
+
+    return _tail_trunc(preview, max_len)
+
+
 def build_tool_preview(tool_name: str, args: dict, max_len: int | None = None) -> str | None:
     """Build a short preview of a tool call's primary argument for display.
 
@@ -481,6 +531,8 @@ def build_tool_preview(tool_name: str, args: dict, max_len: int | None = None) -
     """
     if max_len is None:
         max_len = _tool_preview_max_len
+    if tool_name in {"delegate_task", "delegation"} and str((args or {}).get("action") or "").strip().lower() in _DELEGATION_ACTIONS:
+        return _delegation_action_preview(redact_tool_args_for_display(tool_name, args) or {}, max_len=max_len)
     if not args:
         return None
     args = redact_tool_args_for_display(tool_name, args) or args
@@ -1128,7 +1180,7 @@ def _cute_browser_exec(a: dict, _r) -> str:
 
 
 def _cute_delegate(a: dict, _r) -> str:
-    action_preview = _delegate_action_preview(a)
+    action_preview = _delegation_action_preview(a, max_len=_tool_preview_max_len) if str(a.get("action") or "").strip().lower() in _DELEGATION_ACTIONS else _delegate_action_preview(a)
     tasks = a.get("tasks")
     if action_preview is not None:
         return _cute_row("🔀", "delegate", _cute_trunc(action_preview))
@@ -1253,3 +1305,6 @@ def get_cute_tool_message(tool_name: str, args: dict, duration: float, result: s
         safe_duration = f"{duration:.1f}s" if isinstance(duration, (int, float)) else t("display.cute.fallback_done")
         return t("display.cute.completed", tool=f"{safe_name:9}", duration=safe_duration)
 
+
+
+_CUTE_LINES["delegation"] = lambda args, result: "┊ 🔀 control   " + str(build_tool_preview("delegation", args) or "manage")

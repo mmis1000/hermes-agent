@@ -23,7 +23,7 @@ TOOL_KIND_MAP: Dict[str, ToolKind] = {
         "edit": ("write_file", "patch", "skill_manage"),
         "search": ("search_files",),
         "execute": ("terminal", "process", "execute_code", "browser_click", "browser_type", "browser_scroll",
-                    "browser_press", "browser_back", "delegate_task", "image_generate", "text_to_speech"),
+                    "browser_press", "browser_back", "delegate_task", "delegation", "image_generate", "text_to_speech"),
         "fetch": ("web_search", "web_extract", "browser_navigate"),
         "other": ("todo",),
         "think": ("_thinking",),
@@ -35,7 +35,7 @@ TOOL_KIND_MAP: Dict[str, ToolKind] = {
 # suppressed for these); unknown/plugin tools stay conservative.
 _POLISHED_TOOLS = {
     # Core operator loop
-    "todo", "memory", "session_search", "delegate_task",
+    "todo", "memory", "session_search", "delegate_task", "delegation",
     # Files / execution
     "read_file", "write_file", "patch", "search_files", "terminal", "process", "execute_code",
     # Skills / web / browser / media
@@ -194,6 +194,8 @@ def build_tool_title(tool_name: str, args: Args) -> str:
     """``<tool_name>: <preview>`` using the same per-tool preview (and argument redaction) as
     every other Hermes surface, so ACP clients never show a different summary than the CLI/TUI;
     bare tool name when the arguments yield no preview."""
+    if tool_name == "delegation":
+        return "delegation: " + (build_tool_preview(tool_name, args, max_len=80) or "manage")
     preview = build_tool_preview(tool_name, args, max_len=80)
     return f"{tool_name}: {preview}" if preview else tool_name
 
@@ -796,7 +798,14 @@ def build_tool_start(tool_call_id: str, tool_name: str, arguments: Args, *, edit
 
 def _build_tool_start(tool_call_id: str, tool_name: str, arguments: Args, *, edit_diff: Any = None) -> ToolCallStart:
     """Build the ToolCallStart event (unguarded; see ``build_tool_start``)."""
+    if tool_name == "skill_manage" and arguments.get("action") == "patch":
+        name = str(arguments.get("name") or "")
+        file_path = str(arguments.get("file_path") or "SKILL.md")
+        return acp.start_tool_call(tool_call_id, f"skill patch: {name}/{file_path}", kind="edit",
+            content=[acp.tool_diff_content(path=f"skills/{name}/{file_path}", old_text=str(arguments.get("old_string") or ""), new_text=str(arguments.get("new_string") or ""))], raw_input=None)
     raw_input = None
+    if tool_name == "delegation":
+        return acp.start_tool_call(tool_call_id, build_tool_title(tool_name, arguments), kind=get_tool_kind(tool_name), content=[_text(build_tool_preview(tool_name, arguments, max_len=500) or "manage")], locations=extract_locations(arguments), raw_input=None)
     if tool_name in ("patch", "write_file") and edit_diff is not None:
         content = [acp.tool_diff_content(path=edit_diff.path, old_text=edit_diff.old_text, new_text=edit_diff.new_text)]
     elif tool_name in _START_CONTENT_BUILDERS:
