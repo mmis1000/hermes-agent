@@ -1307,4 +1307,4 @@ def get_cute_tool_message(tool_name: str, args: dict, duration: float, result: s
 
 
 
-_CUTE_LINES["delegation"] = lambda args, result: "┊ 🔀 control   " + str(build_tool_preview("delegation", args) or "manage")
+_CUTE_LINES["delegation"] = lambda args, result: "┊ 🎛️ control   " + str(build_tool_preview("delegation", args) or "manage")
