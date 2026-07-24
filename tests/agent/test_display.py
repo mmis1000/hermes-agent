@@ -311,6 +311,7 @@ class TestCuteToolMessagePreviewLength:
             {"action": "steer", "message": "Focus on lifecycle tests"},
             0.1,
         )
+        assert line.startswith("┊ 🎛️ control")
         assert "steer" in line
         assert "Focus on lifecycle tests" in line
 

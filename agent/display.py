@@ -1535,7 +1535,7 @@ def _get_cute_tool_message(
         return _wrap(f"┊ 🔀 delegate  {_trunc(args.get('goal', ''), 35)}  {dur}")
     if tool_name == "delegation":
         preview = build_tool_preview(tool_name, args) or "manage"
-        return _wrap(f"┊ 🔀 control   {_trunc(preview, 35)}  {dur}")
+        return _wrap(f"┊ 🎛️ control   {_trunc(preview, 35)}  {dur}")
 
     preview = build_tool_preview(tool_name, args) or ""
     return _wrap(f"┊ ⚡ {tool_name[:9]:9} {_trunc(preview, 35)}  {dur}")
