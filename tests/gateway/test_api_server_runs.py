@@ -2614,3 +2614,5 @@ class TestRunEventsHeadFlush:
             assert first, "no body byte arrived before the first event"
 
             resp.close()
+
+from agent.delegation_policy import DelegationSessionPolicy, ExecutionProfile

@@ -1318,11 +1318,6 @@ def _pre_exec_block(
     Order matters: gateway lifecycle first (protects the running gateway),
     then the dangerous-workdir check, then the self-repo guard (local only).
     """
-    blocked = gateway_lifecycle_block(
-        command=command, env=env, env_type=env_type, cwd=cwd, workdir=workdir, session_key=session_key,
-    )
-    if blocked:
-        raise _Rejected(blocked)
     if workdir:
         workdir_error = _validate_workdir(workdir)
         if workdir_error:

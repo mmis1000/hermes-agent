@@ -25,6 +25,8 @@ from __future__ import annotations
 
 
 
+
+
 def test_otlp_attrs_redact_strings_and_never_export_profile():
     from agent.monitoring.otlp_exporter import _span_attrs
 
