@@ -1,4 +1,5 @@
 import asyncio
+import shutil
 import subprocess
 import time
 from datetime import datetime
@@ -300,12 +301,13 @@ async def test_restart_from_served_profile_chat_restarts_the_host_gateway(monkey
     assert seen == {"stop_home": launch_home, "stop_secret_scope": None}
 
 
-@pytest.mark.platforms("windows")
 @pytest.mark.asyncio
 async def test_windows_detached_restart_scrubs_gateway_marker(monkeypatch, tmp_path):
     """Faking sys.platform="win32" on Linux could not reach the real Windows
     detach branch (msvcrt/creationflags spawn, Lib/site-packages venv layout);
     this runs on the Windows CI job instead."""
+    import gateway.run_shutdown as shutdown_owner
+    monkeypatch.setattr(shutdown_owner.sys, "platform", "win32")
     runner, _adapter = make_restart_runner()
     popen_calls = []
 

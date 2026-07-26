@@ -388,6 +388,9 @@ class TestGeneratedSystemdUnits:
         monkeypatch.setattr(
             resource_limits, "configured_nofile_soft_limit", lambda config=None: None
         )
+        unit = gateway_cli.generate_systemd_unit(
+            system=True, run_as_user="root"
+        )
 
         plist = gateway_cli.generate_launchd_plist()
 
@@ -1519,6 +1522,7 @@ class TestHermesHomeForTargetUser:
         monkeypatch.setattr(Path, "home", staticmethod(lambda: Path("/root")))
         monkeypatch.delenv("HERMES_HOME", raising=False)
 
+        monkeypatch.setattr(gateway_cli, "get_hermes_home", lambda: Path("/root/.hermes"))
         result = gateway_cli._hermes_home_for_target_user("/home/alice")
         assert result == "/home/alice/.hermes"
 
@@ -1534,7 +1538,9 @@ class TestGeneratedUnitIncludesLocalBin:
             "_build_user_local_paths",
             lambda home_path, existing: [str(home_path / ".local" / "bin")],
         )
-        unit = gateway_cli.generate_systemd_unit(system=True)
+        unit = gateway_cli.generate_systemd_unit(
+            system=True, run_as_user="root"
+        )
         # System unit uses the resolved home dir from _system_service_identity
         assert "/.local/bin" in unit
 

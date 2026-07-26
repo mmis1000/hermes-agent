@@ -390,6 +390,116 @@ def test_systemd_install_checks_linger_status(monkeypatch, tmp_path):
 
 
 
+@pytest.mark.parametrize(
+    ("requested_system", "user_installed", "system_installed", "expected"),
+    [
+        (True, False, False, True),
+        (False, False, True, True),
+        (False, True, False, False),
+        (False, True, True, False),
+        (False, False, False, False),
+    ],
+)
+def test_select_systemd_scope(
+    monkeypatch,
+    tmp_path,
+    requested_system,
+    user_installed,
+    system_installed,
+    expected,
+):
+    user_unit = tmp_path / "user" / "hermes-gateway.service"
+    system_unit = tmp_path / "system" / "hermes-gateway.service"
+    if user_installed:
+        user_unit.parent.mkdir(parents=True)
+        user_unit.write_text("[Unit]\n", encoding="utf-8")
+    if system_installed:
+        system_unit.parent.mkdir(parents=True)
+        system_unit.write_text("[Unit]\n", encoding="utf-8")
+
+    monkeypatch.setattr(
+        gateway,
+        "get_systemd_unit_path",
+        lambda system=False: system_unit if system else user_unit,
+    )
+
+    assert gateway._select_systemd_scope(requested_system) is expected
+
+
+@pytest.mark.parametrize(
+    ("subcommand", "backend_name"),
+    [
+        ("start", "systemd_start"),
+        ("stop", "systemd_stop"),
+        ("restart", "systemd_restart"),
+    ],
+)
+def test_existing_service_lifecycle_uses_sole_system_unit(
+    monkeypatch, tmp_path, subcommand, backend_name
+):
+    user_unit = tmp_path / "user" / "hermes-gateway.service"
+    system_unit = tmp_path / "system" / "hermes-gateway.service"
+    system_unit.parent.mkdir(parents=True)
+    system_unit.write_text("[Unit]\n", encoding="utf-8")
+
+    monkeypatch.setattr(gateway, "supports_systemd_services", lambda: True)
+    monkeypatch.setattr(
+        gateway,
+        "get_systemd_unit_path",
+        lambda system=False: system_unit if system else user_unit,
+    )
+    monkeypatch.setattr(
+        gateway, "_dispatch_via_service_manager_if_s6", lambda operation: False
+    )
+    monkeypatch.setattr(
+        gateway, "_dispatch_all_via_service_manager_if_s6", lambda operation: False
+    )
+    calls = []
+    monkeypatch.setattr(
+        gateway, backend_name, lambda system=False: calls.append(system)
+    )
+
+    gateway.gateway_command(
+        SimpleNamespace(gateway_command=subcommand, all=False, system=False)
+    )
+
+    assert calls == [True]
+
+
+def test_gateway_status_uses_sole_system_unit(monkeypatch, tmp_path):
+    user_unit = tmp_path / "user" / "hermes-gateway.service"
+    system_unit = tmp_path / "system" / "hermes-gateway.service"
+    system_unit.parent.mkdir(parents=True)
+    system_unit.write_text("[Unit]\n", encoding="utf-8")
+
+    monkeypatch.setattr(gateway, "supports_systemd_services", lambda: True)
+    monkeypatch.setattr(
+        gateway,
+        "get_systemd_unit_path",
+        lambda system=False: system_unit if system else user_unit,
+    )
+    snapshot_scopes = []
+    status_scopes = []
+    monkeypatch.setattr(
+        gateway,
+        "get_gateway_runtime_snapshot",
+        lambda system=False: snapshot_scopes.append(system)
+        or gateway.GatewayRuntimeSnapshot(manager="systemd (system)"),
+    )
+    monkeypatch.setattr(
+        gateway,
+        "systemd_status",
+        lambda deep=False, system=False, full=False: status_scopes.append(system),
+    )
+    monkeypatch.setattr(gateway, "_print_gateway_process_mismatch", lambda snapshot: None)
+    monkeypatch.setattr(gateway, "_print_other_profiles_gateway_status", lambda: None)
+
+    gateway.gateway_command(
+        SimpleNamespace(gateway_command="status", deep=False, full=False, system=False)
+    )
+
+    assert snapshot_scopes == [True]
+    assert status_scopes == [True]
 
 
 def test_gateway_install_noninteractive_skips_legacy_unit_prompt(monkeypatch, tmp_path):
