@@ -4859,6 +4859,8 @@ def _service_backend(*, windows: bool = True) -> str | None:
 def _service_call(backend: str, verb: str, system: bool | None = False) -> None:
     """Run ``verb`` (start/stop/restart/uninstall) on ``backend``. Names resolve at call time so tests
     can monkeypatch them; only systemd takes a scope, and ``system=None`` omits it (wizard restart)."""
+    if backend == "systemd" and system is not None:
+        system = _select_systemd_scope(system)
     if backend == "windows":
         return getattr(_gw_windows(), verb)()
     if backend == "launchd":
@@ -5361,7 +5363,6 @@ def _cmd_start(args):
 
 
 def _cmd_stop(args):
-    _refuse_from_inside_gateway("stop", "restart loops")
     from hermes_cli.gateway_profile_lifecycle import host_scope_for_all_verb, profile_lifecycle
     if profile_lifecycle("stop", args):
         return
@@ -5494,7 +5495,6 @@ def _restart_all_as_host(owner, system: bool) -> None:
 
 
 def _cmd_restart(args):
-    _refuse_from_inside_gateway("restart", "restart loops")
     from hermes_cli.gateway_profile_lifecycle import profile_lifecycle
     if profile_lifecycle("restart", args):
         return
@@ -5617,7 +5617,7 @@ def _cmd_status(args):
     from hermes_cli.gateway_profile_lifecycle import print_parked_status
     deep = getattr(args, "deep", False)
     full = getattr(args, "full", False)
-    system = getattr(args, "system", False)
+    system = _select_systemd_scope(getattr(args, "system", False)) if supports_systemd_services() else getattr(args, "system", False)
     snapshot = get_gateway_runtime_snapshot(system=system)
     # The marker records intent, not runtime: a `--force` gateway bypasses parking and stays live
     # beside it, so only a parked profile with nothing running stops here.
