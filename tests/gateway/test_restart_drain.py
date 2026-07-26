@@ -222,6 +222,77 @@ async def test_run_restart_excluded_from_stop_cancel_loop():
 
 @pytest.mark.windows_only
 @pytest.mark.asyncio
+async def test_launch_detached_restart_command_uses_setsid(monkeypatch):
+    runner, _adapter = make_restart_runner()
+    popen_calls = []
+
+    monkeypatch.setattr(gateway_run.sys, "platform", "linux")
+    monkeypatch.setattr(gateway_run, "_resolve_hermes_bin", lambda: ["/usr/bin/hermes"])
+    monkeypatch.setattr(gateway_run.os, "getpid", lambda: 321)
+    monkeypatch.setenv("_HERMES_GATEWAY", "1")
+    monkeypatch.setattr(shutil, "which", lambda cmd: "/usr/bin/setsid" if cmd == "setsid" else None)
+
+    def fake_popen(cmd, **kwargs):
+        popen_calls.append((cmd, kwargs))
+        return MagicMock()
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+
+    await runner._launch_detached_restart_command()
+
+    assert len(popen_calls) == 1
+    cmd, kwargs = popen_calls[0]
+    assert cmd[:2] == ["/usr/bin/setsid", "bash"]
+    assert "gateway restart" in cmd[-1]
+    assert "kill -0 321" in cmd[-1]
+    assert "deadline=$(( $(date +%s) +" in cmd[-1]
+    assert kwargs["start_new_session"] is True
+    assert kwargs["stdout"] is subprocess.DEVNULL
+    assert kwargs["stderr"] is subprocess.DEVNULL
+    # The detached watcher is not itself the gateway process.
+    assert kwargs["env"].get("_HERMES_GATEWAY") is None
+
+
+@pytest.mark.asyncio
+async def test_detached_restart_helper_is_idempotent(monkeypatch):
+    runner, _adapter = make_restart_runner()
+    popen_calls = []
+
+    monkeypatch.setattr(gateway_run, "_resolve_hermes_bin", lambda: ["/usr/bin/hermes"])
+    monkeypatch.setattr(gateway_run.os, "getpid", lambda: 321)
+    monkeypatch.setattr(shutil, "which", lambda cmd: None)
+    monkeypatch.setattr(subprocess, "Popen", lambda *a, **k: popen_calls.append((a, k)))
+
+    await runner._launch_detached_restart_command()
+    await runner._launch_detached_restart_command()
+
+    assert len(popen_calls) == 1
+
+
+def test_windows_gateway_venv_imports_add_site_packages(monkeypatch, tmp_path):
+    venv_dir = tmp_path / "venv"
+    site_packages = venv_dir / "Lib" / "site-packages"
+    pth_extra = tmp_path / "pywin32_system32"
+    site_packages.mkdir(parents=True)
+    pth_extra.mkdir()
+    (site_packages / "pywin32.pth").write_text(str(pth_extra), encoding="utf-8")
+    project_root = str(gateway_run.Path(gateway_run.__file__).resolve().parent.parent)
+
+    monkeypatch.setattr(gateway_run.sys, "platform", "win32")
+    monkeypatch.setattr(gateway_run.sys, "path", ["existing"])
+    monkeypatch.setenv("VIRTUAL_ENV", str(venv_dir))
+    monkeypatch.setenv("PYTHONPATH", "already-there")
+
+    gateway_run._ensure_windows_gateway_venv_imports()
+
+    assert gateway_run.sys.path[:2] == [project_root, str(site_packages)]
+    assert str(pth_extra) in gateway_run.sys.path
+    assert gateway_run.os.environ["VIRTUAL_ENV"] == str(venv_dir.resolve())
+    pythonpath = gateway_run.os.environ["PYTHONPATH"].split(gateway_run.os.pathsep)
+    assert pythonpath[:3] == [project_root, str(site_packages), "already-there"]
+
+
+@pytest.mark.asyncio
 async def test_windows_detached_restart_scrubs_gateway_marker(monkeypatch, tmp_path):
     """Faking sys.platform="win32" on Linux could not reach the real Windows
     detach branch (msvcrt/creationflags spawn, Lib/site-packages venv layout);
