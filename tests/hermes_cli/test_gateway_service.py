@@ -257,6 +257,9 @@ class TestGeneratedSystemdUnits:
         monkeypatch.setattr(
             resource_limits, "configured_nofile_soft_limit", lambda config=None: None
         )
+        unit = gateway_cli.generate_systemd_unit(
+            system=True, run_as_user="root"
+        )
 
         plist = gateway_cli.generate_launchd_plist()
 
@@ -771,6 +774,252 @@ class TestGatewaySystemServiceRouting:
 
 
 
+        monkeypatch.setattr(gateway_cli, "_select_systemd_scope", lambda system=False: False)
+        monkeypatch.setattr(gateway_cli, "_require_service_installed", lambda action, system=False: None)
+        monkeypatch.setattr(gateway_cli, "refresh_systemd_unit_if_needed", lambda system=False: None)
+        monkeypatch.setattr("gateway.status.get_running_pid", lambda: None)
+        monkeypatch.setattr(gateway_cli, "_recover_pending_systemd_restart", lambda system=False, previous_pid=None: False)
+
+        def fake_run_systemctl(args, **kwargs):
+            calls.append(args)
+            if args[0] == "show":
+                return SimpleNamespace(stdout="ActiveState=inactive\nSubState=dead\nResult=success\nExecMainStatus=0\nMainPID=0\n", stderr="", returncode=0)
+            if args[0] == "reset-failed":
+                return SimpleNamespace(stdout="", stderr="", returncode=0)
+            if args[0] == "restart":
+                raise subprocess.CalledProcessError(
+                    1,
+                    ["systemctl", "--user", *args],
+                    stderr="Job failed. See result 'start-limit-hit'.",
+                )
+            raise AssertionError(f"Unexpected args: {args}")
+
+        monkeypatch.setattr(gateway_cli, "_run_systemctl", fake_run_systemctl)
+
+        gateway_cli.systemd_restart()
+
+        assert ["restart", gateway_cli.get_service_name()] in calls
+        out = capsys.readouterr().out.lower()
+        assert "rate-limited by systemd" in out
+        assert "reset-failed" in out
+
+    def test_systemd_restart_recovers_failed_planned_restart(self, monkeypatch, capsys):
+        monkeypatch.setattr(gateway_cli, "_select_systemd_scope", lambda system=False: False)
+        monkeypatch.setattr(gateway_cli, "_require_service_installed", lambda action, system=False: None)
+        monkeypatch.setattr(gateway_cli, "refresh_systemd_unit_if_needed", lambda system=False: None)
+        monkeypatch.setattr(
+            "gateway.status.read_runtime_status",
+            lambda: {"restart_requested": True, "gateway_state": "stopped"},
+        )
+        monkeypatch.setattr(gateway_cli, "_request_gateway_self_restart", lambda pid: False)
+
+        calls = []
+        started = {"value": False}
+
+        def fake_subprocess_run(cmd, **kwargs):
+            if "show" in cmd:
+                if not started["value"]:
+                    return SimpleNamespace(
+                        stdout=(
+                            "ActiveState=failed\n"
+                            "SubState=failed\n"
+                            "Result=exit-code\n"
+                            f"ExecMainStatus={GATEWAY_SERVICE_RESTART_EXIT_CODE}\n"
+                        ),
+                        returncode=0,
+                    )
+                return SimpleNamespace(
+                    stdout="ActiveState=active\nSubState=running\nResult=success\nExecMainStatus=0\n",
+                    returncode=0,
+                )
+            if "reset-failed" in cmd:
+                calls.append(("reset-failed", cmd))
+                return SimpleNamespace(stdout="", returncode=0)
+            if "start" in cmd:
+                started["value"] = True
+                calls.append(("start", cmd))
+                return SimpleNamespace(stdout="", returncode=0)
+            raise AssertionError(f"Unexpected command: {cmd}")
+
+        monkeypatch.setattr(gateway_cli.subprocess, "run", fake_subprocess_run)
+        monkeypatch.setattr(
+            "gateway.status.get_running_pid",
+            lambda: 999 if started["value"] else None,
+        )
+        monkeypatch.setattr(
+            gateway_cli,
+            "_gateway_runtime_status_for_pid",
+            lambda pid: {"pid": pid, "gateway_state": "running"},
+        )
+
+        gateway_cli.systemd_restart()
+
+        assert any(call[0] == "reset-failed" for call in calls)
+        assert any(call[0] == "start" for call in calls)
+        out = capsys.readouterr().out.lower()
+        assert "restarted" in out
+
+    def test_systemd_status_surfaces_planned_restart_failure(self, monkeypatch, capsys):
+        unit = SimpleNamespace(exists=lambda: True)
+        monkeypatch.setattr(gateway_cli, "_select_systemd_scope", lambda system=False: False)
+        monkeypatch.setattr(gateway_cli, "get_systemd_unit_path", lambda system=False: unit)
+        monkeypatch.setattr(gateway_cli, "has_conflicting_systemd_units", lambda: False)
+        monkeypatch.setattr(gateway_cli, "has_legacy_hermes_units", lambda: False)
+        monkeypatch.setattr(gateway_cli, "systemd_unit_is_current", lambda system=False: True)
+        monkeypatch.setattr(gateway_cli, "_runtime_health_lines", lambda: ["⚠ Last shutdown reason: Gateway restart requested"])
+        monkeypatch.setattr(gateway_cli, "get_systemd_linger_status", lambda: (True, ""))
+        monkeypatch.setattr(gateway_cli, "_read_systemd_unit_properties", lambda system=False: {
+            "ActiveState": "failed",
+            "SubState": "failed",
+            "Result": "exit-code",
+            "ExecMainStatus": str(GATEWAY_SERVICE_RESTART_EXIT_CODE),
+        })
+
+        calls = []
+
+        def fake_run_systemctl(args, **kwargs):
+            calls.append(args)
+            if args[:2] == ["status", gateway_cli.get_service_name()]:
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+            if args[:2] == ["is-active", gateway_cli.get_service_name()]:
+                return SimpleNamespace(returncode=3, stdout="failed\n", stderr="")
+            raise AssertionError(f"Unexpected args: {args}")
+
+        monkeypatch.setattr(gateway_cli, "_run_systemctl", fake_run_systemctl)
+
+        gateway_cli.systemd_status()
+
+        out = capsys.readouterr().out
+        assert "Planned restart is stuck in systemd failed state" in out
+
+    def test_gateway_status_dispatches_full_flag(self, monkeypatch):
+        user_unit = SimpleNamespace(exists=lambda: True)
+        system_unit = SimpleNamespace(exists=lambda: False)
+
+        monkeypatch.setattr(gateway_cli, "supports_systemd_services", lambda: True)
+        monkeypatch.setattr(gateway_cli, "is_termux", lambda: False)
+        monkeypatch.setattr(gateway_cli, "is_macos", lambda: False)
+        monkeypatch.setattr(
+            gateway_cli,
+            "get_systemd_unit_path",
+            lambda system=False: system_unit if system else user_unit,
+        )
+        monkeypatch.setattr(
+            gateway_cli,
+            "get_gateway_runtime_snapshot",
+            lambda system=False: gateway_cli.GatewayRuntimeSnapshot(
+                manager="systemd (user)",
+                service_installed=True,
+                service_running=False,
+                gateway_pids=(),
+                service_scope="user",
+            ),
+        )
+
+        calls = []
+        monkeypatch.setattr(
+            gateway_cli,
+            "systemd_status",
+            lambda deep=False, system=False, full=False: calls.append((deep, system, full)),
+        )
+
+        gateway_cli.gateway_command(
+            SimpleNamespace(gateway_command="status", deep=False, system=False, full=True)
+        )
+
+        assert calls == [(False, False, True)]
+
+    def test_gateway_install_reports_termux_manual_mode(self, monkeypatch, capsys):
+        monkeypatch.setattr(gateway_cli, "is_termux", lambda: True)
+        monkeypatch.setattr(gateway_cli, "supports_systemd_services", lambda: False)
+        monkeypatch.setattr(gateway_cli, "is_macos", lambda: False)
+
+        try:
+            gateway_cli.gateway_command(
+                SimpleNamespace(gateway_command="install", force=False, system=False, run_as_user=None)
+            )
+        except SystemExit as exc:
+            assert exc.code == 1
+        else:
+            raise AssertionError("Expected gateway_command to exit on unsupported Termux service install")
+
+        out = capsys.readouterr().out
+        assert "not supported on Termux" in out
+        assert "Run manually: hermes gateway" in out
+
+    def test_gateway_status_prefers_system_service_when_only_system_unit_exists(self, monkeypatch):
+        user_unit = SimpleNamespace(exists=lambda: False)
+        system_unit = SimpleNamespace(exists=lambda: True)
+
+        monkeypatch.setattr(gateway_cli, "supports_systemd_services", lambda: True)
+        monkeypatch.setattr(gateway_cli, "is_termux", lambda: False)
+        monkeypatch.setattr(gateway_cli, "is_macos", lambda: False)
+        monkeypatch.setattr(
+            gateway_cli,
+            "get_systemd_unit_path",
+            lambda system=False: system_unit if system else user_unit,
+        )
+
+        calls = []
+        monkeypatch.setattr(
+            gateway_cli,
+            "systemd_status",
+            lambda deep=False, system=False, full=False: calls.append((deep, system, full)),
+        )
+
+        gateway_cli.gateway_command(SimpleNamespace(gateway_command="status", deep=False, system=False))
+
+        assert calls == [(False, True, False)]
+
+    def test_gateway_status_reports_manual_process_when_service_is_stopped(self, monkeypatch, capsys):
+        user_unit = SimpleNamespace(exists=lambda: True)
+        system_unit = SimpleNamespace(exists=lambda: False)
+
+        monkeypatch.setattr(gateway_cli, "supports_systemd_services", lambda: True)
+        monkeypatch.setattr(gateway_cli, "is_termux", lambda: False)
+        monkeypatch.setattr(gateway_cli, "is_macos", lambda: False)
+        monkeypatch.setattr(
+            gateway_cli,
+            "get_systemd_unit_path",
+            lambda system=False: system_unit if system else user_unit,
+        )
+        monkeypatch.setattr(
+            gateway_cli,
+            "systemd_status",
+            lambda deep=False, system=False, full=False: print("service stopped"),
+        )
+        monkeypatch.setattr(
+            gateway_cli,
+            "get_gateway_runtime_snapshot",
+            lambda system=False: gateway_cli.GatewayRuntimeSnapshot(
+                manager="systemd (user)",
+                service_installed=True,
+                service_running=False,
+                gateway_pids=(4321,),
+                service_scope="user",
+            ),
+        )
+
+        gateway_cli.gateway_command(SimpleNamespace(gateway_command="status", deep=False, system=False))
+
+        out = capsys.readouterr().out
+        assert "service stopped" in out
+        assert "Gateway process is running for this profile" in out
+        assert "PID(s): 4321" in out
+
+    def test_gateway_status_on_termux_shows_manual_guidance(self, monkeypatch, capsys):
+        monkeypatch.setattr(gateway_cli, "supports_systemd_services", lambda: False)
+        monkeypatch.setattr(gateway_cli, "is_termux", lambda: True)
+        monkeypatch.setattr(gateway_cli, "is_macos", lambda: False)
+        monkeypatch.setattr(gateway_cli, "find_gateway_pids", lambda exclude_pids=None: [])
+        monkeypatch.setattr(gateway_cli, "_runtime_health_lines", lambda: [])
+
+        gateway_cli.gateway_command(SimpleNamespace(gateway_command="status", deep=False, system=False))
+
+        out = capsys.readouterr().out
+        assert "Gateway is not running" in out
+        assert "nohup hermes gateway" in out
+        assert "install as user service" not in out
 
     @pytest.mark.macos_only
     def test_gateway_restart_does_not_fallback_to_foreground_when_launchd_restart_fails(self, tmp_path, monkeypatch):
@@ -1129,7 +1378,9 @@ class TestGeneratedUnitIncludesLocalBin:
             "_build_user_local_paths",
             lambda home_path, existing: [str(home_path / ".local" / "bin")],
         )
-        unit = gateway_cli.generate_systemd_unit(system=True)
+        unit = gateway_cli.generate_systemd_unit(
+            system=True, run_as_user="root"
+        )
         # System unit uses the resolved home dir from _system_service_identity
         assert "/.local/bin" in unit
 

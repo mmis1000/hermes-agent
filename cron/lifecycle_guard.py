@@ -23,14 +23,10 @@ autoscaling and restart behavior") would produce a high false-positive
 rate without preventing the actual foot-gun, which requires a real
 command shape.
 
-This is a defence-in-depth layer.  ``tools/terminal_tool.py`` blocks direct
-commands and shell scripts they reference when ``_HERMES_GATEWAY=1``. It also
-rejects ``launchctl submit`` in gateway sessions because launchd treats that
-primitive as a persistent KeepAlive job, not a one-shot task. ``hermes gateway
-stop|restart`` separately refuse to self-target from inside the gateway.
-Blocking cron specs at creation time as well means the agent gets an immediate,
-informative rejection instead of scheduling a job that will only fail
-(silently) when it fires.
+This is an unattended-loop prevention layer, not a privilege boundary.
+The gateway agent may perform lifecycle operations directly.  Blocking a
+recurring cron specification at creation time prevents an accidental durable
+restart loop while leaving on-demand lifecycle commands available.
 """
 
 from __future__ import annotations

@@ -14,11 +14,15 @@ from tools.approval import (
 
 @pytest.fixture(autouse=True)
 def _clear_approval_state():
+    from gateway.session_context import reset_session_vars
+
+    reset_session_vars()
     approval_module._permanent_approved.clear()
     approval_module.clear_session("default")
     approval_module.clear_session("test-session")
     reset_session_vars()
     yield
+    reset_session_vars()
     approval_module._permanent_approved.clear()
     approval_module.clear_session("default")
     approval_module.clear_session("test-session")
@@ -143,6 +147,29 @@ class TestCronContextVarDetection:
             clear_session_vars(tokens)
 
         assert result["approved"] is True
+# Cron context isolation in long-lived gateway processes
+# ---------------------------------------------------------------------------
+
+
+def test_cron_context_is_task_local_and_does_not_poison_gateway(monkeypatch):
+    from gateway.session_context import clear_session_vars, set_session_vars
+
+    # Reproduce the historical process-wide poison left by an in-process cron
+    # run. A bound live gateway task must explicitly override that stale env.
+    monkeypatch.setenv("HERMES_CRON_SESSION", "1")
+    gateway_tokens = set_session_vars(platform="discord", cron_session=False)
+    try:
+        assert not approval_module._is_cron_approval_context()
+        assert approval_module._is_gateway_approval_context()
+    finally:
+        clear_session_vars(gateway_tokens)
+
+    cron_tokens = set_session_vars(platform="", cron_session=True)
+    try:
+        assert approval_module._is_cron_approval_context()
+        assert not approval_module._is_gateway_approval_context()
+    finally:
+        clear_session_vars(cron_tokens)
 
 
 # ---------------------------------------------------------------------------
@@ -442,7 +469,9 @@ class TestCronWithGatewayOrigin:
         monkeypatch.delenv("HERMES_EXEC_ASK", raising=False)
 
         from gateway.session_context import set_session_vars, clear_session_vars
-        tokens = set_session_vars(platform="telegram", chat_id="123")
+        tokens = set_session_vars(
+            platform="telegram", chat_id="123", cron_session=True
+        )
         try:
             from unittest.mock import patch as mock_patch
             with mock_patch("tools.approval._get_cron_approval_mode", return_value="deny"):
@@ -464,7 +493,9 @@ class TestCronWithGatewayOrigin:
         monkeypatch.delenv("HERMES_EXEC_ASK", raising=False)
 
         from gateway.session_context import set_session_vars, clear_session_vars
-        tokens = set_session_vars(platform="discord", chat_id="456")
+        tokens = set_session_vars(
+            platform="discord", chat_id="456", cron_session=True
+        )
         try:
             from unittest.mock import patch as mock_patch
             with mock_patch("tools.approval._get_cron_approval_mode", return_value="approve"):
@@ -475,3 +506,24 @@ class TestCronWithGatewayOrigin:
         finally:
             clear_session_vars(tokens)
 
+    def test_cron_with_telegram_origin_combined_guard_uses_cron_mode(self, monkeypatch):
+        """check_all_command_guards must also honor cron_mode over gateway classification."""
+        monkeypatch.setenv("HERMES_CRON_SESSION", "1")
+        monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
+        monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)
+        monkeypatch.delenv("HERMES_YOLO_MODE", raising=False)
+        monkeypatch.delenv("HERMES_EXEC_ASK", raising=False)
+
+        from gateway.session_context import set_session_vars, clear_session_vars
+        tokens = set_session_vars(
+            platform="telegram", chat_id="789", cron_session=True
+        )
+        try:
+            from unittest.mock import patch as mock_patch
+            with mock_patch("tools.approval._get_cron_approval_mode", return_value="deny"):
+                result = check_all_command_guards("rm -rf /tmp/stuff", "local")
+                assert not result["approved"]
+                assert "BLOCKED" in result["message"]
+                assert result.get("status") != "approval_required"
+        finally:
+            clear_session_vars(tokens)

@@ -4932,8 +4932,8 @@ def run_job(
 
     agent = None
 
-    # Use ContextVars for per-job session/delivery state so parallel jobs
-    # don't clobber each other's targets (os.environ is process-global).
+    # Use ContextVars for per-job identity/delivery state so the in-process
+    # scheduler cannot classify concurrent or later live gateway turns as cron.
     from gateway.session_context import set_session_vars, clear_session_vars, _VAR_MAP
 
     # Cron execution is an internal scheduler context, not a live inbound
@@ -4973,6 +4973,7 @@ def run_job(
         platform="",
         chat_id="",
         chat_name="",
+        cron_session=True,
         # A cron job cannot receive a completion after its turn ends. We clear the
         # HERMES_SESSION_* routing keys just below, so an async delegation's
         # completion event carries session_key="" — _enrich_async_delegation_routing
