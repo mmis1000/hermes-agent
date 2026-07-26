@@ -23,12 +23,10 @@ autoscaling and restart behavior") would produce a high false-positive
 rate without preventing the actual foot-gun, which requires a real
 command shape.
 
-This is a defence-in-depth layer.  ``tools/terminal_tool.py`` already
-blocks these commands at *execution* time when ``_HERMES_GATEWAY=1``, and
-``hermes gateway stop|restart`` refuse to self-target from inside the
-gateway.  Blocking at *creation* time as well means the agent gets an
-immediate, informative rejection instead of scheduling a job that will
-only fail (silently) when it fires.
+This is an unattended-loop prevention layer, not a privilege boundary.
+The gateway agent may perform lifecycle operations directly.  Blocking a
+recurring cron specification at creation time prevents an accidental durable
+restart loop while leaving on-demand lifecycle commands available.
 """
 
 from __future__ import annotations

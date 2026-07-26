@@ -1387,12 +1387,8 @@ class TestToolsConfigEndpoints:
 # _spawn_hermes_action env scrubbing (#52470)
 # ---------------------------------------------------------------------------
 
-def test_spawn_hermes_action_scrubs_gateway_loop_guard_env(monkeypatch, tmp_path):
-    """The dashboard runs inside the gateway, so os.environ has
-    _HERMES_GATEWAY=1. Spawned actions (e.g. `gateway restart`) must NOT inherit
-    it, or the in-process restart-loop guard rejects the restart and it silently
-    fails (#52470).
-    """
+def test_spawn_hermes_action_scrubs_gateway_process_identity(monkeypatch, tmp_path):
+    """A detached dashboard action is not itself the gateway process."""
     import hermes_cli.web_server as ws
 
     monkeypatch.setenv("_HERMES_GATEWAY", "1")

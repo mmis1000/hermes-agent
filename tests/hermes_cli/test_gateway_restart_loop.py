@@ -1,8 +1,8 @@
-"""Tests for gateway restart-loop defenses (#30719).
+"""Tests for gateway restart-loop handling (#30719).
 
 Covers:
-- Defense 1: gateway stop/restart refuse when _HERMES_GATEWAY=1
-- Defense 2: cron create rejects prompts containing gateway lifecycle commands
+- On-demand gateway stop/restart remain available inside gateway sessions
+- Cron create rejects prompts containing gateway lifecycle commands
 - _contains_gateway_lifecycle_command pattern matching
 """
 
@@ -213,34 +213,14 @@ class TestCronCreateLifecycleBlock:
 
 
 # ---------------------------------------------------------------------------
-# Defense 1: gateway stop/restart refuse inside gateway
+# On-demand gateway stop/restart remain available inside gateway
 # ---------------------------------------------------------------------------
 
-class TestGatewaySelfTargetingGuard:
-    """Verify hermes gateway stop/restart refuse when _HERMES_GATEWAY=1."""
+class TestGatewaySelfTargetingLifecycle:
+    """Gateway-served agents may reach normal stop/restart dispatch."""
 
-    def test_stop_refuses_inside_gateway(self, monkeypatch):
+    def test_stop_allows_inside_gateway(self, monkeypatch):
         monkeypatch.setenv("_HERMES_GATEWAY", "1")
-        from hermes_cli.gateway import gateway_command
-        args = Namespace(gateway_command="stop", all=False, system=False)
-        with pytest.raises(SystemExit) as exc_info:
-            gateway_command(args)
-        assert exc_info.value.code == 1
-
-    def test_restart_refuses_inside_gateway(self, monkeypatch):
-        monkeypatch.setenv("_HERMES_GATEWAY", "1")
-        from hermes_cli.gateway import gateway_command
-        args = Namespace(gateway_command="restart", all=False, system=False)
-        with pytest.raises(SystemExit) as exc_info:
-            gateway_command(args)
-        assert exc_info.value.code == 1
-
-    def test_stop_allows_outside_gateway(self, monkeypatch):
-        # With the gateway marker unset, the self-targeting guard must NOT
-        # fire. Prove control reaches the real stop path (rather than driving
-        # real signal delivery, which would trip the live-system guard) by
-        # short-circuiting the first downstream call with a sentinel.
-        monkeypatch.delenv("_HERMES_GATEWAY", raising=False)
         import hermes_cli.gateway as gw
 
         class _Reached(Exception):
@@ -255,11 +235,8 @@ class TestGatewaySelfTargetingGuard:
         with pytest.raises(_Reached):
             gw.gateway_command(args)
 
-    def test_restart_allows_outside_gateway(self, monkeypatch):
-        # Same as above for restart: guard must not fire when the marker is
-        # unset. The first thing restart does after the guard is the s6
-        # dispatch check — sentinel it so we never reach real signal delivery.
-        monkeypatch.delenv("_HERMES_GATEWAY", raising=False)
+    def test_restart_allows_inside_gateway(self, monkeypatch):
+        monkeypatch.setenv("_HERMES_GATEWAY", "1")
         import hermes_cli.gateway as gw
 
         class _Reached(Exception):
@@ -276,23 +253,18 @@ class TestGatewaySelfTargetingGuard:
 
 
 # ---------------------------------------------------------------------------
-# Defense 3: terminal_tool hard-blocks gateway lifecycle commands inside gateway
+# Terminal commands use the normal approval path inside gateway sessions
 # ---------------------------------------------------------------------------
 
-class TestTerminalToolGatewayLifecycleGuard:
-    """terminal_tool must refuse gateway lifecycle commands when _HERMES_GATEWAY=1.
+class TestTerminalToolGatewayLifecycle:
+    """Gateway lifecycle commands follow ordinary terminal approval semantics."""
 
-    Issue #37453: systemctl --user restart hermes-gateway runs as a child of the
-    gateway process.  When systemd delivers SIGTERM the gateway kills its own
-    restart command mid-execution — the service may never restart.  The guard
-    must fire before execution, unconditionally (force=True cannot bypass it).
-    """
-
-    def _make_fake_env(self):
+    def _make_fake_env(self, calls):
         class _FakeEnv:
             env = {}
-            def execute(self, command, **kwargs):  # pragma: no cover
-                raise AssertionError("execute must not be reached")
+            def execute(self, command, **kwargs):
+                calls.append(command)
+                return {"output": "scheduled", "returncode": 0}
         return _FakeEnv()
 
     def _minimal_config(self):
@@ -312,34 +284,33 @@ class TestTerminalToolGatewayLifecycleGuard:
 
     @pytest.mark.parametrize("cmd", [
         "systemctl restart hermes-gateway",
-        "systemctl --user restart hermes-gateway",
-        "systemctl stop hermes-gateway.service",
-        "hermes gateway restart",
-        "launchctl kickstart gui/501/ai.hermes.gateway",
-        "pkill -f hermes.*gateway",
+        "systemd-run --on-active=3s systemctl restart hermes-gateway",
     ])
-    def test_blocks_lifecycle_commands_inside_gateway(self, monkeypatch, cmd):
+    def test_lifecycle_commands_inside_gateway_reach_normal_execution(self, monkeypatch, cmd):
         import tools.terminal_tool as tt
-        self._patch_env(monkeypatch, self._make_fake_env(), inside_gateway=True)
+        calls = []
+        self._patch_env(monkeypatch, self._make_fake_env(calls), inside_gateway=True)
+        monkeypatch.setattr(tt, "_check_all_guards", lambda command, env, **kwargs: {"approved": True})
 
         result = json.loads(tt.terminal_tool(command=cmd))
 
-        assert result["exit_code"] == 1
-        assert "Blocked" in result["error"]
+        assert result["exit_code"] == 0
+        assert calls == [cmd]
 
-    def test_force_true_cannot_bypass_block(self, monkeypatch):
+    def test_force_true_executes_inside_gateway(self, monkeypatch):
         import tools.terminal_tool as tt
-        self._patch_env(monkeypatch, self._make_fake_env(), inside_gateway=True)
+        calls = []
+        self._patch_env(monkeypatch, self._make_fake_env(calls), inside_gateway=True)
 
         result = json.loads(tt.terminal_tool(
             command="systemctl restart hermes-gateway", force=True
         ))
 
-        assert result["exit_code"] == 1
-        assert "Blocked" in result["error"]
+        assert result["exit_code"] == 0
+        assert calls == ["systemctl restart hermes-gateway"]
 
     def test_safe_systemctl_commands_pass_through(self, monkeypatch):
-        """Non-hermes systemctl commands must not be blocked by this guard."""
+        """Non-Hermes systemctl commands also use normal approval semantics."""
         import tools.terminal_tool as tt
 
         calls = []
@@ -357,29 +328,6 @@ class TestTerminalToolGatewayLifecycleGuard:
 
         assert result["exit_code"] == 0
         assert calls == ["systemctl status nginx"]
-
-    def test_guard_inactive_outside_gateway(self, monkeypatch):
-        """Without _HERMES_GATEWAY=1 the lifecycle guard must not fire."""
-        import tools.terminal_tool as tt
-
-        calls = []
-
-        class _FakeEnv:
-            env = {}
-            def execute(self, command, **kwargs):
-                calls.append(command)
-                return {"output": "restarting...", "returncode": 0}
-
-        self._patch_env(monkeypatch, _FakeEnv(), inside_gateway=False)
-        monkeypatch.setattr(tt, "_check_all_guards", lambda cmd, env, **kwargs: {"approved": True})
-
-        result = json.loads(tt.terminal_tool(command="systemctl restart hermes-gateway"))
-
-        # Outside the gateway the lifecycle guard doesn't block — the normal
-        # approval flow handles it (here mocked as approved).
-        assert result["exit_code"] == 0
-        assert calls == ["systemctl restart hermes-gateway"]
-
 
 # ---------------------------------------------------------------------------
 # cron.lifecycle_guard module — the shared checker create_job/CLI/terminal use

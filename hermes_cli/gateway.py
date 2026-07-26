@@ -3132,6 +3132,7 @@ def _ensure_linger_enabled() -> None:
 
 
 def _select_systemd_scope(system: bool = False) -> bool:
+    """Select the sole installed system unit for existing-service operations."""
     if system:
         return True
     return (
@@ -6886,6 +6887,7 @@ def _gateway_command_inner(args):
             print("Run manually: hermes gateway")
             sys.exit(1)
         if supports_systemd_services():
+            system = _select_systemd_scope(system)
             systemd_start(system=system)
         elif is_macos():
             launchd_start()
@@ -6930,16 +6932,6 @@ def _gateway_command_inner(args):
             sys.exit(1)
 
     elif subcmd == "stop":
-        # Defense: refuse self-targeting gateway stop from inside the gateway.
-        # Prevents agent-initiated kill loops when combined with supervisor KeepAlive.
-        if os.getenv("_HERMES_GATEWAY") == "1":
-            print_error(
-                "Refusing to stop the gateway from inside the gateway process.\n"
-                "This command was blocked to prevent restart loops.\n"
-                "Use `hermes gateway stop` from a shell outside the running gateway."
-            )
-            sys.exit(1)
-
         stop_all = getattr(args, "all", False)
         system = getattr(args, "system", False)
 
@@ -6951,6 +6943,9 @@ def _gateway_command_inner(args):
             return
         if not stop_all and _dispatch_via_service_manager_if_s6("stop"):
             return
+
+        if supports_systemd_services():
+            system = _select_systemd_scope(system)
 
         if stop_all:
             # --all: kill every gateway process on the machine
@@ -7023,16 +7018,6 @@ def _gateway_command_inner(args):
                 print(f"✓ Stopped {get_service_name()} service")
 
     elif subcmd == "restart":
-        # Defense: refuse self-targeting gateway restart from inside the gateway.
-        # Prevents agent-initiated kill loops when combined with supervisor KeepAlive.
-        if os.getenv("_HERMES_GATEWAY") == "1":
-            print_error(
-                "Refusing to restart the gateway from inside the gateway process.\n"
-                "This command was blocked to prevent restart loops.\n"
-                "Use `hermes gateway restart` from a shell outside the running gateway."
-            )
-            sys.exit(1)
-
         # Try service first, fall back to killing and restarting
         service_available = False
         system = getattr(args, "system", False)
@@ -7048,6 +7033,9 @@ def _gateway_command_inner(args):
             return
         if not restart_all and _dispatch_via_service_manager_if_s6("restart"):
             return
+
+        if supports_systemd_services():
+            system = _select_systemd_scope(system)
 
         if restart_all:
             # --all: stop every gateway process across all profiles, then start fresh
@@ -7184,6 +7172,8 @@ def _gateway_command_inner(args):
         deep = getattr(args, "deep", False)
         full = getattr(args, "full", False)
         system = getattr(args, "system", False)
+        if supports_systemd_services():
+            system = _select_systemd_scope(system)
         snapshot = get_gateway_runtime_snapshot(system=system)
 
         # Check for service first

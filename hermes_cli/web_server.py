@@ -3689,11 +3689,8 @@ def _spawn_hermes_action(subcommand: List[str], name: str) -> subprocess.Popen:
 
     cmd = [_dashboard_spawn_executable(), "-m", "hermes_cli.main", *subcommand]
 
-    # The dashboard runs *inside* the gateway process, so os.environ carries
-    # _HERMES_GATEWAY=1. Inheriting it makes a spawned `hermes gateway restart`
-    # trip the in-process restart-loop guard and exit 1 — silently failing the
-    # dashboard's auto-restart paths. The gateway's own restart watcher already
-    # drops it (gateway/run.py); mirror that here (#52470).
+    # The dashboard runs inside the gateway process, but this detached action
+    # is not itself the gateway. Keep the child process identity accurate.
     action_env = {**os.environ, "HERMES_NONINTERACTIVE": "1"}
     action_env.pop("_HERMES_GATEWAY", None)
 

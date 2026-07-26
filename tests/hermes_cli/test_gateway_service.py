@@ -548,7 +548,9 @@ class TestGeneratedSystemdUnits:
             "_get_restart_drain_timeout",
             lambda: DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT,
         )
-        unit = gateway_cli.generate_systemd_unit(system=True)
+        unit = gateway_cli.generate_systemd_unit(
+            system=True, run_as_user="root"
+        )
 
         assert "ExecStart=" in unit
         assert "ExecStop=" not in unit
@@ -1841,7 +1843,7 @@ class TestGatewaySystemServiceRouting:
 
         gateway_cli.gateway_command(SimpleNamespace(gateway_command="status", deep=False, system=False))
 
-        assert calls == [(False, False, False)]
+        assert calls == [(False, True, False)]
 
     def test_gateway_status_reports_manual_process_when_service_is_stopped(self, monkeypatch, capsys):
         user_unit = SimpleNamespace(exists=lambda: True)
@@ -2244,7 +2246,9 @@ class TestGeneratedUnitIncludesLocalBin:
             "_build_user_local_paths",
             lambda home_path, existing: [str(home_path / ".local" / "bin")],
         )
-        unit = gateway_cli.generate_systemd_unit(system=True)
+        unit = gateway_cli.generate_systemd_unit(
+            system=True, run_as_user="root"
+        )
         # System unit uses the resolved home dir from _system_service_identity
         assert "/.local/bin" in unit
 

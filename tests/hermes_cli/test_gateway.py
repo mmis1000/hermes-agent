@@ -560,6 +560,9 @@ def test_gateway_start_in_container_with_operational_systemd_uses_systemd(monkey
     monkeypatch.setattr(gateway, "supports_systemd_services", lambda: True)
     monkeypatch.setattr(gateway, "is_wsl", lambda: False)
     monkeypatch.setattr(gateway, "is_macos", lambda: False)
+    monkeypatch.setattr(
+        gateway, "_select_systemd_scope", lambda system=False: system
+    )
 
     calls = []
     monkeypatch.setattr(gateway, "systemd_start", lambda system=False: calls.append(system))
@@ -574,6 +577,9 @@ def test_gateway_start_ignores_legacy_platform_selector(monkeypatch):
     monkeypatch.setattr(gateway, "supports_systemd_services", lambda: True)
     monkeypatch.setattr(gateway, "is_wsl", lambda: False)
     monkeypatch.setattr(gateway, "is_macos", lambda: False)
+    monkeypatch.setattr(
+        gateway, "_select_systemd_scope", lambda system=False: system
+    )
 
     calls = []
     monkeypatch.setattr(gateway, "systemd_start", lambda system=False: calls.append(system))
@@ -804,6 +810,118 @@ def test_conflicting_systemd_units_warning(monkeypatch, tmp_path, capsys):
     assert "Both user and system gateway services are installed" in out
     assert "hermes gateway uninstall" in out
     assert "--system" in out
+
+
+@pytest.mark.parametrize(
+    ("requested_system", "user_installed", "system_installed", "expected"),
+    [
+        (True, False, False, True),
+        (False, False, True, True),
+        (False, True, False, False),
+        (False, True, True, False),
+        (False, False, False, False),
+    ],
+)
+def test_select_systemd_scope(
+    monkeypatch,
+    tmp_path,
+    requested_system,
+    user_installed,
+    system_installed,
+    expected,
+):
+    user_unit = tmp_path / "user" / "hermes-gateway.service"
+    system_unit = tmp_path / "system" / "hermes-gateway.service"
+    if user_installed:
+        user_unit.parent.mkdir(parents=True)
+        user_unit.write_text("[Unit]\n", encoding="utf-8")
+    if system_installed:
+        system_unit.parent.mkdir(parents=True)
+        system_unit.write_text("[Unit]\n", encoding="utf-8")
+
+    monkeypatch.setattr(
+        gateway,
+        "get_systemd_unit_path",
+        lambda system=False: system_unit if system else user_unit,
+    )
+
+    assert gateway._select_systemd_scope(requested_system) is expected
+
+
+@pytest.mark.parametrize(
+    ("subcommand", "backend_name"),
+    [
+        ("start", "systemd_start"),
+        ("stop", "systemd_stop"),
+        ("restart", "systemd_restart"),
+    ],
+)
+def test_existing_service_lifecycle_uses_sole_system_unit(
+    monkeypatch, tmp_path, subcommand, backend_name
+):
+    user_unit = tmp_path / "user" / "hermes-gateway.service"
+    system_unit = tmp_path / "system" / "hermes-gateway.service"
+    system_unit.parent.mkdir(parents=True)
+    system_unit.write_text("[Unit]\n", encoding="utf-8")
+
+    monkeypatch.setattr(gateway, "supports_systemd_services", lambda: True)
+    monkeypatch.setattr(
+        gateway,
+        "get_systemd_unit_path",
+        lambda system=False: system_unit if system else user_unit,
+    )
+    monkeypatch.setattr(
+        gateway, "_dispatch_via_service_manager_if_s6", lambda operation: False
+    )
+    monkeypatch.setattr(
+        gateway, "_dispatch_all_via_service_manager_if_s6", lambda operation: False
+    )
+    calls = []
+    monkeypatch.setattr(
+        gateway, backend_name, lambda system=False: calls.append(system)
+    )
+
+    gateway.gateway_command(
+        SimpleNamespace(gateway_command=subcommand, all=False, system=False)
+    )
+
+    assert calls == [True]
+
+
+def test_gateway_status_uses_sole_system_unit(monkeypatch, tmp_path):
+    user_unit = tmp_path / "user" / "hermes-gateway.service"
+    system_unit = tmp_path / "system" / "hermes-gateway.service"
+    system_unit.parent.mkdir(parents=True)
+    system_unit.write_text("[Unit]\n", encoding="utf-8")
+
+    monkeypatch.setattr(gateway, "supports_systemd_services", lambda: True)
+    monkeypatch.setattr(
+        gateway,
+        "get_systemd_unit_path",
+        lambda system=False: system_unit if system else user_unit,
+    )
+    snapshot_scopes = []
+    status_scopes = []
+    monkeypatch.setattr(
+        gateway,
+        "get_gateway_runtime_snapshot",
+        lambda system=False: snapshot_scopes.append(system)
+        or gateway.GatewayRuntimeSnapshot(manager="systemd (system)"),
+    )
+    monkeypatch.setattr(
+        gateway,
+        "systemd_status",
+        lambda deep=False, system=False, full=False: status_scopes.append(system),
+    )
+    monkeypatch.setattr(gateway, "_print_gateway_process_mismatch", lambda snapshot: None)
+    monkeypatch.setattr(gateway, "_print_other_profiles_gateway_status", lambda: None)
+
+    gateway.gateway_command(
+        SimpleNamespace(gateway_command="status", deep=False, full=False, system=False)
+    )
+
+    assert snapshot_scopes == [True]
+    assert status_scopes == [True]
 
 
 def test_install_linux_gateway_from_setup_non_root_never_offers_system(monkeypatch, capsys):

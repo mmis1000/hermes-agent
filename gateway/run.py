@@ -7012,9 +7012,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 """
             ).strip()
             watcher_env = os.environ.copy()
-            # This watcher is intentionally outside the running gateway. If it
-            # inherits the gateway marker, `hermes gateway restart` refuses to
-            # run as a self-restart loop guard and the gateway stays stopped.
+            # This watcher is intentionally outside the running gateway, so do
+            # not advertise it as part of the gateway process identity.
             watcher_env.pop("_HERMES_GATEWAY", None)
             project_root = Path(__file__).resolve().parent.parent
             watcher_python = sys.executable
@@ -7053,11 +7052,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             f"while kill -0 {current_pid} 2>/dev/null && [ $(date +%s) -lt $deadline ]; do sleep 0.2; done; "
             f"{cmd} gateway restart"
         )
-        # Same marker scrub as the Windows watcher above: this watcher runs
-        # `hermes gateway restart` from outside the gateway, but it inherits
-        # _HERMES_GATEWAY=1 from us, and the CLI's self-restart loop guard
-        # refuses to run when that marker is set — silently (DEVNULL), so the
-        # gateway stops and never comes back.
+        # Same process-identity scrub as the Windows watcher above: this
+        # detached helper is not itself the gateway.
         watcher_env = os.environ.copy()
         watcher_env.pop("_HERMES_GATEWAY", None)
         setsid_bin = shutil.which("setsid")

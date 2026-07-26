@@ -269,8 +269,7 @@ async def test_launch_detached_restart_command_uses_setsid(monkeypatch):
     assert kwargs["start_new_session"] is True
     assert kwargs["stdout"] is subprocess.DEVNULL
     assert kwargs["stderr"] is subprocess.DEVNULL
-    # The watcher must NOT inherit the gateway marker, or the CLI's
-    # self-restart loop guard refuses to run `hermes gateway restart`.
+    # The detached watcher is not itself the gateway process.
     assert kwargs["env"].get("_HERMES_GATEWAY") is None
 
 
