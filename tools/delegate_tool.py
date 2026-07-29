@@ -3070,6 +3070,10 @@ def delegate_task(
     role: Optional[str] = None,
     background: Optional[bool] = None,
     parent_agent=None,
+    *,
+    model: Optional[str] = None,
+    provider: Optional[str] = None,
+    reasoning_effort: Optional[str] = None,
 ) -> str:
     """
     Spawn one or more child agents to handle delegated tasks.
@@ -3142,13 +3146,39 @@ def delegate_task(
         )
     effective_max_iter = default_max_iter
 
+    # Per-call routing overrides take precedence over delegation.* defaults for
+    # this invocation only. _load_config() may return a shared read-only dict,
+    # so never mutate it in place.
+    effective_cfg = dict(cfg)
+    if model is not None:
+        effective_cfg["model"] = model
+    if provider is not None:
+        effective_cfg["provider"] = provider
+        # A configured direct endpoint takes precedence inside credential
+        # resolution.  A per-call provider must therefore detach the invocation
+        # from that endpoint and its transport credentials, otherwise the
+        # requested provider is silently ignored.
+        for direct_key in ("base_url", "api_key", "api_mode"):
+            effective_cfg.pop(direct_key, None)
+
+    reasoning_config_override: Any = _UNSET
+    if reasoning_effort is not None:
+        from hermes_constants import parse_reasoning_effort
+
+        reasoning_config_override = parse_reasoning_effort(reasoning_effort)
+        if reasoning_config_override is None:
+            return tool_error(
+                f"Unknown delegation reasoning_effort '{reasoning_effort}'. "
+                "Use one of: none, minimal, low, medium, high, xhigh, max, ultra."
+            )
+
     # Resolve delegation credentials (provider:model pair).
     # When delegation.provider is configured, this resolves the full credential
     # bundle (base_url, api_key, api_mode) via the same runtime provider system
     # used by CLI/gateway startup.  When unconfigured, returns None values so
     # children inherit from the parent.
     try:
-        creds = _resolve_delegation_credentials(cfg, parent_agent)
+        creds = _resolve_delegation_credentials(effective_cfg, parent_agent)
     except ValueError as exc:
         return tool_error(str(exc))
 
@@ -3244,6 +3274,7 @@ def delegate_task(
                 override_max_tokens=creds.get("max_output_tokens"),
                 override_acp_command=creds.get("command"),
                 override_acp_args=creds.get("args"),
+                reasoning_config_override=reasoning_config_override,
                 role=effective_role,
             )
             # Override with correct parent tool names (before child construction mutated global)
@@ -4094,7 +4125,7 @@ def _build_top_level_description() -> str:
         f"Orchestrators are bounded by max_spawn_depth={max_depth} for this "
         f"user and can be disabled globally via "
         "delegation.orchestrator_enabled=false.\n"
-        "- Subagent model is NOT selectable per call: children inherit the parent model (plus its fallback chain) unless you pin all subagents to a model via delegation.provider / delegation.model in config.yaml.\n"
+        "- A call may override model, provider, and reasoning effort for all children in that invocation. When omitted, delegation.* configuration and then parent inheritance apply.\n"
         "- Each subagent gets its own terminal session (separate working directory and state).\n"
         "- Results are always returned as an array, one entry per task."
     )
@@ -4208,6 +4239,29 @@ DELEGATE_TASK_SCHEMA = {
                     "specific you are, the better the subagent performs."
                 ),
             },
+            "model": {
+                "type": "string",
+                "description": (
+                    "Optional model override for every child in this invocation. "
+                    "When omitted, delegation.model or the parent model is used."
+                ),
+            },
+            "provider": {
+                "type": "string",
+                "description": (
+                    "Optional provider override for every child in this invocation. "
+                    "When omitted, delegation.provider or the parent provider is used."
+                ),
+            },
+            "reasoning_effort": {
+                "type": "string",
+                "enum": ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"],
+                "description": (
+                    "Optional reasoning-effort override for every child in this "
+                    "invocation. When omitted, delegation.reasoning_effort or the "
+                    "parent reasoning configuration is used."
+                ),
+            },
             "tasks": {
                 "type": "array",
                 "items": {
@@ -4307,6 +4361,9 @@ registry.register(
         tasks=_strip_model_hidden_task_fields(args.get("tasks")),
         max_iterations=args.get("max_iterations"),
         role=args.get("role"),
+        model=args.get("model"),
+        provider=args.get("provider"),
+        reasoning_effort=args.get("reasoning_effort"),
         background=_model_background_value(args, kw.get("parent_agent")),
         parent_agent=kw.get("parent_agent"),
     ),

@@ -10,6 +10,7 @@ Run with:  python -m pytest tests/test_delegate.py -v
 """
 
 import json
+import inspect
 import os
 import threading
 import time
@@ -27,6 +28,7 @@ from tools.delegate_tool import (
     MAX_DEPTH,
     check_delegate_requirements,
     delegate_task,
+    build_resumed_child_agent,
     _build_child_agent,
     _build_child_progress_callback,
     _build_child_system_prompt,
@@ -71,6 +73,9 @@ class TestDelegateRequirements(unittest.TestCase):
         self.assertIn("goal", props)
         self.assertIn("tasks", props)
         self.assertIn("context", props)
+        for name in ("model", "provider", "reasoning_effort"):
+            self.assertIn(name, props)
+            self.assertNotIn(name, props["tasks"]["items"]["properties"])
         # toolsets is intentionally NOT exposed to the model — subagents always
         # inherit the parent's toolsets. Letting the model name toolsets was a
         # capability-selection surface the model should not control.
@@ -87,6 +92,28 @@ class TestDelegateRequirements(unittest.TestCase):
         self.assertNotIn("acp_command", props["tasks"]["items"]["properties"])
         self.assertNotIn("acp_args", props["tasks"]["items"]["properties"])
         self.assertNotIn("maxItems", props["tasks"])  # removed — limit is now runtime-configurable
+
+    def test_schema_description_allows_per_call_routing_overrides(self):
+        from tools.delegate_tool import _build_dynamic_schema_overrides
+
+        description = _build_dynamic_schema_overrides()["description"]
+        self.assertNotIn("NOT selectable per call", description)
+        self.assertIn("model", description)
+        self.assertIn("provider", description)
+        self.assertIn("reasoning", description)
+
+    def test_new_routing_overrides_are_keyword_only_after_legacy_parameters(self):
+        params = inspect.signature(delegate_task).parameters
+        self.assertEqual(
+            params["background"].kind,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        )
+        self.assertEqual(
+            params["parent_agent"].kind,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        )
+        for name in ("model", "provider", "reasoning_effort"):
+            self.assertEqual(params[name].kind, inspect.Parameter.KEYWORD_ONLY)
 
     def test_schema_description_advertises_runtime_limits(self):
         """The model must see the user's actual concurrency / spawn-depth caps,
@@ -521,6 +548,53 @@ class TestDelegateTask(unittest.TestCase):
         self.assertNotIn("api_key", encoded)
         self.assertNotIn("base_url", encoded)
         self.assertNotIn("acp_command", encoded)
+
+    def test_resume_reuses_effective_per_call_model_provider_and_reasoning(self):
+        metadata = {
+            "model": "google/gemini-2.5-flash",
+            "provider": "openrouter",
+            "reasoning_config": {"enabled": True, "effort": "low"},
+            "max_iterations": 45,
+            "role": "leaf",
+            "depth": 1,
+            "enabled_toolsets": [],
+            "disabled_toolsets": [],
+        }
+        credentials = {
+            "model": metadata["model"],
+            "provider": metadata["provider"],
+            "base_url": "https://openrouter.ai/api/v1",
+            "api_key": "fresh-key",
+            "api_mode": "chat_completions",
+        }
+        parent = _make_mock_parent()
+        child = MagicMock()
+        child.session_id = "resumed-session"
+        child._session_init_model_config = {}
+
+        with (
+            patch("tools.delegate_tool._resolve_delegation_credentials", return_value=credentials),
+            patch("tools.delegate_tool._build_child_agent", return_value=child) as mock_build,
+        ):
+            build_resumed_child_agent(
+                bundle={"reconstruction_metadata": metadata},
+                logical_id="child-logical-id",
+                goal="continue verification",
+                parent_agent=parent,
+                continuation={
+                    "session_id": "resumed-session",
+                    "parent_session_id": "prior-session",
+                    "delegate_from": "parent-session",
+                },
+            )
+
+        kwargs = mock_build.call_args.kwargs
+        self.assertEqual(kwargs["model"], "google/gemini-2.5-flash")
+        self.assertEqual(kwargs["override_provider"], "openrouter")
+        self.assertEqual(
+            kwargs["reasoning_config_override"],
+            {"enabled": True, "effort": "low"},
+        )
 
     def test_attempt_id_is_the_runtime_task_key(self):
         from tools.delegate_tool import _run_single_child
@@ -1560,6 +1634,107 @@ class TestDelegationCredentialResolution(unittest.TestCase):
 class TestDelegationProviderIntegration(unittest.TestCase):
     """Integration tests: delegation config → _run_single_child → AIAgent construction."""
 
+    @patch("tools.delegate_tool._run_single_child")
+    @patch("tools.delegate_tool._build_child_agent")
+    @patch("tools.delegate_tool._load_config")
+    @patch("tools.delegate_tool._resolve_delegation_credentials")
+    def test_per_call_overrides_apply_to_every_batch_child(
+        self, mock_creds, mock_cfg, mock_build, mock_run
+    ):
+        mock_cfg.return_value = {"max_iterations": 45}
+        mock_creds.return_value = {
+            "model": "google/gemini-2.5-flash",
+            "provider": "openrouter",
+            "base_url": "https://openrouter.ai/api/v1",
+            "api_key": "test-key",
+            "api_mode": "chat_completions",
+        }
+        mock_build.side_effect = [MagicMock(), MagicMock()]
+        mock_run.side_effect = [
+            {"task_index": 0, "status": "completed", "summary": "one"},
+            {"task_index": 1, "status": "completed", "summary": "two"},
+        ]
+
+        delegate_task(
+            tasks=[{"goal": "one"}, {"goal": "two"}],
+            model="google/gemini-2.5-flash",
+            provider="openrouter",
+            reasoning_effort="low",
+            parent_agent=_make_mock_parent(),
+        )
+
+        self.assertEqual(mock_build.call_count, 2)
+        for call in mock_build.call_args_list:
+            self.assertEqual(call.kwargs["model"], "google/gemini-2.5-flash")
+            self.assertEqual(call.kwargs["override_provider"], "openrouter")
+            self.assertEqual(
+                call.kwargs["reasoning_config_override"],
+                {"enabled": True, "effort": "low"},
+            )
+        mock_creds.assert_called_once()
+
+    @patch("tools.delegate_tool._load_config")
+    @patch("tools.delegate_tool._resolve_delegation_credentials")
+    def test_per_call_overrides_config_for_entire_invocation(self, mock_creds, mock_cfg):
+        mock_cfg.return_value = {
+            "max_iterations": 45,
+            "model": "anthropic/claude-opus-4",
+            "provider": "anthropic",
+            "reasoning_effort": "high",
+            "base_url": "https://configured.example/v1",
+            "api_key": "configured-direct-key",
+            "api_mode": "chat_completions",
+        }
+
+        def resolve(effective_cfg, _parent):
+            return {
+                "model": effective_cfg.get("model"),
+                "provider": effective_cfg.get("provider"),
+                "base_url": "https://openrouter.ai/api/v1",
+                "api_key": "test-key",
+                "api_mode": "chat_completions",
+            }
+
+        mock_creds.side_effect = resolve
+        parent = _make_mock_parent(depth=0)
+        parent.reasoning_config = {"enabled": True, "effort": "xhigh"}
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            child = MagicMock()
+            child.run_conversation.return_value = {
+                "final_response": "done", "completed": True, "api_calls": 1
+            }
+            MockAgent.return_value = child
+
+            delegate_task(
+                goal="Verify checklist",
+                model="google/gemini-2.5-flash",
+                provider="openrouter",
+                reasoning_effort="low",
+                parent_agent=parent,
+            )
+
+        effective_cfg = mock_creds.call_args.args[0]
+        self.assertEqual(effective_cfg["model"], "google/gemini-2.5-flash")
+        self.assertEqual(effective_cfg["provider"], "openrouter")
+        self.assertNotIn("base_url", effective_cfg)
+        self.assertNotIn("api_key", effective_cfg)
+        self.assertNotIn("api_mode", effective_cfg)
+        self.assertEqual(MockAgent.call_args.kwargs["model"], "google/gemini-2.5-flash")
+        self.assertEqual(MockAgent.call_args.kwargs["provider"], "openrouter")
+        self.assertEqual(
+            MockAgent.call_args.kwargs["reasoning_config"],
+            {"enabled": True, "effort": "low"},
+        )
+        metadata = child._delegation_runtime_metadata
+        self.assertEqual(metadata["model"], "google/gemini-2.5-flash")
+        self.assertEqual(metadata["provider"], "openrouter")
+        self.assertEqual(metadata["api_mode"], "chat_completions")
+        self.assertEqual(metadata["reasoning_config"], {"enabled": True, "effort": "low"})
+        for secret_field in ("api_key", "base_url", "request_overrides"):
+            self.assertNotIn(secret_field, metadata)
+        self.assertEqual(mock_cfg.return_value["model"], "anthropic/claude-opus-4")
+
     @patch("tools.delegate_tool._load_config")
     @patch("tools.delegate_tool._resolve_delegation_credentials")
     def test_config_provider_credentials_reach_child_agent(self, mock_creds, mock_cfg):
@@ -2405,6 +2580,22 @@ class TestDelegateHeartbeat(unittest.TestCase):
 class TestDelegationReasoningEffort(unittest.TestCase):
     """Tests for delegation.reasoning_effort config override."""
 
+    @patch("tools.delegate_tool._build_child_agent")
+    def test_invalid_per_call_reasoning_effort_returns_error_before_child_creation(self, mock_build):
+        parent = _make_mock_parent()
+
+        result = json.loads(
+            delegate_task(
+                goal="verify checklist",
+                reasoning_effort="banana",
+                parent_agent=parent,
+            )
+        )
+
+        self.assertIn("error", result)
+        self.assertIn("reasoning_effort", result["error"])
+        mock_build.assert_not_called()
+
     @patch("tools.delegate_tool._load_config")
     @patch("run_agent.AIAgent")
     def test_inherits_parent_reasoning_when_no_override(self, MockAgent, mock_cfg):
@@ -2480,6 +2671,56 @@ class TestDelegationReasoningEffort(unittest.TestCase):
 
 class TestDispatchDelegateTask(unittest.TestCase):
     """Tests for the _dispatch_delegate_task helper and full param forwarding."""
+
+    def test_forwards_per_call_model_provider_and_reasoning(self):
+        import run_agent
+
+        captured = {}
+
+        def fake_delegate_task(**kwargs):
+            captured.update(kwargs)
+            return "{}"
+
+        parent = _make_mock_parent(depth=0)
+        with patch("tools.delegate_tool.delegate_task", fake_delegate_task):
+            run_agent.AIAgent._dispatch_delegate_task(
+                parent,
+                {
+                    "goal": "verify checklist",
+                    "model": "google/gemini-2.5-flash",
+                    "provider": "openrouter",
+                    "reasoning_effort": "low",
+                },
+            )
+
+        self.assertEqual(captured["model"], "google/gemini-2.5-flash")
+        self.assertEqual(captured["provider"], "openrouter")
+        self.assertEqual(captured["reasoning_effort"], "low")
+
+    def test_registry_handler_forwards_per_call_overrides(self):
+        from tools.registry import registry
+
+        captured = {}
+
+        def fake_delegate_task(**kwargs):
+            captured.update(kwargs)
+            return "{}"
+
+        parent = _make_mock_parent(depth=0)
+        with patch("tools.delegate_tool.delegate_task", fake_delegate_task):
+            registry._tools["delegate_task"].handler(
+                {
+                    "goal": "verify checklist",
+                    "model": "google/gemini-2.5-flash",
+                    "provider": "openrouter",
+                    "reasoning_effort": "low",
+                },
+                parent_agent=parent,
+            )
+
+        self.assertEqual(captured["model"], "google/gemini-2.5-flash")
+        self.assertEqual(captured["provider"], "openrouter")
+        self.assertEqual(captured["reasoning_effort"], "low")
 
     def test_model_acp_args_not_forwarded(self):
         """The live model dispatch path strips hidden ACP transport args."""
