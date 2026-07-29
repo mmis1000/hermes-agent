@@ -15057,6 +15057,71 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 except OSError:
                     pass
 
+    async def _deliver_queued_first_response(
+        self,
+        *,
+        response: str,
+        source,
+        adapter,
+        thread_metadata: Optional[Dict[str, Any]],
+        already_streamed: bool,
+        event_message_id: Optional[str] = None,
+    ) -> None:
+        """Deliver a completed response before processing a queued follow-up.
+
+        The queued-follow-up branch returns the recursively processed result to
+        its caller, so the ordinary completed-turn post-processing never sees
+        this first response.  Deliver its text here when streaming did not, and
+        always run the shared MEDIA handler so attachments are not lost.
+        """
+        from gateway.platforms.base import BasePlatformAdapter, MessageEvent
+
+        if response and not already_streamed:
+            display_response = BasePlatformAdapter.strip_media_directives_for_display(
+                response
+            ).strip()
+            if display_response:
+                try:
+                    result = await adapter.send(
+                        source.chat_id,
+                        display_response,
+                        metadata=thread_metadata,
+                    )
+                    if getattr(result, "success", None) is False:
+                        logger.warning(
+                            "[%s] Queued first-response text delivery failed "
+                            "(chat=%s thread=%s): %s",
+                            getattr(adapter, "name", "adapter"),
+                            source.chat_id,
+                            getattr(source, "thread_id", None),
+                            getattr(result, "error", None) or "unknown adapter error",
+                        )
+                except Exception as exc:
+                    # Text and attachment delivery are independent.  In
+                    # particular, a formatting/send failure must not discard a
+                    # valid document referenced by this completed response.
+                    logger.warning(
+                        "[%s] Queued first-response text delivery raised "
+                        "(chat=%s thread=%s): %s",
+                        getattr(adapter, "name", "adapter"),
+                        source.chat_id,
+                        getattr(source, "thread_id", None),
+                        exc,
+                    )
+
+        if response:
+            synthetic_event = MessageEvent(
+                text="",
+                source=source,
+                message_id=event_message_id,
+                internal=True,
+            )
+            await self._deliver_media_from_response(
+                response,
+                synthetic_event,
+                adapter,
+            )
+
     async def _deliver_media_from_response(
         self,
         response: str,
@@ -22709,24 +22774,31 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             "Queued follow-up for session %s: suppressing intentional silence marker before continuing.",
                             session_key or "?",
                         )
-                    elif first_response and not _already_streamed:
+                    elif first_response:
                         try:
-                            logger.info(
-                                "Queued follow-up for session %s: final stream delivery not confirmed; sending first response before continuing.",
-                                session_key or "?",
-                            )
-                            await adapter.send(
-                                source.chat_id,
-                                first_response,
-                                metadata=_status_thread_metadata,
+                            if _already_streamed:
+                                logger.info(
+                                    "Queued follow-up for session %s: skipping text resend because final streamed delivery was confirmed; delivering attachments before continuing.",
+                                    session_key or "?",
+                                )
+                            else:
+                                logger.info(
+                                    "Queued follow-up for session %s: final stream delivery not confirmed; sending first response and attachments before continuing.",
+                                    session_key or "?",
+                                )
+                            await self._deliver_queued_first_response(
+                                response=first_response,
+                                source=source,
+                                adapter=adapter,
+                                thread_metadata=_status_thread_metadata,
+                                already_streamed=_already_streamed,
+                                event_message_id=event_message_id,
                             )
                         except Exception as e:
-                            logger.warning("Failed to send first response before queued message: %s", e)
-                    elif first_response:
-                        logger.info(
-                            "Queued follow-up for session %s: skipping resend because final streamed delivery was confirmed.",
-                            session_key or "?",
-                        )
+                            logger.warning(
+                                "Failed to deliver first response before queued message: %s",
+                                e,
+                            )
                     # Release deferred bg-review notifications now that the
                     # first response has been delivered.  Pop from the
                     # adapter's callback dict (prevents double-fire in
