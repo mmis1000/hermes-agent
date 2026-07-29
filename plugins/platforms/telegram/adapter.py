@@ -9020,7 +9020,16 @@ class TelegramAdapter(BasePlatformAdapter):
         if not text or not bot_username:
             return text
         username = re.escape(bot_username)
-        cleaned = re.sub(rf"(?i)@{username}\b[,:\-]*\s*", "", text).strip()
+        # Telegram group commands are addressed as `/command@bot args`.
+        # Remove the bot suffix without consuming the whitespace that separates
+        # the command token from its arguments.
+        cleaned = re.sub(
+            rf"(?i)(/[A-Za-z0-9_]+)@{username}\b[,:\-]*(?=\s|$)",
+            r"\1",
+            text,
+        )
+        # Mentions in ordinary prose are removed together with following space.
+        cleaned = re.sub(rf"(?i)@{username}\b[,:\-]*\s*", "", cleaned).strip()
         return cleaned or text
 
     def _should_observe_unmentioned_group_message(self, message: Message) -> bool:

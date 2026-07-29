@@ -115,6 +115,46 @@ async def test_command_from_unauthorized_user_blocked():
 
 
 @pytest.mark.asyncio
+async def test_command_from_authorized_user_processed():
+    """Commands from authorized users should be processed."""
+    adapter = _make_adapter(allow_from=["111"])
+    adapter.handle_message = AsyncMock()
+
+    update = SimpleNamespace(
+        update_id=1,
+        message=_make_message(text="/start", from_user_id=111),
+        effective_message=None,
+    )
+
+    await adapter._handle_command(update, SimpleNamespace())
+
+    adapter.handle_message.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_bot_addressed_command_preserves_argument_separator():
+    """Removing @bot from a command must not join the command and its option."""
+    adapter = _make_adapter(allow_from=["111"])
+    adapter.handle_message = AsyncMock()
+
+    update = SimpleNamespace(
+        update_id=1,
+        message=_make_message(
+            text="/reasoning@test_bot --global",
+            from_user_id=111,
+        ),
+        effective_message=None,
+    )
+
+    await adapter._handle_command(update, SimpleNamespace())
+
+    event = adapter.handle_message.await_args.args[0]
+    assert event.text == "/reasoning --global"
+    assert event.get_command() == "reasoning"
+    assert event.get_command_args() == "--global"
+
+
+@pytest.mark.asyncio
 async def test_location_from_unauthorized_user_blocked():
     """Location messages from unauthorized users should be blocked."""
     adapter = _make_adapter(group_allow_from=["222"])
