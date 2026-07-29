@@ -417,6 +417,9 @@ def _build_children(
             _ident_ref = getattr(child, "_progress_identity_ref", None)
             if isinstance(_ident_ref, dict):
                 _ident_ref["delegation_id"] = live_deleg_id
+        if routing_cfg.get("reasoning_effort") is not None:
+            from hermes_constants import parse_reasoning_effort
+            child.reasoning_config = parse_reasoning_effort(routing_cfg["reasoning_effort"])
         children.append((i, t, child))
     return children, None
 
@@ -447,6 +450,7 @@ def delegate_task(
     output_schema: Optional[Dict[str, Any]] = None, images: Optional[List[str]] = None, action: Optional[str] = None,
     subagent_id: Optional[str] = None, message: Optional[str] = None, parent_agent=None,
     credentials_cfg: Optional[Dict[str, Any]] = None,
+    model: Optional[str] = None, provider: Optional[str] = None, reasoning_effort: Optional[str] = None,
 ) -> str:
     """Spawn child agents (single ``goal`` or ``tasks=[...]`` batch) or control running ones. ``action``
     list/steer/stop run synchronously and bypass the pause gate, depth limit and async dispatch. ``role`` is legacy
@@ -494,7 +498,19 @@ def delegate_task(
     # credentials_cfg (internal callers only, e.g. /review → auxiliary.review) is
     # a per-call routing owner shaped like the delegation config section. Keep
     # the route and its fallback policy together through child construction.
-    routing_cfg = credentials_cfg if credentials_cfg is not None else cfg
+    routing_cfg = dict(credentials_cfg if credentials_cfg is not None else cfg)
+    if model is not None:
+        routing_cfg["model"] = model
+    if provider is not None:
+        routing_cfg["provider"] = provider
+        for key in ("base_url", "api_key", "api_mode"):
+            routing_cfg.pop(key, None)
+    if reasoning_effort is not None:
+        from hermes_constants import parse_reasoning_effort
+        parsed_reasoning = parse_reasoning_effort(reasoning_effort)
+        if parsed_reasoning is None:
+            return tool_error(f"Unknown delegation reasoning_effort '{reasoning_effort}'.")
+        routing_cfg["reasoning_effort"] = reasoning_effort
     try:
         creds = _resolve_delegation_credentials(routing_cfg, parent_agent)
     except ValueError as exc:
