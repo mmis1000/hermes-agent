@@ -140,18 +140,30 @@ process disappears while it is still running is recorded as `unknown`, because
 Hermes cannot prove whether its external side effects happened. Pending and
 delivered records are bounded and profile-local.
 
-## Model Override
+## Model and reasoning overrides
 
-You can configure a different model for subagents via `config.yaml` — useful for delegating simple tasks to cheaper/faster models:
+You can configure a default model for all subagents through `config.yaml`:
 
 ```yaml
 # In ~/.hermes/config.yaml
 delegation:
-  model: "google/gemini-flash-2.0"    # Cheaper model for subagents
-  provider: "openrouter"              # Optional: route subagents to a different provider
+  model: "anthropic/claude-opus-4"
+  provider: "openrouter"
+  reasoning_effort: "high"
 ```
 
-If omitted, subagents use the same model as the parent.
+For routine work, one `delegate_task` call can override that default without changing configuration:
+
+```python
+delegate_task(
+    goal="Verify every action item against the repository and return an evidence-backed checklist.",
+    provider="openrouter",
+    model="google/gemini-2.5-flash",
+    reasoning_effort="low",
+)
+```
+
+The override applies to every child in that invocation, including every child in a batch. Values are resolved in this order: per-call override, then `delegation.*` configuration, then parent inheritance. Omitting all three fields preserves the existing behavior.
 
 ### Cost strategy: frontier planner, inexpensive workers
 
