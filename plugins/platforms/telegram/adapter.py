@@ -6177,7 +6177,17 @@ class TelegramAdapter(BasePlatformAdapter):
         bot_username = self._current_bot_username()
         if not text or not bot_username:
             return text
-        cleaned = re.sub(rf"(?i)@{re.escape(bot_username)}\b[,:\-]*\s*", "", text).strip()
+        username = re.escape(bot_username)
+        # Telegram group commands are addressed as `/command@bot args`.
+        # Remove the bot suffix without consuming the whitespace that separates
+        # the command token from its arguments.
+        cleaned = re.sub(
+            rf"(?i)(/[A-Za-z0-9_]+)@{username}\b[,:\-]*(?=\s|$)",
+            r"\1",
+            text,
+        )
+        # Mentions in ordinary prose are removed together with following space.
+        cleaned = re.sub(rf"(?i)@{username}\b[,:\-]*\s*", "", cleaned).strip()
         return cleaned or text
 
     def _topic_gates_pass(self, thread_id, *, warn_non_numeric: bool) -> Optional[bool]:
