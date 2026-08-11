@@ -334,6 +334,8 @@ def test_protected_resume_reconstructs_scope_tools_and_fresh_private_attempt(
         ),
     )
     attempt_registry = AttemptScopeRegistry()
+    prepare_idmaps = MagicMock(wraps=attempt_registry.prepare_idmapped_reveals)
+    attempt_registry.prepare_idmapped_reveals = prepare_idmaps
     monkeypatch.setattr(scope_module, "attempt_scope_registry", attempt_registry)
     parent = SimpleNamespace(
         delegation_backing_registry=backing_registry,
@@ -366,6 +368,7 @@ def test_protected_resume_reconstructs_scope_tools_and_fresh_private_attempt(
         assert child._delegation_scope_id != "scope-initial"
         assert attempt_registry.get("attempt-new").state == "active"
         assert terminal_tool._resolve_container_task_id("attempt-new") == "attempt-new"
+        prepare_idmaps.assert_called_once_with("attempt-new")
     finally:
         attempt_registry.cleanup("attempt-new")
 
