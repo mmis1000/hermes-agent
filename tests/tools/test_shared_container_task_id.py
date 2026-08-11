@@ -287,6 +287,83 @@ def test_protected_acquisition_materializes_only_resolved_profile_and_reveals(mo
     }
 
 
+def test_protected_acquisition_uses_attempt_prepared_mount_source(monkeypatch):
+    from pathlib import PurePosixPath
+    from unittest.mock import MagicMock
+    from agent.delegation_policy import AccessMode, BackingObjectRef, ExecutionProfile, VisibleObjectGrant
+    from tools.delegation_scope import (
+        BackingObjectRecord,
+        BackingObjectRegistry,
+        ResolvedInvocationScope,
+        attempt_scope_registry,
+        execution_profile_hash,
+    )
+
+    grant = VisibleObjectGrant(
+        "/visible/data",
+        AccessMode.RW,
+        BackingObjectRef("obj-mapped", "host_path", "/trusted/data", "rev-1"),
+        "directory",
+    )
+    profile = ExecutionProfile(
+        "protected",
+        "docker",
+        "repo/protected@sha256:deadbeef",
+        PurePosixPath("/workspace"),
+        frozenset({"terminal"}),
+        network="none",
+        runtime_identity=(10001, 10001),
+    )
+    scope = ResolvedInvocationScope(
+        profile.name,
+        execution_profile_hash(profile),
+        profile,
+        PurePosixPath("/workspace"),
+        (),
+        (grant,),
+    )
+    authority = attempt_scope_registry.reserve(
+        scope,
+        "logical-mapped",
+        attempt_id="attempt-protected-mapped",
+        backing_registry=BackingObjectRegistry(
+            {grant.backing.object_id: BackingObjectRecord(grant.backing, "directory")}
+        ),
+    )
+    authority.prepared_mount_sources[grant.backing.object_id] = "/private/mapped"
+    create = MagicMock(return_value=object())
+    monkeypatch.setattr(terminal_tool, "_get_env_config", lambda: {
+        "env_type": "local", "cwd": "/ambient", "timeout": 60,
+        "lifetime_seconds": 300,
+    })
+    monkeypatch.setattr(terminal_tool, "_create_environment", create)
+    monkeypatch.setattr(terminal_tool, "_start_cleanup_thread", lambda: None)
+    monkeypatch.setattr(terminal_tool, "_active_environments", {})
+    monkeypatch.setattr(terminal_tool, "_last_activity", {})
+    monkeypatch.setattr(terminal_tool, "_task_env_overrides", {})
+    monkeypatch.setattr(terminal_tool, "_creation_locks", {})
+
+    try:
+        terminal_tool.register_task_env_overrides(authority.attempt_id, {
+            "env_type": "docker", "docker_image": profile.image, "cwd": "/workspace",
+            "delegation_scope_id": authority.scope_id,
+        })
+        terminal_tool.acquire_task_environment(authority.attempt_id)
+    finally:
+        terminal_tool.clear_task_env_overrides(authority.attempt_id)
+        attempt_scope_registry.cleanup(authority.attempt_id)
+
+    trusted_mounts = create.call_args.kwargs["container_config"]["trusted_mounts"]
+    assert trusted_mounts == [
+        {
+            "kind": "host_path",
+            "source": "/private/mapped",
+            "target": "/visible/data",
+            "mode": "rw",
+        }
+    ]
+
+
 def test_protected_acquisition_revalidates_backing_revision_before_creation(monkeypatch):
     from pathlib import PurePosixPath
     from unittest.mock import MagicMock
