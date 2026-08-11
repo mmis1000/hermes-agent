@@ -57,6 +57,7 @@ def test_terminal_uses_central_task_environment_acquisition(monkeypatch):
     monkeypatch.setattr(terminal_tool, "acquire_task_environment", acquired)
     monkeypatch.setattr(terminal_tool, "_active_environments", {"default": env})
     monkeypatch.setattr(terminal_tool, "_last_activity", {})
+    monkeypatch.setattr(terminal_tool, "_session_cwd", {})
     monkeypatch.setattr(terminal_tool, "_get_env_config", lambda: _minimal_terminal_config())
     monkeypatch.setattr(
         terminal_tool,

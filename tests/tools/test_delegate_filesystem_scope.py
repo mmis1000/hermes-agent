@@ -339,7 +339,8 @@ def test_protected_orchestrator_policy_and_toolsets_derive_only_from_effective_s
         backend="docker",
         image="repo/isolated@sha256:deadbeef",
         default_workdir="/work",
-        allowed_toolsets=frozenset({"terminal", "delegation"}),
+        allowed_toolsets=frozenset({"terminal"}),
+        allowed_tools=frozenset({"delegate_task", "skills_list", "skill_view"}),
     )
     omitted_profile = ExecutionProfile(
         name="other",
@@ -389,7 +390,7 @@ def test_protected_orchestrator_policy_and_toolsets_derive_only_from_effective_s
     parent = MagicMock()
     parent.delegation_policy = parent_policy
     parent.delegation_backing_registry = object()
-    parent.enabled_toolsets = ["terminal", "web", "delegation"]
+    parent.enabled_toolsets = ["terminal", "web", "delegation", "skills"]
     parent.disabled_toolsets = []
     parent._delegate_depth = 0
     parent._session_db = None
@@ -405,6 +406,17 @@ def test_protected_orchestrator_policy_and_toolsets_derive_only_from_effective_s
         "run_agent.AIAgent"
     ) as agent_cls:
         child = MagicMock()
+        child.valid_tool_names = {
+            "terminal",
+            "web_search",
+            "delegate_task",
+            "skills_list",
+            "skill_view",
+            "skill_manage",
+        }
+        child.tools = [
+            {"function": {"name": name}} for name in child.valid_tool_names
+        ]
         agent_cls.return_value = child
         from tools.delegate_tool import _build_child_agent
 
@@ -426,7 +438,14 @@ def test_protected_orchestrator_policy_and_toolsets_derive_only_from_effective_s
     assert child_policy.allowed_profiles == frozenset({"isolated"})
     assert set(child_policy.profile_snapshots) == {"isolated"}
     assert child_policy.visible_objects == (effective_grant,)
-    assert set(kwargs["enabled_toolsets"]) == {"terminal", "delegation"}
+    assert set(kwargs["enabled_toolsets"]) == {"terminal", "delegation", "skills"}
+    assert child.valid_tool_names == {
+        "terminal",
+        "delegate_task",
+        "skills_list",
+        "skill_view",
+    }
+    assert {item["function"]["name"] for item in child.tools} == child.valid_tool_names
     assert child.delegation_backing_registry is parent.delegation_backing_registry
 
 

@@ -1,16 +1,28 @@
 """Live adversarial gates for protected delegation Docker materialization."""
 
+import asyncio
 import json
 import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import pytest
+from aiohttp import web
+from aiohttp.test_utils import TestClient, TestServer
 
 from agent.delegation_policy import DelegationSessionPolicy, ExecutionProfile
+from gateway.config import PlatformConfig
+from gateway.platforms.api_server import APIServerAdapter
 from run_agent import AIAgent
-from tools.delegation_scope import resolve_invocation_scope
+from tools.delegation_scope import (
+    admit_trusted_run_execution,
+    attempt_scope_registry,
+    configure_protected_attempt_environment,
+    resolve_invocation_scope,
+)
 from tools.environments.docker import DockerEnvironment
 
 
@@ -330,3 +342,159 @@ def test_protected_force_cleanup_returns_only_after_real_container_removal(
         timeout=30,
     )
     assert inspect.returncode != 0, inspect.stdout + inspect.stderr
+
+
+def test_trusted_runs_root_materializes_exact_home_repository(protected_image):
+    import tools.terminal_tool as terminal_tool
+
+    profile = ExecutionProfile(
+        name="isolated",
+        backend="docker",
+        image=protected_image,
+        default_workdir="/workspace",
+        allowed_toolsets=frozenset({"terminal"}),
+        network="none",
+        runtime_identity=(10001, 10001),
+    )
+    base_policy = DelegationSessionPolicy(
+        profile_required=True,
+        allow_profile_none=False,
+        allowed_profiles=frozenset({"isolated"}),
+        profile_snapshots={"isolated": profile},
+        visible_objects=(),
+        protected_prefixes=(),
+    )
+    with tempfile.TemporaryDirectory(
+        prefix="hermes-protected-runs-",
+        dir=Path.home(),
+    ) as repository:
+        admitted = admit_trusted_run_execution(
+            base_policy,
+            {
+                "profile": "isolated",
+                "workdir": repository,
+                "reveal": [{"path": repository, "mode": "rw"}],
+            },
+            inherited_network=False,
+        )
+        task_id = "integration-trusted-runs-root"
+        authority = attempt_scope_registry.reserve(
+            admitted.invocation_scope,
+            "integration-session",
+            attempt_id=task_id,
+            backing_registry=admitted.backing_registry,
+        )
+        assert authority.attempt_id == task_id
+        try:
+            attempt_scope_registry.prepare_idmapped_reveals(task_id)
+            configure_protected_attempt_environment(task_id)
+            attempt_scope_registry.activate(task_id, run_id="integration-run")
+            result = json.loads(
+                terminal_tool.terminal_tool(
+                    command=(
+                        f"test \"$(pwd)\" = {repository}; "
+                        "test ! -e /home/prod/.hermes; "
+                        "printf live-root > materialized.txt"
+                    ),
+                    task_id=task_id,
+                    timeout=30,
+                    force=True,
+                )
+            )
+            assert result["exit_code"] == 0, result
+            assert Path(repository, "materialized.txt").read_text(
+                encoding="utf-8"
+            ) == "live-root"
+        finally:
+            assert attempt_scope_registry.cleanup(task_id) == ()
+
+
+@pytest.mark.asyncio
+async def test_runs_api_is_trusted_initiator_for_live_protected_root(
+    protected_image,
+    monkeypatch,
+):
+    import tools.terminal_tool as terminal_tool
+
+    profile = ExecutionProfile(
+        name="isolated",
+        backend="docker",
+        image=protected_image,
+        default_workdir="/workspace",
+        allowed_toolsets=frozenset({"terminal"}),
+        network="inherit",
+        runtime_identity=(10001, 10001),
+    )
+    base_policy = DelegationSessionPolicy(
+        profile_required=True,
+        allow_profile_none=False,
+        allowed_profiles=frozenset({"isolated"}),
+        profile_snapshots={"isolated": profile},
+        visible_objects=(),
+        protected_prefixes=(),
+    )
+    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={}))
+    monkeypatch.setenv("TERMINAL_DOCKER_NETWORK", "false")
+    app = web.Application()
+    app.router.add_post("/v1/runs", adapter._handle_runs)
+    app.router.add_get("/v1/runs/{run_id}", adapter._handle_get_run)
+
+    with tempfile.TemporaryDirectory(
+        prefix="hermes-runs-api-protected-",
+        dir=Path.home(),
+    ) as repository:
+        agent = MagicMock()
+        agent.tools = [{"function": {"name": "terminal"}}]
+        agent.valid_tool_names = {"terminal"}
+        agent.session_prompt_tokens = 0
+        agent.session_completion_tokens = 0
+        agent.session_total_tokens = 0
+
+        def _run_conversation(*, task_id, **_kwargs):
+            result = json.loads(
+                terminal_tool.terminal_tool(
+                    command=(
+                        "test ! -e /home/prod/.hermes; "
+                        "printf api-live > api-materialized.txt"
+                    ),
+                    task_id=task_id,
+                    timeout=30,
+                    force=True,
+                )
+            )
+            assert result["exit_code"] == 0, result
+            return {"final_response": "protected root completed"}
+
+        agent.run_conversation.side_effect = _run_conversation
+        with (
+            patch(
+                "agent.agent_init._admit_standard_delegation_policy",
+                return_value=base_policy,
+            ),
+            patch.object(adapter, "_create_agent", return_value=agent),
+        ):
+            async with TestClient(TestServer(app)) as client:
+                response = await client.post(
+                    "/v1/runs",
+                    json={
+                        "input": "exercise the protected root",
+                        "execution": {
+                            "profile": "isolated",
+                            "workdir": repository,
+                            "reveal": [{"path": repository, "mode": "rw"}],
+                        },
+                    },
+                )
+                assert response.status == 202
+                run_id = (await response.json())["run_id"]
+                for _ in range(100):
+                    if run_id not in adapter._active_run_tasks:
+                        break
+                    await asyncio.sleep(0.05)
+                status = await client.get(f"/v1/runs/{run_id}")
+                status_body = await status.json()
+
+        assert status_body["status"] == "completed", status_body
+        assert Path(repository, "api-materialized.txt").read_text(
+            encoding="utf-8"
+        ) == "api-live"
