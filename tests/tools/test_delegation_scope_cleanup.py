@@ -7,7 +7,12 @@ from types import SimpleNamespace
 
 import pytest
 
-from agent.delegation_policy import ExecutionProfile
+from agent.delegation_policy import (
+    AccessMode,
+    BackingObjectRef,
+    ExecutionProfile,
+    VisibleObjectGrant,
+)
 from tools import terminal_tool
 from tools.environments import docker as docker_env
 from tools.delegation_scope import (
@@ -17,15 +22,133 @@ from tools.delegation_scope import (
 )
 
 
-def _scope():
+def _scope(runtime_identity=None, visible_objects=()):
     profile = ExecutionProfile(
         "protected", "docker", "repo/protected@sha256:deadbeef", "/workspace",
-        frozenset({"terminal"}),
+        frozenset({"terminal"}), runtime_identity=runtime_identity,
     )
     return ResolvedInvocationScope(
         profile.name, execution_profile_hash(profile), profile,
-        PurePosixPath("/workspace"), (), (),
+        PurePosixPath("/workspace"), (), visible_objects,
     )
+
+
+def _directory_grant(source):
+    return VisibleObjectGrant(
+        "/workspace/shared",
+        AccessMode.RW,
+        BackingObjectRef("shared", "host_path", str(source), "rev-1"),
+        "directory",
+    )
+
+
+def test_runtime_identity_prepares_before_environment_and_cleans_after_it(
+    tmp_path, monkeypatch
+):
+    source = tmp_path / "source"
+    source.mkdir()
+    grant = _directory_grant(source)
+    order = []
+
+    def prepare(attempt_id, grants, identity, *, register_cleanup):
+        assert attempt_id == "attempt-idmap"
+        assert grants == (grant,)
+        assert identity == (10001, 10002)
+        register_cleanup(lambda: order.append("idmap"))
+        return {"shared": "/private/mapped"}
+
+    monkeypatch.setattr("tools.idmapped_mounts.prepare_idmapped_reveals", prepare)
+    authority = attempt_scope_registry.reserve(
+        _scope((10001, 10002), (grant,)),
+        "logical-idmap",
+        attempt_id="attempt-idmap",
+    )
+
+    attempt_scope_registry.prepare_idmapped_reveals(authority.attempt_id)
+    attempt_scope_registry.add_resource(
+        authority.attempt_id, "task-environment", lambda: order.append("environment")
+    )
+
+    assert authority.prepared_mount_sources == {"shared": "/private/mapped"}
+    assert attempt_scope_registry.cleanup(authority.attempt_id) == ()
+    assert order == ["environment", "idmap"]
+
+
+def test_partial_setup_failure_retains_cleanup_for_attempt_retry(tmp_path, monkeypatch):
+    source = tmp_path / "source-partial"
+    source.mkdir()
+    grant = _directory_grant(source)
+    cleanup = MagicMock()
+
+    def prepare(_attempt_id, _grants, _identity, *, register_cleanup):
+        register_cleanup(cleanup)
+        raise RuntimeError("second mount failed")
+
+    monkeypatch.setattr("tools.idmapped_mounts.prepare_idmapped_reveals", prepare)
+    authority = attempt_scope_registry.reserve(
+        _scope((10001, 10001), (grant,)),
+        "logical-partial",
+        attempt_id="attempt-partial",
+    )
+
+    with pytest.raises(RuntimeError, match="second mount failed"):
+        attempt_scope_registry.prepare_idmapped_reveals(authority.attempt_id)
+
+    assert list(authority.resources.cleanup_callbacks) == ["idmapped-reveals"]
+    assert attempt_scope_registry.cleanup(authority.attempt_id) == ()
+    cleanup.assert_called_once_with()
+
+
+def test_environment_failure_blocks_unmount_until_container_cleanup_retries(
+    tmp_path, monkeypatch
+):
+    source = tmp_path / "source-environment-failure"
+    source.mkdir()
+    grant = _directory_grant(source)
+    unmount = MagicMock()
+    environment_calls = 0
+
+    def prepare(_attempt_id, _grants, _identity, *, register_cleanup):
+        register_cleanup(unmount)
+        return {"shared": "/private/mapped"}
+
+    def cleanup_environment():
+        nonlocal environment_calls
+        environment_calls += 1
+        if environment_calls == 1:
+            raise RuntimeError("docker rm failed")
+
+    monkeypatch.setattr("tools.idmapped_mounts.prepare_idmapped_reveals", prepare)
+    authority = attempt_scope_registry.reserve(
+        _scope((10001, 10001), (grant,)),
+        "logical-environment-failure",
+        attempt_id="attempt-environment-failure",
+    )
+    attempt_scope_registry.prepare_idmapped_reveals(authority.attempt_id)
+    attempt_scope_registry.add_resource(
+        authority.attempt_id, "task-environment", cleanup_environment
+    )
+
+    first_errors = attempt_scope_registry.cleanup(authority.attempt_id)
+    assert first_errors
+    unmount.assert_not_called()
+
+    assert attempt_scope_registry.cleanup(authority.attempt_id) == ()
+    unmount.assert_called_once_with()
+
+
+def test_omitted_runtime_identity_does_not_prepare_mounts(monkeypatch):
+    prepare = MagicMock()
+    monkeypatch.setattr("tools.idmapped_mounts.prepare_idmapped_reveals", prepare)
+    authority = attempt_scope_registry.reserve(
+        _scope(), "logical-ordinary", attempt_id="attempt-ordinary"
+    )
+
+    attempt_scope_registry.prepare_idmapped_reveals(authority.attempt_id)
+
+    prepare.assert_not_called()
+    assert authority.prepared_mount_sources == {}
+    assert attempt_scope_registry.cleanup(authority.attempt_id) == ()
 
 
 def test_cleanup_revokes_before_reverse_teardown_and_is_idempotent(
