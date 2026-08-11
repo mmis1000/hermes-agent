@@ -407,3 +407,15 @@ async def test_shutdown_mcp_servers_nonblocking_completes_fast_path():
         done = await gateway_run._shutdown_mcp_servers_nonblocking(timeout=5)
     assert done is True
     assert calls == [1]
+
+
+def test_cleanup_agent_resources_reaps_stale_aux_clients():
+    runner, _adapter = make_restart_runner()
+    agent = MagicMock()
+
+    with patch("agent.auxiliary_client.cleanup_stale_async_clients") as cleanup_mock:
+        runner._cleanup_agent_resources(agent)
+
+    agent.shutdown_memory_provider.assert_called_once()
+    agent.close.assert_called_once()
+    cleanup_mock.assert_called_once()

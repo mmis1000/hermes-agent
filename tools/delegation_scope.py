@@ -79,6 +79,8 @@ class ResolvedAttemptAuthority:
     run_id: str | None = None
     resources: AttemptResourceLedger = field(default_factory=AttemptResourceLedger)
     backing_registry: Any = None
+    prepared_mount_sources: dict[str, str] = field(default_factory=dict)
+    task_environment_cleaned: bool = True
 
 
 class AttemptScopeRegistry:
@@ -123,7 +125,66 @@ class AttemptScopeRegistry:
                 raise ValueError(f"physical attempt is not resource-owning: {attempt_id}")
             if resource_key in record.resources.cleanup_callbacks:
                 raise ValueError(f"resource already registered: {resource_key}")
+            if resource_key == "task-environment":
+                record.task_environment_cleaned = False
+                original_cleanup = cleanup
+
+                def cleanup_task_environment() -> None:
+                    original_cleanup()
+                    with self._lock:
+                        record.task_environment_cleaned = True
+
+                cleanup = cleanup_task_environment
             record.resources.cleanup_callbacks[resource_key] = cleanup
+
+    def prepare_idmapped_reveals(self, attempt_id: str) -> None:
+        with self._lock:
+            record = self._records.get(attempt_id)
+            if record is None or record.state not in {"starting", "active"}:
+                raise ValueError(f"physical attempt is not resource-owning: {attempt_id}")
+            identity = record.invocation_scope.profile.runtime_identity
+            grants = record.invocation_scope.visible_objects
+            if identity is None or not grants:
+                return
+            resource_key = "idmapped-reveals"
+            if (
+                record.prepared_mount_sources
+                or resource_key in record.resources.cleanup_callbacks
+            ):
+                raise ValueError(f"idmapped reveals already prepared: {attempt_id}")
+
+        from tools.idmapped_mounts import prepare_idmapped_reveals
+
+        def register_cleanup(cleanup: Callable[[], None]) -> None:
+            def cleanup_registered_mounts() -> None:
+                with self._lock:
+                    if not record.task_environment_cleaned:
+                        raise RuntimeError(
+                            "container cleanup must succeed before idmapped unmount"
+                        )
+                cleanup()
+                with self._lock:
+                    record.prepared_mount_sources.clear()
+
+            with self._lock:
+                if record.state not in {"starting", "active"}:
+                    raise ValueError(
+                        f"physical attempt is not resource-owning: {attempt_id}"
+                    )
+                if resource_key in record.resources.cleanup_callbacks:
+                    raise ValueError(f"resource already registered: {resource_key}")
+                record.resources.cleanup_callbacks[resource_key] = cleanup_registered_mounts
+
+        prepared = prepare_idmapped_reveals(
+            attempt_id,
+            grants,
+            identity,
+            register_cleanup=register_cleanup,
+        )
+        with self._lock:
+            if record.state not in {"starting", "active"}:
+                raise ValueError(f"physical attempt is not resource-owning: {attempt_id}")
+            record.prepared_mount_sources.update(prepared)
 
     def activate(
         self,
@@ -151,8 +212,12 @@ class AttemptScopeRegistry:
             record.state = "revoked"
             callbacks = list(record.resources.cleanup_callbacks.items())
             record.resources.cleanup_callbacks.clear()
+        cleanup_order = list(reversed(callbacks))
+        cleanup_order = [
+            item for item in cleanup_order if item[0] != "idmapped-reveals"
+        ] + [item for item in cleanup_order if item[0] == "idmapped-reveals"]
         errors: list[Exception] = []
-        for resource_key, callback in reversed(callbacks):
+        for resource_key, callback in cleanup_order:
             try:
                 callback()
             except Exception as exc:  # cleanup must continue across the ledger
@@ -184,6 +249,14 @@ class AttemptScopeRegistry:
     def rollback(self, attempt_ids: Sequence[str]) -> None:
         for attempt_id in reversed(tuple(attempt_ids)):
             self.cleanup(attempt_id)
+
+    def cleanup_all(self) -> tuple[Exception, ...]:
+        with self._lock:
+            attempt_ids = tuple(self._records)
+        errors: list[Exception] = []
+        for attempt_id in reversed(attempt_ids):
+            errors.extend(self.cleanup(attempt_id))
+        return tuple(errors)
 
 
 attempt_scope_registry = AttemptScopeRegistry()
@@ -275,8 +348,23 @@ _PROFILE_KEYS = frozenset(
         "memory_mb",
         "shm_mb",
         "pids_limit",
+        "runtime_identity",
     }
 )
+
+
+def _parse_runtime_identity(raw: Any) -> tuple[int, int] | None:
+    if raw is None:
+        return None
+    if not isinstance(raw, Mapping) or set(raw) != {"uid", "gid"}:
+        raise ValueError("runtime_identity must contain exactly uid and gid")
+    values = (raw["uid"], raw["gid"])
+    if any(
+        isinstance(value, bool) or not isinstance(value, int) or value < 0
+        for value in values
+    ):
+        raise ValueError("runtime_identity uid and gid must be non-negative integers")
+    return values
 
 
 def parse_execution_profiles(config: Mapping[str, Any]) -> Mapping[str, ExecutionProfile]:
@@ -327,6 +415,7 @@ def parse_execution_profiles(config: Mapping[str, Any]) -> Mapping[str, Executio
             memory_mb=raw.get("memory_mb"),
             shm_mb=raw.get("shm_mb"),
             pids_limit=raw.get("pids_limit"),
+            runtime_identity=_parse_runtime_identity(raw.get("runtime_identity")),
         )
     return MappingProxyType(parsed)
 
@@ -345,6 +434,11 @@ def execution_profile_hash(profile: ExecutionProfile) -> str:
         "shm_mb": profile.shm_mb,
         "pids_limit": profile.pids_limit,
     }
+    if profile.runtime_identity is not None:
+        payload["runtime_identity"] = {
+            "uid": profile.runtime_identity[0],
+            "gid": profile.runtime_identity[1],
+        }
     canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
@@ -353,7 +447,7 @@ _AUTHORITY_VERSION = 1
 
 
 def _execution_profile_payload(profile: ExecutionProfile) -> dict[str, Any]:
-    return {
+    payload = {
         "name": profile.name,
         "backend": profile.backend,
         "image": profile.image,
@@ -366,6 +460,12 @@ def _execution_profile_payload(profile: ExecutionProfile) -> dict[str, Any]:
         "shm_mb": profile.shm_mb,
         "pids_limit": profile.pids_limit,
     }
+    if profile.runtime_identity is not None:
+        payload["runtime_identity"] = {
+            "uid": profile.runtime_identity[0],
+            "gid": profile.runtime_identity[1],
+        }
+    return payload
 
 
 def serialize_delegation_authority(
@@ -571,6 +671,7 @@ def deserialize_delegation_authority(
             memory_mb=snapshot.get("memory_mb"),
             shm_mb=snapshot.get("shm_mb"),
             pids_limit=snapshot.get("pids_limit"),
+            runtime_identity=_parse_runtime_identity(snapshot.get("runtime_identity")),
         )
     except (KeyError, TypeError, ValueError) as exc:
         raise ValueError("protected authority profile is malformed") from exc
