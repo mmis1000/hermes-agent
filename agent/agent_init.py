@@ -26,6 +26,7 @@ import sys
 import threading
 import time
 import uuid
+from collections.abc import Mapping
 from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional
 from urllib.parse import urlparse, parse_qs, urlunparse
@@ -66,6 +67,64 @@ def _ra():
     """
     import run_agent
     return run_agent
+
+
+def _admit_standard_delegation_policy(explicit_policy):
+    """Snapshot operator-owned filesystem isolation for a standard session."""
+
+    if explicit_policy is not None:
+        return explicit_policy
+
+    from hermes_cli.config import load_config_readonly
+
+    config = load_config_readonly()
+    delegation = config.get("delegation", {})
+    if not isinstance(delegation, Mapping):
+        return None
+    isolation = delegation.get("filesystem_isolation", {})
+    if not isinstance(isolation, Mapping):
+        raise ValueError("delegation.filesystem_isolation must be a mapping")
+    enabled = isolation.get("enabled", False)
+    if not isinstance(enabled, bool):
+        raise ValueError("delegation.filesystem_isolation.enabled must be a boolean")
+    if not enabled:
+        return None
+
+    from agent.delegation_policy import DelegationSessionPolicy
+    from tools.delegation_scope import parse_execution_profiles
+
+    profiles = parse_execution_profiles(delegation)
+    raw_allowed = isolation.get("allowed_profiles")
+    if not isinstance(raw_allowed, list) or not raw_allowed:
+        raise ValueError(
+            "delegation.filesystem_isolation.allowed_profiles must be a non-empty list"
+        )
+    if not all(
+        isinstance(name, str) and name and name == name.strip()
+        for name in raw_allowed
+    ):
+        raise ValueError(
+            "delegation.filesystem_isolation.allowed_profiles must contain canonical strings"
+        )
+    if len(raw_allowed) != len(set(raw_allowed)):
+        raise ValueError(
+            "delegation.filesystem_isolation.allowed_profiles must not contain duplicates"
+        )
+    unknown = sorted(set(raw_allowed).difference(profiles))
+    if unknown:
+        raise ValueError(
+            "delegation.filesystem_isolation.allowed_profiles contains unknown profiles: "
+            + ", ".join(unknown)
+        )
+    snapshots = {name: profiles[name] for name in raw_allowed}
+    return DelegationSessionPolicy(
+        profile_required=True,
+        allow_profile_none=False,
+        allowed_profiles=frozenset(raw_allowed),
+        profile_snapshots=snapshots,
+        visible_objects=(),
+        protected_prefixes=(),
+    )
 
 
 def _build_codex_gpt5_autoraise_notice(
@@ -412,7 +471,7 @@ def init_agent(
     agent.model = model
     # Session-static, immutable authority snapshot. It must be installed before
     # tool schemas are built so delegate_task receives an invocation-owned view.
-    agent.delegation_policy = delegation_policy
+    agent.delegation_policy = _admit_standard_delegation_policy(delegation_policy)
     # Runtime backing-object lookup used by protected nested delegation. The
     # parent installs the concrete registry after construction; ordinary agents
     # retain an explicit None so all construction paths have deterministic state.

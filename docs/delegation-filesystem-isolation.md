@@ -49,6 +49,54 @@ policy = DelegationSessionPolicy(
 
 The backing object must also be registered in the trusted `BackingObjectRegistry` with matching identity, revision, and object type. Protected dispatch fails closed if the profile or backing is unknown, stale, missing, replaced, malformed, or outside the session ceiling.
 
+## Enabling profiles for standard CLI and gateway sessions
+
+Standard CLI and gateway agent construction can snapshot operator-owned
+profiles from the active Hermes profile's `config.yaml`. Isolation is disabled
+unless `enabled` is the boolean `true`:
+
+```yaml
+delegation:
+  filesystem_isolation:
+    enabled: true
+    # Required when enabled. Only these named definitions are admitted.
+    allowed_profiles:
+      - filesystem-isolated
+    profiles:
+      filesystem-isolated:
+        backend: docker
+        image: registry.example/hermes-delegation@sha256:<approved-digest>
+        default_workdir: /workspace
+        allowed_toolsets: [delegation, terminal, file, code, vision]
+        qualified_mcp_servers: []
+        network: none
+        cpu: 1.0
+        memory_mb: 512
+        shm_mb: 64
+        pids_limit: 64
+```
+
+`allowed_profiles` must be an explicit, non-empty list of unique names from
+`profiles`. The profile definitions use the strict execution-profile parser;
+malformed definitions, empty selections, and unknown names abort agent/session
+construction rather than silently falling back to ordinary delegation. The
+configuration is loaded from the active profile-local Hermes home and is
+snapshotted for the lifetime of the session, so changing profiles requires a
+new session/agent construction.
+
+Standard admission deliberately starts with an empty visible-object/reveal
+ceiling and no backing registry. It therefore supports private scratch children
+with no `reveal`, but cannot expose a host path, Docker socket, credential, or
+other backing object. A trusted custom initiator may instead pass an explicit
+`DelegationSessionPolicy` with `VisibleObjectGrant` entries plus a matching
+`BackingObjectRegistry`; that explicit policy remains authoritative and is not
+replaced by global configuration. Model-authored `profile`, `workdir`, or
+`reveal` arguments can only select or attenuate the trusted snapshot.
+
+Omitting `filesystem_isolation`, or setting `enabled: false`, preserves the
+ordinary delegation path and leaves the standard session without a delegation
+policy.
+
 ## Delegating
 
 A protected child may request only admitted values:

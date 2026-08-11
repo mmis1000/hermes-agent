@@ -1,12 +1,15 @@
 """Live adversarial gates for protected delegation Docker materialization."""
 
+import json
 import shutil
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from agent.delegation_policy import DelegationSessionPolicy, ExecutionProfile
+from run_agent import AIAgent
 from tools.delegation_scope import resolve_invocation_scope
 from tools.environments.docker import DockerEnvironment
 
@@ -53,6 +56,147 @@ def _strict_env(image, task_id, *, mounts=()):
         pids_limit=64,
         memory=256,
     )
+
+
+def test_standard_config_admission_dispatches_private_scratch_container(
+    protected_image, tmp_path, monkeypatch
+):
+    """Exercise standard admission, real delegate preflight, and materialization."""
+    import tools.delegate_tool as delegate_tool
+    import tools.terminal_tool as terminal_tool
+
+    home = tmp_path / "profile-home"
+    home.mkdir()
+    host_sentinel = home / "host-only-sentinel"
+    host_sentinel.write_text("must-not-be-mounted", encoding="utf-8")
+    (home / "config.yaml").write_text(
+        f"""\
+delegation:
+  filesystem_isolation:
+    enabled: true
+    allowed_profiles:
+      - filesystem-isolated
+    profiles:
+      filesystem-isolated:
+        backend: docker
+        image: {protected_image}
+        default_workdir: /workspace
+        allowed_toolsets: [delegation, terminal, file]
+        qualified_mcp_servers: []
+        network: none
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    parent = AIAgent(
+        api_key="test-key",
+        base_url="http://127.0.0.1:9/v1",
+        model="test-model",
+        enabled_toolsets=["delegation"],
+        quiet_mode=True,
+        skip_context_files=True,
+        skip_memory=True,
+    )
+    observation = {}
+
+    def run_conversation(*, task_id, **_kwargs):
+        result = json.loads(
+            terminal_tool.terminal_tool(
+                command=(
+                    "set -eu; "
+                    "test \"$(id -u)\" -ne 0; "
+                    "test \"$(pwd)\" = /workspace; "
+                    "test ! -S /var/run/docker.sock; "
+                    "test ! -e /root/.hermes; "
+                    "test ! -e /home/hermes/.hermes; "
+                    "test ! -e /home/hermes/.ssh; "
+                    "test ! -e /root/.ssh; "
+                    "test ! -e /home/prod; "
+                    "printf private-scratch > /workspace/child-only"
+                ),
+                task_id=task_id,
+                timeout=30,
+                force=True,
+            )
+        )
+        assert result["exit_code"] == 0, result
+        env = terminal_tool._active_environments[task_id]
+        container_name = env._container_name
+        inspected = json.loads(
+            subprocess.run(
+                ["docker", "inspect", container_name],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout
+        )[0]
+        direct = subprocess.run(
+            [
+                "docker",
+                "exec",
+                container_name,
+                "/bin/sh",
+                "-c",
+                "id -u; cat /workspace/child-only",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.splitlines()
+        observation.update(
+            task_id=task_id,
+            container_name=container_name,
+            user=inspected["Config"]["User"],
+            mounts=inspected["Mounts"],
+            network=inspected["HostConfig"]["NetworkMode"],
+            direct=direct,
+        )
+        return {
+            "final_response": "materialized private scratch",
+            "completed": True,
+            "interrupted": False,
+            "api_calls": 0,
+            "messages": [],
+        }
+
+    def build_child(**kwargs):
+        # Child/model execution is replaced only after real invocation preflight.
+        scope = kwargs["resolved_scope"]
+        assert scope.profile.name == "filesystem-isolated"
+        assert scope.visible_objects == ()
+        return SimpleNamespace(
+            _subagent_id="standard-admission-live-child",
+            _delegate_role="leaf",
+            _delegate_saved_tool_names=[],
+            enabled_toolsets=["terminal", "file"],
+            disabled_toolsets=[],
+            tool_progress_callback=None,
+            run_conversation=run_conversation,
+            close=lambda: None,
+        )
+
+    monkeypatch.setattr(delegate_tool, "_build_child_agent", build_child)
+    output = json.loads(
+        delegate_tool.delegate_task(
+            goal="materialize admitted scratch",
+            profile="filesystem-isolated",
+            workdir="/workspace",
+            parent_agent=parent,
+        )
+    )
+
+    assert "results" in output, output
+    assert output["results"][0]["status"] == "completed", output
+    assert observation["user"] == "hermes"
+    assert observation["mounts"] == []
+    assert observation["network"] == "none"
+    assert observation["direct"] == ["10001", "private-scratch"]
+    assert host_sentinel.read_text(encoding="utf-8") == "must-not-be-mounted"
+    assert subprocess.run(
+        ["docker", "inspect", observation["container_name"]],
+        capture_output=True,
+    ).returncode != 0
 
 
 @pytest.mark.parametrize(

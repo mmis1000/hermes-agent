@@ -2399,6 +2399,17 @@ DEFAULT_CONFIG = {
         # budget still applies.
         "max_summary_chars": 24000,
 
+        # Operator-owned protected delegation profiles. Disabled unless the
+        # boolean flag is explicitly true. When enabled, allowed_profiles must
+        # be a non-empty list naming strict definitions in profiles; malformed
+        # or unknown selections abort standard CLI/gateway agent construction.
+        # Standard sessions begin with no reveal grants/backing registry.
+        "filesystem_isolation": {
+            "enabled": False,
+            "allowed_profiles": [],
+            "profiles": {},
+        },
+
         "child_timeout_seconds": 0,  # optional wall-clock cap per child agent. 0 (default)
                                      # = no timeout: children fail only from real errors
                                      # (API, tools, iteration budget), never a delegation
