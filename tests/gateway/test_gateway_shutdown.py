@@ -190,6 +190,10 @@ async def test_gateway_stop_kills_tool_subprocesses_before_adapter_disconnect_on
     def _fake_cleanup_envs():
         call_order.append("cleanup_environments")
 
+    def _fake_cleanup_attempts():
+        call_order.append("cleanup_attempts")
+        return ()
+
     def _fake_cleanup_browsers():
         call_order.append("cleanup_browsers")
 
@@ -200,8 +204,10 @@ async def test_gateway_stop_kills_tool_subprocesses_before_adapter_disconnect_on
     import tools.process_registry as _pr
     import tools.terminal_tool as _tt
     import tools.browser_tool as _bt
+    import tools.delegation_scope as _ds
     monkeypatch.setattr(_pr.process_registry, "kill_all", _fake_kill_all)
     monkeypatch.setattr(_tt, "cleanup_all_environments", _fake_cleanup_envs)
+    monkeypatch.setattr(_ds.attempt_scope_registry, "cleanup_all", _fake_cleanup_attempts)
     monkeypatch.setattr(_bt, "cleanup_all_browsers", _fake_cleanup_browsers)
 
     adapter.disconnect = _disconnect
@@ -227,6 +233,8 @@ async def test_gateway_stop_kills_tool_subprocesses_before_adapter_disconnect_on
     )
     # Defense-in-depth final cleanup still runs.
     assert call_order.count("kill_all") >= 2
+    assert "cleanup_attempts" in call_order
+    assert call_order.index("cleanup_environments") < call_order.index("cleanup_attempts")
 
 
 # ---------------------------------------------------------------------------

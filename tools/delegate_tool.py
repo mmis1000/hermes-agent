@@ -3544,6 +3544,7 @@ def delegate_task(
                 )
                 attempt_id = authority.attempt_id
                 reserved_ids.append(attempt_id)
+                protected_attempt_registry.prepare_idmapped_reveals(attempt_id)
 
                 def _cleanup_attempt_environment(
                     physical_id: str = attempt_id,
