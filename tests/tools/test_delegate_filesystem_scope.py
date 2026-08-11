@@ -87,6 +87,8 @@ def test_protected_background_batch_binds_distinct_attempt_environment_keys():
         SimpleNamespace(_subagent_id="logical-b"),
     ]
     registry = AttemptScopeRegistry()
+    prepare_idmaps = MagicMock(wraps=registry.prepare_idmapped_reveals)
+    registry.prepare_idmapped_reveals = prepare_idmaps
     captured_mapping: dict[str, str] = {}
     captured_authority: dict[str, dict] = {}
 
@@ -130,6 +132,9 @@ def test_protected_background_batch_binds_distinct_attempt_environment_keys():
         assert set(captured_mapping) == {"logical-a", "logical-b"}
         assert set(captured_authority) == set(captured_mapping)
         assert len(set(captured_mapping.values())) == 2
+        assert [call.args[0] for call in prepare_idmaps.call_args_list] == list(
+            captured_mapping.values()
+        )
         for child in children:
             attempt_id = child._delegation_attempt_id
             assert attempt_id == captured_mapping[child._subagent_id]

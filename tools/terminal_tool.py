@@ -1371,6 +1371,19 @@ def acquire_task_environment(
                 raise ValueError(
                     "protected execution profile network inheritance was not frozen"
                 )
+
+            def _mount_source(grant) -> str:
+                if profile.runtime_identity is None:
+                    return grant.backing.identity
+                source = protected_authority.prepared_mount_sources.get(
+                    grant.backing.object_id
+                )
+                if not isinstance(source, str) or not source:
+                    raise ValueError(
+                        f"idmapped reveal is unavailable: {grant.backing.object_id}"
+                    )
+                return source
+
             container_config = {
                 "container_cpu": profile.cpu or 0,
                 "container_memory": profile.memory_mb or 0,
@@ -1382,7 +1395,7 @@ def acquire_task_environment(
                 "trusted_mounts": [
                     {
                         "kind": grant.backing.kind,
-                        "source": grant.backing.identity,
+                        "source": _mount_source(grant),
                         "target": str(grant.visible_path),
                         "mode": grant.mode.value,
                     }

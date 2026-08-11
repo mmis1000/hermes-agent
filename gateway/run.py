@@ -9191,6 +9191,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 except Exception as _e:
                     logger.debug("cleanup_all_environments (%s) error: %s", phase, _e)
                 try:
+                    from tools.delegation_scope import attempt_scope_registry
+                    _attempt_errors = attempt_scope_registry.cleanup_all()
+                    if _attempt_errors:
+                        logger.warning(
+                            "Shutdown (%s): %d protected attempt cleanup error(s): %s",
+                            phase,
+                            len(_attempt_errors),
+                            "; ".join(str(error) for error in _attempt_errors),
+                        )
+                except Exception as _e:
+                    logger.debug("attempt_scope_registry.cleanup_all (%s) error: %s", phase, _e)
+                try:
                     from tools.browser_tool import cleanup_all_browsers
                     cleanup_all_browsers()
                 except Exception as _e:

@@ -609,6 +609,7 @@ def dispatch_resumed_subagent(
                     parent_agent, "delegation_backing_registry", None
                 ),
             )
+            protected_attempt_registry.prepare_idmapped_reveals(attempt_id)
 
             def _cleanup_resumed_environment() -> None:
                 try:
