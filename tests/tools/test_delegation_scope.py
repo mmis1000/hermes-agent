@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
+import tempfile
 
 import pytest
 
@@ -15,13 +16,29 @@ from agent.delegation_policy import (
 from tools.delegation_scope import (
     BackingObjectRecord,
     BackingObjectRegistry,
+    RevealRequest,
     ResolvedInvocationScope,
+    admit_trusted_run_execution as _admit_trusted_run_execution,
+    delegation_authority_audit_view,
+    deserialize_delegation_authority,
     execution_profile_hash,
     parse_execution_profiles,
     resolve_invocation_scope,
     serialize_delegation_authority,
-    delegation_authority_audit_view,
 )
+
+
+def admit_trusted_run_execution(
+    policy,
+    execution,
+    *,
+    inherited_network: bool = False,
+):
+    return _admit_trusted_run_execution(
+        policy,
+        execution,
+        inherited_network=inherited_network,
+    )
 
 
 def _profile(name: str = "isolated", *, backend: str = "docker") -> ExecutionProfile:
@@ -64,6 +81,287 @@ def _record(grant: VisibleObjectGrant, **overrides):
     }
     values.update(overrides)
     return BackingObjectRecord(**values)
+
+
+def test_trusted_run_execution_admits_real_directory_as_root_scope(tmp_path):
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    policy = _policy(profiles=("isolated",))
+
+    admitted = admit_trusted_run_execution(
+        policy,
+        {
+            "profile": "isolated",
+            "workdir": str(repository),
+            "reveal": [{"path": str(repository), "mode": "rw"}],
+        },
+    )
+
+    assert admitted.invocation_scope.profile_name == "isolated"
+    assert admitted.invocation_scope.workdir == PurePosixPath(str(repository))
+    assert admitted.invocation_scope.visible_objects == admitted.policy.visible_objects
+    grant = admitted.policy.visible_objects[0]
+    assert grant.visible_path == PurePosixPath(str(repository))
+    assert grant.mode is AccessMode.RW
+    assert grant.object_type == "directory"
+    record = admitted.backing_registry.get(grant.backing.object_id)
+    assert record is not None
+    assert record.backing == grant.backing
+    assert record.trusted_host_path is True
+
+
+@pytest.mark.parametrize(
+    ("session_network", "effective_mode"),
+    [(False, "none"), (True, "full")],
+)
+def test_trusted_run_execution_freezes_inherited_network(
+    tmp_path,
+    session_network,
+    effective_mode,
+):
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    admitted = admit_trusted_run_execution(
+        _policy(profiles=("isolated",)),
+        {
+            "profile": "isolated",
+            "workdir": str(repository),
+            "reveal": [{"path": str(repository), "mode": "rw"}],
+        },
+        inherited_network=session_network,
+    )
+
+    assert admitted.invocation_scope.profile.network == effective_mode
+    assert admitted.invocation_scope.profile_template_hash is not None
+
+
+def test_trusted_run_execution_can_admit_exact_directory_below_home():
+    with tempfile.TemporaryDirectory(dir=Path.home()) as repository:
+        admitted = admit_trusted_run_execution(
+            _policy(profiles=("isolated",)),
+            {
+                "profile": "isolated",
+                "workdir": repository,
+                "reveal": [{"path": repository, "mode": "rw"}],
+            },
+        )
+
+    assert admitted.invocation_scope.workdir == PurePosixPath(repository)
+
+
+def test_trusted_run_execution_admits_operator_selected_home_root():
+    home = str(Path.home().resolve())
+
+    admitted = admit_trusted_run_execution(
+        _policy(profiles=("isolated",)),
+        {
+            "profile": "isolated",
+            "workdir": home,
+            "reveal": [{"path": home, "mode": "rw"}],
+        },
+    )
+
+    assert admitted.invocation_scope.workdir == PurePosixPath(home)
+
+
+@pytest.mark.parametrize(
+    "selected_root",
+    ["/usr", "/etc", "/proc", "/sys", "/dev", "/var/lib"],
+)
+def test_trusted_run_execution_admits_operator_selected_existing_root(
+    selected_root,
+):
+    admitted = admit_trusted_run_execution(
+        _policy(profiles=("isolated",)),
+        {
+            "profile": "isolated",
+            "workdir": selected_root,
+            "reveal": [{"path": selected_root, "mode": "rw"}],
+        },
+    )
+
+    assert admitted.invocation_scope.workdir == PurePosixPath(selected_root)
+
+
+@pytest.mark.parametrize(
+    "relative_path",
+    [
+        ".config",
+        ".kube",
+        ".docker",
+        ".pki",
+        ".local/share/keyrings",
+    ],
+)
+def test_trusted_run_execution_admits_operator_selected_named_directory(
+    tmp_path,
+    relative_path,
+):
+    selected = tmp_path / relative_path
+    selected.mkdir(parents=True)
+
+    admitted = admit_trusted_run_execution(
+        _policy(profiles=("isolated",)),
+        {
+            "profile": "isolated",
+            "workdir": str(selected),
+            "reveal": [{"path": str(selected), "mode": "rw"}],
+        },
+    )
+
+    assert admitted.invocation_scope.workdir == PurePosixPath(str(selected))
+
+
+def test_trusted_run_backing_detects_root_replacement(tmp_path):
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    admitted = admit_trusted_run_execution(
+        _policy(profiles=("isolated",)),
+        {
+            "profile": "isolated",
+            "workdir": str(repository),
+            "reveal": [{"path": str(repository), "mode": "rw"}],
+        },
+    )
+    grant = admitted.policy.visible_objects[0]
+    repository.rename(tmp_path / "original")
+    repository.mkdir()
+
+    assert admitted.backing_registry.get(grant.backing.object_id) is None
+
+
+def test_trusted_root_can_attenuate_to_existing_child_directory(tmp_path):
+    repository = tmp_path / "repository"
+    lane = repository / "lanes" / "source-blind"
+    sibling = repository / "lanes" / "reference"
+    lane.mkdir(parents=True)
+    sibling.mkdir()
+    admitted = admit_trusted_run_execution(
+        _policy(profiles=("isolated",)),
+        {
+            "profile": "isolated",
+            "workdir": str(repository),
+            "reveal": [{"path": str(repository), "mode": "rw"}],
+        },
+    )
+
+    child_scope = resolve_invocation_scope(
+        admitted.policy,
+        "isolated",
+        None,
+        [{"path": str(lane), "mode": "ro"}],
+        backing_registry=admitted.backing_registry,
+    )
+
+    assert child_scope is not None
+    assert child_scope.workdir == PurePosixPath("/workspace")
+    assert len(child_scope.visible_objects) == 1
+    assert child_scope.visible_objects[0].visible_path == PurePosixPath(str(lane))
+    assert child_scope.visible_objects[0].mode is AccessMode.RO
+    child_policy = derive_child_policy(admitted.policy, child_scope.visible_objects)
+    assert child_policy.visible_objects == child_scope.visible_objects
+    with pytest.raises(ValueError, match="outside parent/session ceiling"):
+        resolve_invocation_scope(
+            child_policy,
+            "isolated",
+            None,
+            [{"path": str(sibling), "mode": "ro"}],
+            backing_registry=admitted.backing_registry,
+        )
+    with pytest.raises(ValueError, match="cannot widen"):
+        resolve_invocation_scope(
+            child_policy,
+            "isolated",
+            str(lane),
+            [{"path": str(lane), "mode": "rw"}],
+            backing_registry=admitted.backing_registry,
+        )
+
+
+def test_trusted_root_descendant_rejects_symlink_escape(tmp_path):
+    repository = tmp_path / "repository"
+    outside = tmp_path / "outside"
+    repository.mkdir()
+    outside.mkdir()
+    escape = repository / "escape"
+    escape.symlink_to(outside, target_is_directory=True)
+    admitted = admit_trusted_run_execution(
+        _policy(profiles=("isolated",)),
+        {
+            "profile": "isolated",
+            "workdir": str(repository),
+            "reveal": [{"path": str(repository), "mode": "rw"}],
+        },
+    )
+
+    with pytest.raises(ValueError, match="real directory below"):
+        resolve_invocation_scope(
+            admitted.policy,
+            "isolated",
+            None,
+            [{"path": str(escape), "mode": "ro"}],
+            backing_registry=admitted.backing_registry,
+        )
+
+
+def test_trusted_root_allows_multiple_disjoint_child_directories(tmp_path):
+    repository = tmp_path / "repository"
+    first = repository / "lanes" / "first"
+    second = repository / "lanes" / "second"
+    first.mkdir(parents=True)
+    second.mkdir()
+    admitted = admit_trusted_run_execution(
+        _policy(profiles=("isolated",)),
+        {
+            "profile": "isolated",
+            "workdir": str(repository),
+            "reveal": [{"path": str(repository), "mode": "rw"}],
+        },
+    )
+
+    child_scope = resolve_invocation_scope(
+        admitted.policy,
+        "isolated",
+        str(second),
+        [
+            {"path": str(first), "mode": "ro"},
+            {"path": str(second), "mode": "rw"},
+        ],
+        backing_registry=admitted.backing_registry,
+    )
+
+    assert child_scope is not None
+    assert [grant.visible_path for grant in child_scope.visible_objects] == [
+        PurePosixPath(str(first)),
+        PurePosixPath(str(second)),
+    ]
+
+
+def test_trusted_root_rejects_overlapping_child_directories_even_same_mode(tmp_path):
+    repository = tmp_path / "repository"
+    lanes = repository / "lanes"
+    first = lanes / "first"
+    first.mkdir(parents=True)
+    admitted = admit_trusted_run_execution(
+        _policy(profiles=("isolated",)),
+        {
+            "profile": "isolated",
+            "workdir": str(repository),
+            "reveal": [{"path": str(repository), "mode": "rw"}],
+        },
+    )
+
+    with pytest.raises(ValueError, match="overlapping reveal paths"):
+        resolve_invocation_scope(
+            admitted.policy,
+            "isolated",
+            None,
+            [
+                {"path": str(lanes), "mode": "ro"},
+                {"path": str(first), "mode": "ro"},
+            ],
+            backing_registry=admitted.backing_registry,
+        )
 
 
 def test_nested_scope_cannot_restore_an_omitted_sibling():
@@ -224,6 +522,7 @@ def test_profile_parser_builds_immutable_snapshot_with_stable_canonical_hash():
                     "image": "example@sha256:abc",
                     "default_workdir": "/workspace",
                     "allowed_toolsets": ["terminal", "file"],
+                    "allowed_tools": ["delegate_task", "skills_list", "skill_view"],
                     "qualified_mcp_servers": ["safe-server"],
                     "network": "inherit",
                     "cpu": 2,
@@ -239,6 +538,9 @@ def test_profile_parser_builds_immutable_snapshot_with_stable_canonical_hash():
 
     assert tuple(parsed) == ("isolated",)
     assert parsed["isolated"].allowed_toolsets == frozenset({"terminal", "file"})
+    assert parsed["isolated"].allowed_tools == frozenset(
+        {"delegate_task", "skills_list", "skill_view"}
+    )
     assert len(execution_profile_hash(parsed["isolated"])) == 64
     equivalent = ExecutionProfile(
         name="isolated",
@@ -246,6 +548,7 @@ def test_profile_parser_builds_immutable_snapshot_with_stable_canonical_hash():
         image="example@sha256:abc",
         default_workdir="/workspace",
         allowed_toolsets={"file", "terminal"},
+        allowed_tools={"skill_view", "delegate_task", "skills_list"},
         qualified_mcp_servers=frozenset({"safe-server"}),
         network="inherit",
         cpu=2,
@@ -254,6 +557,28 @@ def test_profile_parser_builds_immutable_snapshot_with_stable_canonical_hash():
         pids_limit=512,
     )
     assert execution_profile_hash(parsed["isolated"]) == execution_profile_hash(equivalent)
+    scope = ResolvedInvocationScope(
+        "isolated",
+        execution_profile_hash(equivalent),
+        equivalent,
+        PurePosixPath("/workspace"),
+        (),
+        (),
+    )
+    authority = serialize_delegation_authority(
+        scope,
+        enabled_toolsets=(),
+        disabled_toolsets=(),
+        scope_id="scope-tools",
+        attempt_id="attempt-tools",
+    )
+    assert authority["profile"]["snapshot"]["allowed_tools"] == [
+        "delegate_task",
+        "skill_view",
+        "skills_list",
+    ]
+    restored = deserialize_delegation_authority(authority, backing_registry=None)
+    assert restored.profile.allowed_tools == equivalent.allowed_tools
     with pytest.raises(TypeError):
         parsed["other"] = _profile("other")  # type: ignore[index]
 
@@ -445,18 +770,36 @@ def test_backing_registry_rejects_symlink_or_changed_identity(case):
         "/home/prod/project",
         "/home/prod/.hermes/hermes-agent",
         "/work/.env",
-        "/protected/child",
         "/var/run/docker.sock",
     ],
 )
-def test_reveal_rejects_protected_host_and_credential_paths(path):
+def test_reveal_applies_operator_selected_exact_grant_without_path_classification(path):
     grant = _grant(path)
-    with pytest.raises(ValueError, match="protected|forbidden|credential|Docker socket"):
+
+    scope = resolve_invocation_scope(
+        _policy(visible_objects=(grant,)),
+        "isolated",
+        None,
+        [{"path": path, "mode": "ro"}],
+    )
+
+    assert scope is not None
+    assert len(scope.visible_objects) == 1
+    selected = scope.visible_objects[0]
+    assert selected.visible_path == grant.visible_path
+    assert selected.mode is AccessMode.RO
+    assert selected.backing == grant.backing
+    assert selected.object_type == grant.object_type
+
+
+def test_reveal_rejects_operator_configured_protected_prefix():
+    grant = _grant("/protected/child")
+    with pytest.raises(ValueError, match="protected"):
         resolve_invocation_scope(
             _policy(visible_objects=(grant,)),
             "isolated",
             None,
-            [{"path": path, "mode": "ro"}],
+            [{"path": "/protected/child", "mode": "ro"}],
         )
 
 

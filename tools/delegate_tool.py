@@ -36,6 +36,7 @@ from concurrent.futures import (
 from typing import Any, Dict, List, Optional
 
 from toolsets import TOOLSETS
+from agent.delegation_policy import ExecutionProfile
 
 # Sentinel value used by the runtime provider system for providers that are
 # not natively known (named custom providers, third-party aggregators, etc.).
@@ -825,8 +826,9 @@ def _qualified_protected_tool_names(
     candidate_names: set[str],
     allowed_profile_toolsets: set[str],
     qualified_mcp_servers: frozenset[str],
+    allowed_profile_tools: frozenset[str] | set[str] | tuple[str, ...] = frozenset(),
 ) -> set[str]:
-    """Apply profile toolset and exact MCP-server qualification admission."""
+    """Apply profile toolset/exact-tool and MCP-server qualification admission."""
 
     import model_tools
     from tools.mcp_tool import get_mcp_tool_server_qualification
@@ -834,7 +836,7 @@ def _qualified_protected_tool_names(
     admitted: set[str] = set()
     for name in candidate_names:
         toolset = model_tools.get_toolset_for_tool(name)
-        if toolset not in allowed_profile_toolsets:
+        if toolset not in allowed_profile_toolsets and name not in allowed_profile_tools:
             continue
         if _is_mcp_toolset_name(toolset or ""):
             server = get_mcp_tool_server_qualification(name)
@@ -842,6 +844,47 @@ def _qualified_protected_tool_names(
                 continue
         admitted.add(name)
     return admitted
+
+
+def configure_protected_agent_tools(
+    agent: Any,
+    profile: ExecutionProfile,
+) -> frozenset[str]:
+    """Pin a positive tool snapshot for any protected agent attempt."""
+
+    candidate_names = set(getattr(agent, "valid_tool_names", set()))
+    protected_names = _qualified_protected_tool_names(
+        candidate_names,
+        set(profile.allowed_toolsets),
+        profile.qualified_mcp_servers,
+        profile.allowed_tools,
+    )
+    protected_tools = [
+        item
+        for item in (getattr(agent, "tools", None) or [])
+        if item.get("function", {}).get("name") in protected_names
+    ]
+    snapshot = frozenset(protected_names)
+    setattr(agent, "tools", protected_tools)
+    setattr(agent, "valid_tool_names", set(protected_names))
+    setattr(agent, "_protected_tool_snapshot", snapshot)
+    setattr(
+        agent,
+        "_protected_qualified_mcp_servers",
+        frozenset(profile.qualified_mcp_servers),
+    )
+    from tools.mcp_tool import get_mcp_tool_server_qualification
+
+    setattr(
+        agent,
+        "_protected_mcp_tool_provenance",
+        {
+            name: provenance
+            for name in protected_names
+            if (provenance := get_mcp_tool_server_qualification(name)) is not None
+        },
+    )
+    return snapshot
 
 
 def _expand_parent_toolsets(parent_toolsets: set) -> set:
@@ -1758,6 +1801,7 @@ def _build_child_agent(
 
     child_delegation_policy = None
     protected_profile_toolsets = None
+    protected_profile_tools = None
     from tools.delegation_scope import ResolvedInvocationScope
 
     if isinstance(resolved_scope, ResolvedInvocationScope):
@@ -1769,8 +1813,15 @@ def _build_child_agent(
         if not isinstance(parent_policy, DelegationSessionPolicy):
             raise ValueError("protected child requires a pinned parent delegation policy")
         protected_profile_toolsets = set(resolved_scope.profile.allowed_toolsets)
+        protected_profile_tools = set(resolved_scope.profile.allowed_tools)
         child_toolsets = [
-            name for name in child_toolsets if name in protected_profile_toolsets
+            name
+            for name in child_toolsets
+            if name in protected_profile_toolsets
+            or bool(
+                set(_toolset_tool_names(TOOLSETS.get(name)))
+                .intersection(protected_profile_tools)
+            )
         ]
         child_delegation_policy = derive_child_policy(
             parent_policy,
@@ -1789,8 +1840,8 @@ def _build_child_agent(
     else:
         inherited_disabled = []
     if effective_role == "orchestrator":
-        # Role grants delegate_task explicitly, matching the unconditional
-        # delegation toolset re-add below.
+        # Role permits delegate_task when the protected profile also selects it,
+        # matching the bounded delegation toolset re-add below.
         inherited_disabled = [
             name for name in inherited_disabled if name != "delegation"
         ]
@@ -1802,16 +1853,19 @@ def _build_child_agent(
         )
     )
 
-    # Orchestrators retain the 'delegation' toolset that _strip_blocked_tools
-    # removed.  The re-add is unconditional on parent-toolset membership because
-    # orchestrator capability is granted by role, not inherited — see the
-    # test_intersection_preserves_delegation_bound test for the design rationale.
+    # Orchestrators may retain the 'delegation' toolset that _strip_blocked_tools
+    # removed, but only within the selected protected profile's whole-toolset or
+    # exact delegate_task capability.
     if (
         effective_role == "orchestrator"
         and "delegation" not in child_toolsets
         and (
             protected_profile_toolsets is None
             or "delegation" in protected_profile_toolsets
+            or (
+                protected_profile_tools is not None
+                and "delegate_task" in protected_profile_tools
+            )
         )
     ):
         child_toolsets.append("delegation")
@@ -2090,12 +2144,8 @@ def _build_child_agent(
             set(getattr(child, "valid_tool_names", set())),
             allowed_profile_toolsets,
             resolved_scope.profile.qualified_mcp_servers,
+            resolved_scope.profile.allowed_tools,
         )
-        if (
-            effective_role == "orchestrator"
-            and "delegation" in allowed_profile_toolsets
-        ):
-            protected_names.add("delegate_task")
         protected_tools = [
             item for item in (getattr(child, "tools", None) or [])
             if item.get("function", {}).get("name") in protected_names
@@ -3526,7 +3576,6 @@ def delegate_task(
     protected_attempt_registry = None
     if resolved_scope is not None:
         from tools import delegation_scope as _delegation_scope
-        from tools import terminal_tool as _terminal_tool
 
         protected_attempt_registry = _delegation_scope.attempt_scope_registry
         reserved_ids: List[str] = []
@@ -3545,29 +3594,7 @@ def delegate_task(
                 attempt_id = authority.attempt_id
                 reserved_ids.append(attempt_id)
                 protected_attempt_registry.prepare_idmapped_reveals(attempt_id)
-
-                def _cleanup_attempt_environment(
-                    physical_id: str = attempt_id,
-                ) -> None:
-                    try:
-                        _terminal_tool.cleanup_vm(physical_id, force_remove=True)
-                    finally:
-                        _terminal_tool.clear_task_env_overrides(physical_id)
-
-                protected_attempt_registry.add_resource(
-                    attempt_id,
-                    "task-environment",
-                    _cleanup_attempt_environment,
-                )
-                _terminal_tool.register_task_env_overrides(
-                    attempt_id,
-                    {
-                        "env_type": resolved_scope.profile.backend,
-                        "docker_image": resolved_scope.profile.image,
-                        "cwd": str(resolved_scope.workdir),
-                        "delegation_scope_id": authority.scope_id,
-                    },
-                )
+                _delegation_scope.configure_protected_attempt_environment(attempt_id)
                 protected_attempt_ids[logical_id] = attempt_id
                 child._delegation_attempt_id = attempt_id
                 child._delegation_scope_id = authority.scope_id

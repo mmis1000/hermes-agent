@@ -1762,6 +1762,7 @@ class APIServerAdapter(BasePlatformAdapter):
         tool_complete_callback=None,
         gateway_session_key: Optional[str] = None,
         route: Optional[Dict[str, Any]] = None,
+        delegation_policy: Any = None,
     ) -> Any:
         """
         Create an AIAgent instance using the gateway's runtime config.
@@ -1883,6 +1884,7 @@ class APIServerAdapter(BasePlatformAdapter):
             fallback_model=fallback_model,
             reasoning_config=reasoning_config,
             gateway_session_key=gateway_session_key,
+            delegation_policy=delegation_policy,
         )
         return agent
 
@@ -4859,6 +4861,24 @@ class APIServerAdapter(BasePlatformAdapter):
                         )
                     conversation_history.append({"role": msg["role"], "content": str(content)})
 
+        protected_execution = None
+        if "execution" in body:
+            try:
+                from agent.agent_init import _admit_standard_delegation_policy
+                from tools.delegation_scope import admit_trusted_run_execution
+                from tools.terminal_tool import _get_env_config
+
+                protected_execution = admit_trusted_run_execution(
+                    _admit_standard_delegation_policy(None),
+                    body["execution"],
+                    inherited_network=_get_env_config().get("docker_network", True),
+                )
+            except (TypeError, ValueError) as exc:
+                return web.json_response(
+                    _openai_error(str(exc), code="invalid_execution"),
+                    status=400,
+                )
+
         run_id = f"run_{uuid.uuid4().hex}"
         session_id = body.get("session_id") or stored_session_id or run_id
         # Approval queues gate host-side tool execution and must be isolated
@@ -4913,6 +4933,22 @@ class APIServerAdapter(BasePlatformAdapter):
         request_profile = _api_request_profile.get()
 
         async def _run_and_close():
+            root_attempt_id = None
+
+            def _cleanup_root(*, raise_errors: bool) -> None:
+                nonlocal root_attempt_id
+                if root_attempt_id is None:
+                    return
+                from tools.delegation_scope import attempt_scope_registry
+
+                cleanup_errors = attempt_scope_registry.cleanup(root_attempt_id)
+                root_attempt_id = None
+                if cleanup_errors and raise_errors:
+                    raise RuntimeError(
+                        "protected root cleanup failed: "
+                        + "; ".join(str(error) for error in cleanup_errors)
+                    )
+
             try:
                 self._set_run_status(run_id, "running")
                 if run_id in self._stopping_run_ids:
@@ -4927,6 +4963,28 @@ class APIServerAdapter(BasePlatformAdapter):
                         last_event="run.cancelled",
                     )
                     return
+
+                effective_task_id = session_id or run_id
+                delegation_policy = None
+                if protected_execution is not None:
+                    from tools.delegation_scope import (
+                        attempt_scope_registry,
+                        configure_protected_attempt_environment,
+                    )
+
+                    authority = attempt_scope_registry.reserve(
+                        protected_execution.invocation_scope,
+                        run_id,
+                        attempt_id=f"runs_root_{run_id}",
+                        backing_registry=protected_execution.backing_registry,
+                    )
+                    root_attempt_id = authority.attempt_id
+                    attempt_scope_registry.prepare_idmapped_reveals(root_attempt_id)
+                    configure_protected_attempt_environment(root_attempt_id)
+                    attempt_scope_registry.activate(root_attempt_id, run_id=run_id)
+                    effective_task_id = root_attempt_id
+                    delegation_policy = protected_execution.policy
+
                 with self._profile_scope(request_profile):
                     agent = self._create_agent(
                         ephemeral_system_prompt=ephemeral_system_prompt,
@@ -4935,6 +4993,20 @@ class APIServerAdapter(BasePlatformAdapter):
                         tool_progress_callback=event_cb,
                         gateway_session_key=gateway_session_key,
                         route=route,
+                        delegation_policy=delegation_policy,
+                    )
+                if protected_execution is not None:
+                    from tools.delegate_tool import configure_protected_agent_tools
+
+                    agent.delegation_backing_registry = (
+                        protected_execution.backing_registry
+                    )
+                    agent.resolved_invocation_scope = (
+                        protected_execution.invocation_scope
+                    )
+                    configure_protected_agent_tools(
+                        agent,
+                        protected_execution.invocation_scope.profile,
                     )
                 self._active_run_agents[run_id] = agent
 
@@ -4976,7 +5048,6 @@ class APIServerAdapter(BasePlatformAdapter):
                         unregister_gateway_notify,
                     )
 
-                    effective_task_id = session_id or run_id
                     approval_token = None
                     session_tokens = []
                     with self._profile_scope(request_profile):
@@ -5016,6 +5087,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         return r, u
 
                 result, usage = await asyncio.get_running_loop().run_in_executor(None, _run_sync)
+                _cleanup_root(raise_errors=True)
                 if run_id in self._stopping_run_ids:
                     _put_event_if_active({
                         "event": "run.cancelled",
@@ -5061,6 +5133,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         last_event="run.completed",
                     )
             except asyncio.CancelledError:
+                _cleanup_root(raise_errors=False)
                 self._set_run_status(
                     run_id,
                     "cancelled",
@@ -5076,6 +5149,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     pass
                 raise
             except Exception as exc:
+                _cleanup_root(raise_errors=False)
                 logger.exception("[api_server] run %s failed", run_id)
                 self._set_run_status(
                     run_id,
