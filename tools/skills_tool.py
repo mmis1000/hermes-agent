@@ -90,10 +90,10 @@ logger = logging.getLogger(__name__)
 # Per-session skill discovery cache.  _find_all_skills() re-reads every
 # SKILL.md on every call; with hundreds of skills this is wasteful.
 # Cache validation (mirrors hermes_cli/profiles.py::_count_skills, d5eee133e):
-#   - signature = per-dir max mtime of the dir AND its immediate children
-#     (one scandir per dir; catches skill add/remove inside categories,
-#     which does NOT bump the root dir's mtime), plus the disabled-set
-#     (config-driven — changes with no filesystem mtime bump at all)
+#   - signature = root metadata, immediate child metadata, and nested directory
+#     names (one shallow scandir per level; catches skill add/remove inside
+#     categories, which does NOT bump the root dir's mtime), plus the
+#     disabled-set (config-driven — changes with no filesystem mtime bump at all)
 #   - a short TTL bounds staleness from in-place SKILL.md edits, which
 #     bump only the file's mtime, invisible to any directory signature.
 # skip_disabled True/False are cached separately.
@@ -117,22 +117,46 @@ def _skills_scan_signature(dirs_to_scan, disabled) -> tuple:
     sig = []
     for d in dirs_to_scan:
         try:
-            m = d.stat().st_mtime
+            root_stat = d.stat()
         except OSError:
             continue
+        children = []
         try:
             with os.scandir(d) as it:
                 for entry in it:
                     try:
                         if entry.is_dir(follow_symlinks=False):
-                            em = entry.stat(follow_symlinks=False).st_mtime
-                            if em > m:
-                                m = em
+                            entry_stat = entry.stat(follow_symlinks=False)
+                            nested_dirs = []
+                            try:
+                                with os.scandir(entry.path) as nested:
+                                    nested_dirs = sorted(
+                                        child.name
+                                        for child in nested
+                                        if child.is_dir(follow_symlinks=False)
+                                    )
+                            except OSError:
+                                pass
+                            children.append(
+                                (
+                                    entry.name,
+                                    entry_stat.st_mtime,
+                                    entry_stat.st_size,
+                                    tuple(nested_dirs),
+                                )
+                            )
                     except OSError:
                         continue
         except OSError:
             pass
-        sig.append((str(d), m))
+        sig.append(
+            (
+                str(d),
+                root_stat.st_mtime,
+                root_stat.st_size,
+                tuple(sorted(children)),
+            )
+        )
     return (tuple(sig), frozenset(disabled), platform)
 
 
@@ -666,7 +690,119 @@ def _is_skill_disabled(name: str, platform: str = None) -> bool:
         return False
 
 
-def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
+def _protected_skill_path_allowed(task_id: str | None, path: Path) -> bool | None:
+    """Return None for ordinary calls, otherwise whether path is in attempt scope."""
+
+    if not task_id:
+        return None
+    from tools.delegation_scope import attempt_scope_registry
+
+    authority = attempt_scope_registry.get(task_id)
+    if authority is None:
+        return None
+    if getattr(authority, "state", None) not in {"starting", "active"}:
+        return False
+    backing_registry = getattr(authority, "backing_registry", None)
+    if backing_registry is None:
+        return False
+    try:
+        candidate = path.resolve(strict=True)
+    except OSError:
+        return False
+    for grant in authority.invocation_scope.visible_objects:
+        if grant.backing.kind != "host_path" or grant.object_type != "directory":
+            continue
+        record = backing_registry.get(grant.backing.object_id)
+        if (
+            record is None
+            or not record.exists
+            or record.root_symlink
+            or record.backing != grant.backing
+            or record.object_type != grant.object_type
+        ):
+            continue
+        root = Path(record.backing.identity)
+        if candidate == root or root in candidate.parents:
+            # Re-check after candidate resolution. Trusted host records pin and
+            # verify the directory device/inode on every registry lookup.
+            return backing_registry.get(grant.backing.object_id) == record
+    return False
+
+
+def _protected_skill_search_dirs(
+    task_id: str | None,
+    candidates: List[Path],
+) -> List[Path] | None:
+    if not task_id:
+        return None
+    from tools.delegation_scope import attempt_scope_registry
+
+    authority = attempt_scope_registry.get(task_id)
+    if authority is None:
+        return None
+    if getattr(authority, "state", None) not in {"starting", "active"}:
+        return []
+    return [
+        path
+        for path in candidates
+        if _protected_skill_path_allowed(task_id, path) is True
+    ]
+
+
+def _discover_skill_linked_files(
+    skill_dir: Path,
+    *,
+    task_id: str | None,
+    protected: bool,
+) -> tuple[bool, Dict[str, List[str]]]:
+    """Discover linked files, revalidating protected authority around scans."""
+
+    if protected and _protected_skill_path_allowed(task_id, skill_dir) is not True:
+        return False, {}
+
+    linked: Dict[str, List[str]] = {}
+    specs = (
+        ("references", ("*.md",), False),
+        ("templates", ("*.md", "*.py", "*.yaml", "*.yml", "*.json", "*.tex", "*.sh"), True),
+        ("assets", ("*",), True),
+        ("scripts", ("*.py", "*.sh", "*.bash", "*.js", "*.ts", "*.rb"), False),
+    )
+    for directory_name, patterns, recursive in specs:
+        directory = skill_dir / directory_name
+        if protected:
+            if _protected_skill_path_allowed(task_id, directory) is not True:
+                continue
+        elif not directory.exists():
+            continue
+
+        files: List[str] = []
+        for pattern in patterns:
+            iterator = directory.rglob(pattern) if recursive else directory.glob(pattern)
+            for candidate in iterator:
+                if directory_name == "assets" and not candidate.is_file():
+                    continue
+                if (
+                    protected
+                    and _protected_skill_path_allowed(task_id, candidate) is not True
+                ):
+                    continue
+                files.append(str(candidate.relative_to(skill_dir)))
+        if files:
+            linked[directory_name] = files
+        if protected and _protected_skill_path_allowed(task_id, skill_dir) is not True:
+            return False, {}
+
+    if protected and _protected_skill_path_allowed(task_id, skill_dir) is not True:
+        return False, {}
+    return True, linked
+
+
+def _find_all_skills(
+    *,
+    skip_disabled: bool = False,
+    search_dirs: List[Path] | None = None,
+    task_id: str | None = None,
+) -> List[Dict[str, Any]]:
     """Recursively find all skills in ~/.hermes/skills/ and external dirs.
 
     Args:
@@ -683,20 +819,40 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
     """
     from agent.skill_utils import get_external_skills_dirs, iter_skill_index_files
 
-    cache_key = _SKILLS_CACHE_KEY_DISABLED if skip_disabled else _SKILLS_CACHE_KEY_FILTERED
+    cache_key: Any = (
+        (_SKILLS_CACHE_KEY_DISABLED if skip_disabled else _SKILLS_CACHE_KEY_FILTERED)
+        if search_dirs is None
+        else (
+            "protected",
+            tuple(str(path) for path in search_dirs),
+            bool(skip_disabled),
+        )
+    )
 
     # Load disabled set once (not per-skill). Part of the cache signature:
     # disabling a skill is a config change with no filesystem mtime bump.
-    disabled = set() if skip_disabled else _get_disabled_skill_names()
+    disabled = (
+        set()
+        if skip_disabled or search_dirs is not None
+        else _get_disabled_skill_names()
+    )
 
     # Collect directories to scan — same resolution as the scan loop below
     # (_skills_dir() resolves the LIVE profile HERMES_HOME; the module-level
     # SKILLS_DIR can be stale in long-lived runtimes).
-    dirs_to_scan: list = []
-    active_skills_dir = _skills_dir()
-    if active_skills_dir.exists():
-        dirs_to_scan.append(active_skills_dir)
-    dirs_to_scan.extend(get_external_skills_dirs())
+    if search_dirs is None:
+        dirs_to_scan: list = []
+        active_skills_dir = _skills_dir()
+        if active_skills_dir.exists():
+            dirs_to_scan.append(active_skills_dir)
+        dirs_to_scan.extend(get_external_skills_dirs())
+    else:
+        dirs_to_scan = list(search_dirs)
+    if task_id:
+        protected_dirs = _protected_skill_search_dirs(task_id, dirs_to_scan)
+        if protected_dirs is None:
+            return []
+        dirs_to_scan = protected_dirs
 
     signature = _skills_scan_signature(dirs_to_scan, disabled)
     now = time.monotonic()
@@ -718,8 +874,12 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
     # Scan local dir first, then external dirs (local takes precedence) —
     # dirs_to_scan already resolved above for the signature.
     for scan_dir in dirs_to_scan:
+        if task_id and _protected_skill_path_allowed(task_id, scan_dir) is not True:
+            continue
         for skill_md in iter_skill_index_files(scan_dir, "SKILL.md"):
             if any(part in _EXCLUDED_SKILL_DIRS for part in skill_md.parts):
+                continue
+            if task_id and _protected_skill_path_allowed(task_id, skill_md) is not True:
                 continue
 
             skill_dir = skill_md.parent
@@ -797,8 +957,15 @@ def skills_list(category: str = None, task_id: str = None) -> str:
         JSON string with minimal skill info: name, description, category
     """
     try:
+        from agent.skill_utils import get_external_skills_dirs
+
         active_skills_dir = _skills_dir()
-        if not active_skills_dir.exists():
+        candidate_dirs = []
+        if active_skills_dir.exists():
+            candidate_dirs.append(active_skills_dir)
+        candidate_dirs.extend(get_external_skills_dirs())
+        protected_dirs = _protected_skill_search_dirs(task_id, candidate_dirs)
+        if protected_dirs is None and not active_skills_dir.exists():
             active_skills_dir.mkdir(parents=True, exist_ok=True)
             return json.dumps(
                 {
@@ -811,7 +978,10 @@ def skills_list(category: str = None, task_id: str = None) -> str:
             )
 
         # Find all skills
-        all_skills = _find_all_skills()
+        all_skills = _find_all_skills(
+            search_dirs=protected_dirs,
+            task_id=task_id if protected_dirs is not None else None,
+        )
 
         if not all_skills:
             return json.dumps(
@@ -996,6 +1166,22 @@ def skill_view(
             )
 
         local_category_name: str | None = None
+        protected_call = _protected_skill_search_dirs(task_id, []) is not None
+        if protected_call and ":" in name:
+            from agent.skill_utils import is_valid_namespace, parse_qualified_name
+
+            namespace, bare = parse_qualified_name(name)
+            if not is_valid_namespace(namespace):
+                return json.dumps(
+                    {
+                        "success": False,
+                        "error": f"Invalid namespace '{namespace}' in '{name}'.",
+                    },
+                    ensure_ascii=False,
+                )
+            local_category_name = f"{namespace}/{bare}"
+            name = local_category_name
+
         # ── Qualified name dispatch (plugin skills) ──────────────────
         # Names containing ':' are routed to the plugin skill registry.
         # Bare names fall through to the existing flat-tree scan below.
@@ -1021,6 +1207,17 @@ def skill_view(
             plugin_skill_md = pm.find_plugin_skill(name)
 
             if plugin_skill_md is not None:
+                if _protected_skill_path_allowed(task_id, plugin_skill_md) is False:
+                    return json.dumps(
+                        {
+                            "success": False,
+                            "error": (
+                                f"Skill '{name}' is outside this protected attempt's "
+                                "filesystem grants."
+                            ),
+                        },
+                        ensure_ascii=False,
+                    )
                 if not plugin_skill_md.exists():
                     # Stale registry entry — file deleted out of band
                     pm.remove_plugin_skill(name)
@@ -1085,6 +1282,9 @@ def skill_view(
         if active_skills_dir.exists():
             all_dirs.append(active_skills_dir)
         all_dirs.extend(get_external_skills_dirs())
+        protected_dirs = _protected_skill_search_dirs(task_id, all_dirs)
+        if protected_dirs is not None:
+            all_dirs = protected_dirs
 
         if not all_dirs:
             return json.dumps(
@@ -1110,6 +1310,11 @@ def skill_view(
         seen_md: set = set()
 
         def _record(sd: Optional[Path], smd: Path) -> None:
+            if (
+                protected_dirs is not None
+                and _protected_skill_path_allowed(task_id, smd) is not True
+            ):
+                return
             try:
                 key = smd.resolve()
             except Exception:
@@ -1158,6 +1363,11 @@ def skill_view(
             # frontmatter name, so `skill_view(name)` must accept it too even
             # when the on-disk directory is a shorter category/alias.
             for found_skill_md in iter_skill_index_files(search_dir, "SKILL.md"):
+                if (
+                    protected_dirs is not None
+                    and _protected_skill_path_allowed(task_id, found_skill_md) is not True
+                ):
+                    continue
                 if found_skill_md.parent.name == name:
                     _record(found_skill_md.parent, found_skill_md)
                     continue
@@ -1207,7 +1417,15 @@ def skill_view(
             skill_dir, skill_md = candidates[0]
 
         if not skill_md or not skill_md.exists():
-            available = [s["name"] for s in _sort_skills(_find_all_skills())[:20]]
+            available = [
+                s["name"]
+                for s in _sort_skills(
+                    _find_all_skills(
+                        search_dirs=protected_dirs,
+                        task_id=task_id if protected_dirs is not None else None,
+                    )
+                )[:20]
+            ]
             return json.dumps(
                 {
                     "success": False,
@@ -1219,6 +1437,20 @@ def skill_view(
             )
 
         # Read the file once — reused for platform check and main content below
+        if (
+            protected_dirs is not None
+            and _protected_skill_path_allowed(task_id, skill_md) is not True
+        ):
+            return json.dumps(
+                {
+                    "success": False,
+                    "error": (
+                        f"Skill '{name}' is outside this protected attempt's "
+                        "filesystem grants."
+                    ),
+                },
+                ensure_ascii=False,
+            )
         try:
             content = skill_md.read_text(encoding="utf-8")
         except Exception as e:
@@ -1233,11 +1465,10 @@ def skill_view(
         # Security: warn if skill is loaded from outside trusted directories
         # (local skills dir + configured external_dirs are all trusted)
         _outside_skills_dir = True
-        _trusted_dirs = [active_skills_dir.resolve()]
         try:
-            _trusted_dirs.extend(d.resolve() for d in all_dirs[1:])
+            _trusted_dirs = [directory.resolve() for directory in all_dirs]
         except Exception:
-            pass
+            _trusted_dirs = []
         for _td in _trusted_dirs:
             try:
                 skill_md.resolve().relative_to(_td)
@@ -1314,6 +1545,20 @@ def skill_view(
                         "success": False,
                         "error": traversal_error,
                         "hint": "Use a relative path within the skill directory",
+                    },
+                    ensure_ascii=False,
+                )
+            if (
+                protected_dirs is not None
+                and _protected_skill_path_allowed(task_id, target_file) is not True
+            ):
+                return json.dumps(
+                    {
+                        "success": False,
+                        "error": (
+                            f"File '{file_path}' is outside this protected attempt's "
+                            "filesystem grants."
+                        ),
                     },
                     ensure_ascii=False,
                 )
@@ -1404,52 +1649,25 @@ def skill_view(
         # Reuse the parse from the platform check above
         frontmatter = parsed_frontmatter
 
-        # Get reference, template, asset, and script files if this is a directory-based skill
-        reference_files = []
-        template_files = []
-        asset_files = []
-        script_files = []
-
+        # Discover linked files with per-scan protected authority validation.
+        linked_files = {}
         if skill_dir:
-            references_dir = skill_dir / "references"
-            if references_dir.exists():
-                reference_files = [
-                    str(f.relative_to(skill_dir)) for f in references_dir.glob("*.md")
-                ]
-
-            templates_dir = skill_dir / "templates"
-            if templates_dir.exists():
-                for ext in [
-                    "*.md",
-                    "*.py",
-                    "*.yaml",
-                    "*.yml",
-                    "*.json",
-                    "*.tex",
-                    "*.sh",
-                ]:
-                    template_files.extend(
-                        [
-                            str(f.relative_to(skill_dir))
-                            for f in templates_dir.rglob(ext)
-                        ]
-                    )
-
-            # assets/ — agentskills.io standard directory for supplementary files
-            assets_dir = skill_dir / "assets"
-            if assets_dir.exists():
-                for f in assets_dir.rglob("*"):
-                    if f.is_file():
-                        asset_files.append(str(f.relative_to(skill_dir)))
-
-            scripts_dir = skill_dir / "scripts"
-            if scripts_dir.exists():
-                for ext in ["*.py", "*.sh", "*.bash", "*.js", "*.ts", "*.rb"]:
-                    script_files.extend(
-                        [str(f.relative_to(skill_dir)) for f in scripts_dir.glob(ext)]
-                    )
-
-        # Read tags/related_skills with backward compat:
+            linked_scope_valid, linked_files = _discover_skill_linked_files(
+                skill_dir,
+                task_id=task_id,
+                protected=protected_dirs is not None,
+            )
+            if not linked_scope_valid:
+                return json.dumps(
+                    {
+                        "success": False,
+                        "error": (
+                            f"Skill '{name}' changed outside this protected attempt's "
+                            "filesystem authority during access."
+                        ),
+                    },
+                    ensure_ascii=False,
+                )
         # Check metadata.hermes.* first (agentskills.io convention), fall back to top-level
         hermes_meta = {}
         metadata = frontmatter.get("metadata")
@@ -1461,16 +1679,7 @@ def skill_view(
             hermes_meta.get("related_skills") or frontmatter.get("related_skills", "")
         )
 
-        # Build linked files structure for clear discovery
-        linked_files = {}
-        if reference_files:
-            linked_files["references"] = reference_files
-        if template_files:
-            linked_files["templates"] = template_files
-        if asset_files:
-            linked_files["assets"] = asset_files
-        if script_files:
-            linked_files["scripts"] = script_files
+        # linked_files was built by the bounded discovery helper above.
 
         try:
             rel_path = str(skill_md.relative_to(active_skills_dir))
