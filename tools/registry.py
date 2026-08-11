@@ -27,6 +27,10 @@ from typing import Callable, Dict, List, Optional, Set
 logger = logging.getLogger(__name__)
 
 
+class ToolProvenanceCollisionError(ValueError):
+    """Raised when two operator identities claim one sanitized MCP tool name."""
+
+
 def _is_registry_register_call(node: ast.AST) -> bool:
     """Return True when *node* is a ``registry.register(...)`` call expression."""
     if not isinstance(node, ast.Expr) or not isinstance(node.value, ast.Call):
@@ -91,11 +95,13 @@ class ToolEntry:
         "name", "toolset", "schema", "handler", "check_fn",
         "requires_env", "is_async", "description", "emoji",
         "max_result_size_chars", "dynamic_schema_overrides",
+        "operator_provenance",
     )
 
     def __init__(self, name, toolset, schema, handler, check_fn,
                  requires_env, is_async, description, emoji,
-                 max_result_size_chars=None, dynamic_schema_overrides=None):
+                 max_result_size_chars=None, dynamic_schema_overrides=None,
+                 operator_provenance=None):
         self.name = name
         self.toolset = toolset
         self.schema = schema
@@ -114,6 +120,7 @@ class ToolEntry:
         # on every get_definitions() call; results are merged shallow on top
         # of the base schema before the {"type": "function", ...} wrap.
         self.dynamic_schema_overrides = dynamic_schema_overrides
+        self.operator_provenance = operator_provenance
 
 
 # ---------------------------------------------------------------------------
@@ -376,6 +383,7 @@ class ToolRegistry:
         max_result_size_chars: int | float | None = None,
         dynamic_schema_overrides: Callable = None,
         override: bool = False,
+        operator_provenance: str | None = None,
     ):
         """Register a tool.  Called at module-import time by each tool file.
 
@@ -387,6 +395,21 @@ class ToolRegistry:
         """
         with self._lock:
             existing = self._tools.get(name)
+            if (
+                existing
+                and existing.toolset.startswith("mcp-")
+                and toolset.startswith("mcp-")
+                and existing.operator_provenance != operator_provenance
+                and not (
+                    existing.operator_provenance is None
+                    and existing.toolset == toolset
+                )
+            ):
+                raise ToolProvenanceCollisionError(
+                    f"MCP tool {name!r} already belongs to operator server "
+                    f"{existing.operator_provenance!r}; refusing ambiguous owner "
+                    f"{operator_provenance!r}"
+                )
             if existing and existing.toolset != toolset:
                 # Allow MCP-to-MCP overwrites (legitimate: server refresh,
                 # or two MCP servers with overlapping tool names).
@@ -445,6 +468,7 @@ class ToolRegistry:
                 emoji=emoji,
                 max_result_size_chars=max_result_size_chars,
                 dynamic_schema_overrides=dynamic_schema_overrides,
+                operator_provenance=operator_provenance,
             )
             # Availability is now derived per-tool (_toolset_has_exposable_tools),
             # so this map no longer gates a toolset. It is still consumed by

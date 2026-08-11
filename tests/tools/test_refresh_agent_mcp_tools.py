@@ -183,6 +183,28 @@ def test_refreshed_tool_is_callable_through_valid_tool_names_guard(monkeypatch):
     assert any(t["function"]["name"] == "mcp_granola_list_meetings" for t in agent.tools)
 
 
+def test_protected_refresh_fails_closed_while_mcp_provenance_is_absent(monkeypatch):
+    import model_tools
+    from tools.registry import registry
+
+    name = "mcp__validation_race_safe__probe"
+    agent = _agent([])
+    agent._protected_tool_snapshot = frozenset({name})
+    agent._protected_qualified_mcp_servers = frozenset({"validation-race-safe"})
+    agent._protected_mcp_tool_provenance = {
+        name: "validation-race-safe",
+    }
+    monkeypatch.setattr(model_tools, "get_tool_definitions", lambda **kw: [_tool(name)])
+
+    # Models the refresh window after registry deregistration and before a
+    # replacement has atomically published its handler and exact provenance.
+    registry.deregister(name)
+    mcp_tool.refresh_agent_mcp_tools(agent)
+
+    assert name not in agent.valid_tool_names
+    assert agent.tools == []
+
+
 def test_refresh_is_thread_safe_under_concurrent_calls(monkeypatch):
     """Concurrent refreshes keep tools / valid_tool_names coherent.
 

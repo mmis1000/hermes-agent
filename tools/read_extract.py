@@ -10,10 +10,14 @@ from __future__ import annotations
 import json
 import posixpath
 import zipfile
+from io import BytesIO
 from pathlib import Path
 from xml.etree import ElementTree as ET
 
-__all__ = ["EXTRACTABLE_EXTENSIONS", "ExtractionError", "extract_document_text", "is_extractable_document"]
+__all__ = [
+    "EXTRACTABLE_EXTENSIONS", "ExtractionError", "extract_document_bytes",
+    "extract_document_text", "is_extractable_document",
+]
 
 EXTRACTABLE_EXTENSIONS = frozenset({".ipynb", ".docx", ".xlsx"})
 MAX_XLSX_BYTES = 50 * 1024 * 1024
@@ -50,6 +54,24 @@ def extract_document_text(path: str) -> str:
     raise ExtractionError(f"Unsupported document type: {path!r}")
 
 
+def extract_document_bytes(data: bytes, filename: str) -> str:
+    """Extract a structured document already read through a scoped backend."""
+    ext = _extension(filename)
+    if ext == ".ipynb":
+        try:
+            notebook = json.loads(data.decode("utf-8", errors="replace"))
+        except (ValueError, json.JSONDecodeError) as exc:
+            raise ExtractionError(f"Not a valid notebook: {exc}") from exc
+        return _render_notebook(notebook)
+    if ext == ".docx":
+        return _extract_docx(BytesIO(data))
+    if ext == ".xlsx":
+        if len(data) > MAX_XLSX_BYTES:
+            raise ExtractionError("XLSX exceeds extraction size limit")
+        return _extract_xlsx(BytesIO(data))
+    raise ExtractionError(f"Unsupported document type: {filename!r}")
+
+
 def _source_text(source) -> str:
     if isinstance(source, str):
         return source
@@ -64,6 +86,10 @@ def _extract_notebook(path: str) -> str:
             nb = json.load(fh)
     except (OSError, ValueError, json.JSONDecodeError) as exc:
         raise ExtractionError(f"Not a valid notebook: {exc}") from exc
+    return _render_notebook(nb)
+
+
+def _render_notebook(nb) -> str:
     if not isinstance(nb, dict):
         raise ExtractionError("Notebook root is not an object")
 
@@ -104,7 +130,7 @@ def _zip_xml(zf: zipfile.ZipFile, name: str) -> ET.Element:
         raise ExtractionError(f"Malformed XML in {name}: {exc}") from exc
 
 
-def _extract_docx(path: str) -> str:
+def _extract_docx(path) -> str:
     try:
         with zipfile.ZipFile(path) as zf:
             root = _zip_xml(zf, "word/document.xml")
@@ -130,7 +156,7 @@ def _extract_docx(path: str) -> str:
     return "\n".join(lines).rstrip("\n") + "\n"
 
 
-def _extract_xlsx(path: str) -> str:
+def _extract_xlsx(path) -> str:
     try:
         with zipfile.ZipFile(path) as zf:
             names = set(zf.namelist())

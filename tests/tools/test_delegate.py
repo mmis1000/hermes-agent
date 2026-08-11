@@ -93,6 +93,19 @@ class TestDelegateRequirements(unittest.TestCase):
         self.assertNotIn("acp_args", props["tasks"]["items"]["properties"])
         self.assertNotIn("maxItems", props["tasks"])  # removed — limit is now runtime-configurable
 
+    def test_schema_exposes_filesystem_scope_only_at_top_level(self):
+        props = DELEGATE_TASK_SCHEMA["parameters"]["properties"]
+        nested = props["tasks"]["items"]["properties"]
+        self.assertEqual(props["profile"]["type"], "string")
+        self.assertEqual(props["workdir"]["type"], "string")
+        self.assertEqual(props["reveal"]["type"], "array")
+        self.assertEqual(
+            set(props["reveal"]["items"]["properties"]), {"path", "mode"}
+        )
+        self.assertEqual(props["reveal"]["items"]["properties"]["mode"]["enum"], ["ro", "rw"])
+        for protected in ("profile", "workdir", "reveal"):
+            self.assertNotIn(protected, nested)
+
     def test_schema_description_allows_per_call_routing_overrides(self):
         from tools.delegate_tool import _build_dynamic_schema_overrides
 
@@ -166,6 +179,26 @@ class TestDelegateRequirements(unittest.TestCase):
 
 
 class TestChildSystemPrompt(unittest.TestCase):
+    def test_resolved_scope_is_attached_to_constructed_child(self):
+        parent = _make_mock_parent()
+        scope = object()
+        with patch("run_agent.AIAgent") as MockAgent:
+            child = MagicMock()
+            MockAgent.return_value = child
+            built = _build_child_agent(
+                task_index=0,
+                goal="Scoped work",
+                context=None,
+                toolsets=None,
+                model=None,
+                max_iterations=10,
+                task_count=1,
+                parent_agent=parent,
+                resolved_scope=scope,
+            )
+        self.assertIs(built, child)
+        self.assertIs(child.resolved_invocation_scope, scope)
+
     def test_goal_only(self):
         prompt = _build_child_system_prompt("Fix the tests")
         self.assertIn("Fix the tests", prompt)

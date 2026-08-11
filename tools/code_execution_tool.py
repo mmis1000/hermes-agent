@@ -691,6 +691,13 @@ def _get_or_create_env(task_id: str):
     terminal and file tools use, creating one if it doesn't exist yet.
     Returns ``(env, env_type)`` tuple.
     """
+    from tools.terminal_tool import acquire_task_environment
+
+    env, env_type, _effective_task_id = acquire_task_environment(task_id)
+    return env, env_type
+
+    # Legacy duplicate acquisition path retained only until Stage 7's parity
+    # suite is green; the central path above is authoritative.
     from tools.terminal_tool import (
         _active_environments, _env_lock, _create_environment,
         _get_env_config, _last_activity, _start_cleanup_thread,

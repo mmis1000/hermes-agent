@@ -18,10 +18,20 @@ import zipfile
 
 from tools.read_extract import (
     ExtractionError,
+    extract_document_bytes,
     extract_document_text,
     is_extractable_document,
 )
 from tools.file_tools import read_file_tool
+
+
+def test_notebook_extraction_accepts_scoped_bytes_without_host_path():
+    payload = json.dumps({
+        "cells": [{"cell_type": "markdown", "source": ["scoped bytes"]}],
+        "metadata": {}, "nbformat": 4, "nbformat_minor": 5,
+    }).encode()
+
+    assert "scoped bytes" in extract_document_bytes(payload, "inside.ipynb")
 
 
 # ---------------------------------------------------------------------------

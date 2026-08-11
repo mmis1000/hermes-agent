@@ -663,6 +663,66 @@ assert ad.mark_completion_delivered({delegation_id!r})
     assert probe.stdout.strip().splitlines()[-1] == "0"
 
 
+def test_batch_persistence_failure_removes_partial_record_and_submits_no_runner(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    started = threading.Event()
+    monkeypatch.setattr(
+        ad,
+        "_persist_dispatch",
+        lambda _record: (_ for _ in ()).throw(RuntimeError("persistence failed")),
+    )
+
+    result = ad.dispatch_async_delegation_batch(
+        goals=["never ran"],
+        context=None,
+        toolsets=None,
+        role="leaf",
+        model="m",
+        session_key="owner",
+        runner=lambda: started.set() or {},
+        root_subagent_ids=["logical-a"],
+        attempt_ids_by_logical_id={"logical-a": "attempt-a"},
+        delegation_id="deleg-persist-failure",
+    )
+
+    assert result["status"] == "rejected"
+    assert result["reason"] == "dispatch_setup_failed"
+    assert not started.is_set()
+    assert "deleg-persist-failure" not in ad._records
+    assert ad.get_durable_delegation("deleg-persist-failure") is None
+
+
+def test_batch_bind_failure_removes_durable_record_and_submits_no_runner(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    started = threading.Event()
+
+    result = ad.dispatch_async_delegation_batch(
+        goals=["never ran"],
+        context=None,
+        toolsets=None,
+        role="leaf",
+        model="m",
+        session_key="owner",
+        runner=lambda: started.set() or {},
+        root_subagent_ids=["logical-a"],
+        attempt_ids_by_logical_id={"logical-a": "attempt-a"},
+        delegation_id="deleg-bind-failure",
+        _bind_attempts=lambda _run, _attempts: (_ for _ in ()).throw(
+            RuntimeError("bind failed")
+        ),
+    )
+
+    assert result["status"] == "rejected"
+    assert result["reason"] == "dispatch_setup_failed"
+    assert not started.is_set()
+    assert "deleg-bind-failure" not in ad._records
+    assert ad.get_durable_delegation("deleg-bind-failure") is None
+
+
 def test_submit_failure_removes_durable_running_record(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
 

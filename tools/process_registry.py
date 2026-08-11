@@ -2473,6 +2473,23 @@ def _handle_process(args, **kw):
     elif action in {"poll", "log", "wait", "kill", "write", "submit", "close"}:
         if not session_id:
             return tool_error(f"session_id is required for {action}")
+        from tools.delegation_scope import attempt_scope_registry
+
+        caller_authority = attempt_scope_registry.get(task_id or "")
+        target_session = process_registry.get(session_id)
+        target_authority = (
+            attempt_scope_registry.get(target_session.task_id)
+            if target_session is not None
+            else None
+        )
+        if caller_authority is not None and caller_authority.state not in {"starting", "active"}:
+            return tool_error(
+                f"protected process authority is {caller_authority.state}"
+            )
+        if (caller_authority is not None or target_authority is not None) and (
+            target_session is None or target_session.task_id != task_id
+        ):
+            return tool_error("process is owned by another protected attempt")
         if action == "poll":
             return json.dumps(_redact_process_result(process_registry.poll(session_id)), ensure_ascii=False)
         elif action == "log":

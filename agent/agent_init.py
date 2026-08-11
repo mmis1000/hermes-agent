@@ -356,6 +356,7 @@ def init_agent(
     checkpoint_max_total_size_mb: int = 500,
     checkpoint_max_file_size_mb: int = 10,
     pass_session_id: bool = False,
+    delegation_policy=None,
 ):
     """
     Initialize the AI Agent.
@@ -409,6 +410,17 @@ def init_agent(
     _install_safe_stdio()
 
     agent.model = model
+    # Session-static, immutable authority snapshot. It must be installed before
+    # tool schemas are built so delegate_task receives an invocation-owned view.
+    agent.delegation_policy = delegation_policy
+    # Runtime backing-object lookup used by protected nested delegation. The
+    # parent installs the concrete registry after construction; ordinary agents
+    # retain an explicit None so all construction paths have deterministic state.
+    agent.delegation_backing_registry = None
+    # Filled by delegate_task after pure invocation-scope preflight and before
+    # the child is exposed to routed tools/container setup.
+    agent.resolved_invocation_scope = None
+    agent._delegation_scope = None
     agent.max_iterations = max_iterations
     # Shared iteration budget — parent creates, children inherit.
     # Consumed by every LLM turn across parent + all subagents.
@@ -1226,6 +1238,7 @@ def init_agent(
         enabled_toolsets=enabled_toolsets,
         disabled_toolsets=disabled_toolsets,
         quiet_mode=agent.quiet_mode,
+        delegation_policy=agent.delegation_policy,
     )
     
     # Show tool configuration and store valid tool names for validation

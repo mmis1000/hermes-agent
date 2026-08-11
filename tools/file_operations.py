@@ -28,6 +28,8 @@ Usage:
 import os
 import re
 import difflib
+import base64
+import shlex
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Optional, List, Dict, Any, ClassVar
@@ -871,6 +873,23 @@ class ShellFileOperations(FileOperations):
             result = self._exec(f"command -v {cmd} >/dev/null 2>&1 && echo 'yes'")
             self._command_cache[cmd] = result.stdout.strip() == 'yes'
         return self._command_cache[cmd]
+
+    def read_bytes(self, path: str) -> bytes:
+        """Read exact bytes through the governed execution environment."""
+        result = self._exec(f"base64 < {shlex.quote(path)}")
+        if result.exit_code != 0:
+            raise OSError(f"could not read scoped file: {path}")
+        try:
+            return base64.b64decode(result.stdout, validate=False)
+        except ValueError as exc:
+            raise OSError(f"invalid scoped byte stream for: {path}") from exc
+
+    def stat_size(self, path: str) -> int:
+        """Return byte size without consulting the host filesystem."""
+        result = self._exec(f"wc -c < {shlex.quote(path)}")
+        if result.exit_code != 0:
+            raise OSError(f"could not stat scoped file: {path}")
+        return int(result.stdout.strip())
     
     def _is_likely_binary(self, path: str, content_sample: str = None) -> bool:
         """

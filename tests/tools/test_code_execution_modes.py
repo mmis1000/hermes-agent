@@ -60,6 +60,28 @@ def _mock_handle_function_call(function_name, function_args, task_id=None, user_
     return json.dumps({"error": f"Unknown tool: {function_name}"})
 
 
+def test_code_first_uses_central_task_environment_acquisition(monkeypatch):
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+    from tools import code_execution_tool, terminal_tool
+
+    env = SimpleNamespace(cwd="/workspace")
+    acquired = MagicMock(return_value=(env, "docker", "attempt-code-first"))
+    monkeypatch.setattr(terminal_tool, "acquire_task_environment", acquired)
+    monkeypatch.setattr(
+        terminal_tool,
+        "_get_env_config",
+        MagicMock(side_effect=AssertionError("duplicate acquisition path")),
+    )
+
+    resolved_env, backend = code_execution_tool._get_or_create_env(
+        "attempt-code-first"
+    )
+
+    assert (resolved_env, backend) == (env, "docker")
+    acquired.assert_called_once_with("attempt-code-first")
+
+
 # ---------------------------------------------------------------------------
 # Mode resolution
 # ---------------------------------------------------------------------------
