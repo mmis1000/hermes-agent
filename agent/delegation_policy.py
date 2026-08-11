@@ -80,11 +80,22 @@ class ExecutionProfile:
     memory_mb: int | None = None
     shm_mb: int | None = None
     pids_limit: int | None = None
+    runtime_identity: tuple[int, int] | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "default_workdir", normalize_visible_path(self.default_workdir))
         object.__setattr__(self, "allowed_toolsets", frozenset(self.allowed_toolsets))
         object.__setattr__(self, "qualified_mcp_servers", frozenset(self.qualified_mcp_servers))
+        if self.runtime_identity is not None:
+            if (
+                not isinstance(self.runtime_identity, tuple)
+                or len(self.runtime_identity) != 2
+                or any(
+                    isinstance(value, bool) or not isinstance(value, int) or value < 0
+                    for value in self.runtime_identity
+                )
+            ):
+                raise ValueError("runtime_identity must be a non-negative integer UID/GID pair")
 
 
 @dataclass(frozen=True)

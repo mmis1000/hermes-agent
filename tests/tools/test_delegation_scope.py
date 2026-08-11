@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import PurePosixPath
+
 import pytest
 
 from agent.delegation_policy import (
@@ -13,6 +15,7 @@ from agent.delegation_policy import (
 from tools.delegation_scope import (
     BackingObjectRecord,
     BackingObjectRegistry,
+    ResolvedInvocationScope,
     execution_profile_hash,
     parse_execution_profiles,
     resolve_invocation_scope,
@@ -253,6 +256,98 @@ def test_profile_parser_builds_immutable_snapshot_with_stable_canonical_hash():
     assert execution_profile_hash(parsed["isolated"]) == execution_profile_hash(equivalent)
     with pytest.raises(TypeError):
         parsed["other"] = _profile("other")  # type: ignore[index]
+
+
+def test_runtime_identity_is_optional_hashed_and_operator_supplied():
+    base = {
+        "backend": "docker",
+        "image": "example@sha256:abc",
+        "default_workdir": "/workspace",
+        "allowed_toolsets": ["terminal"],
+    }
+    without = parse_execution_profiles(
+        {"filesystem_isolation": {"profiles": {"isolated": base}}}
+    )["isolated"]
+    with_identity = parse_execution_profiles(
+        {
+            "filesystem_isolation": {
+                "profiles": {
+                    "isolated": {
+                        **base,
+                        "runtime_identity": {"uid": 0, "gid": 10001},
+                    }
+                }
+            }
+        }
+    )["isolated"]
+
+    assert without.runtime_identity is None
+    assert with_identity.runtime_identity == (0, 10001)
+    assert execution_profile_hash(without) != execution_profile_hash(with_identity)
+
+    without_scope = ResolvedInvocationScope(
+        without.name,
+        execution_profile_hash(without),
+        without,
+        PurePosixPath("/workspace"),
+        (),
+        (),
+    )
+    with_scope = ResolvedInvocationScope(
+        with_identity.name,
+        execution_profile_hash(with_identity),
+        with_identity,
+        PurePosixPath("/workspace"),
+        (),
+        (),
+    )
+    without_authority = serialize_delegation_authority(
+        without_scope,
+        enabled_toolsets=(),
+        disabled_toolsets=(),
+        scope_id="scope-without",
+        attempt_id="attempt-without",
+    )
+    with_authority = serialize_delegation_authority(
+        with_scope,
+        enabled_toolsets=(),
+        disabled_toolsets=(),
+        scope_id="scope-with",
+        attempt_id="attempt-with",
+    )
+    assert "runtime_identity" not in without_authority["profile"]["snapshot"]
+    assert with_authority["profile"]["snapshot"]["runtime_identity"] == {
+        "uid": 0,
+        "gid": 10001,
+    }
+
+
+@pytest.mark.parametrize(
+    "identity",
+    [
+        {"uid": True, "gid": 10001},
+        {"uid": -1, "gid": 10001},
+        {"uid": 10001},
+        {"uid": 10001, "gid": 10001, "extra": 1},
+    ],
+)
+def test_runtime_identity_rejects_malformed_values(identity):
+    config = {
+        "filesystem_isolation": {
+            "profiles": {
+                "isolated": {
+                    "backend": "docker",
+                    "image": "example@sha256:abc",
+                    "default_workdir": "/workspace",
+                    "allowed_toolsets": ["terminal"],
+                    "runtime_identity": identity,
+                }
+            }
+        }
+    }
+
+    with pytest.raises(ValueError, match="runtime_identity"):
+        parse_execution_profiles(config)
 
 
 @pytest.mark.parametrize(
