@@ -6,7 +6,8 @@ from dataclasses import dataclass, field, replace
 import hashlib
 import json
 import logging
-from pathlib import PurePosixPath
+import stat
+from pathlib import Path, PurePosixPath
 from types import MappingProxyType
 from typing import Any, Callable, Mapping, Sequence
 import threading
@@ -49,17 +50,70 @@ class BackingObjectRecord:
     object_type: str
     exists: bool = True
     root_symlink: bool = False
+    trusted_host_path: bool = False
 
 
 class BackingObjectRegistry:
-    """Read-only backing-object validation interface used during preflight."""
+    """Pinned backing registry with internal descendant admission."""
 
     def __init__(self, records: Mapping[str, Any] | None = None) -> None:
+        self._lock = threading.RLock()
         self._records = dict(records or {})
 
     def get(self, object_id: str) -> BackingObjectRecord | None:
-        record = self._records.get(object_id)
-        return record if isinstance(record, BackingObjectRecord) else None
+        with self._lock:
+            record = self._records.get(object_id)
+            if not isinstance(record, BackingObjectRecord):
+                return None
+            if record.trusted_host_path:
+                path = Path(record.backing.identity)
+                try:
+                    current = path.lstat()
+                except OSError:
+                    return None
+                if (
+                    path.is_symlink()
+                    or record.backing.kind != "host_path"
+                    or record.object_type != "directory"
+                    or not stat.S_ISDIR(current.st_mode)
+                    or record.backing.revision
+                    != f"{current.st_dev}:{current.st_ino}"
+                ):
+                    return None
+            return record
+
+    def register_derived(
+        self,
+        parent_object_id: str,
+        record: BackingObjectRecord,
+    ) -> None:
+        """Pin one existing host directory strictly below an admitted parent."""
+
+        with self._lock:
+            parent = self._records.get(parent_object_id)
+            if not isinstance(parent, BackingObjectRecord):
+                raise ValueError("derived backing parent is unavailable")
+            parent_path = Path(parent.backing.identity)
+            child_path = Path(record.backing.identity)
+            if (
+                parent.backing.kind != "host_path"
+                or record.backing.kind != "host_path"
+                or parent.object_type != "directory"
+                or child_path == parent_path
+                or parent_path not in child_path.parents
+            ):
+                raise ValueError("derived backing is outside its admitted parent")
+            existing = self._records.get(record.backing.object_id)
+            if existing is not None and existing != record:
+                raise ValueError("derived backing identity changed")
+            self._records[record.backing.object_id] = record
+
+
+@dataclass(frozen=True)
+class TrustedRunExecution:
+    policy: DelegationSessionPolicy
+    backing_registry: BackingObjectRegistry
+    invocation_scope: ResolvedInvocationScope
 
 
 @dataclass
@@ -262,6 +316,38 @@ class AttemptScopeRegistry:
 attempt_scope_registry = AttemptScopeRegistry()
 
 
+def configure_protected_attempt_environment(attempt_id: str) -> None:
+    """Bind task-aware tools to one already-reserved protected attempt."""
+
+    authority = attempt_scope_registry.get(attempt_id)
+    if authority is None or authority.state not in {"starting", "active"}:
+        raise ValueError("protected attempt authority is unavailable")
+
+    from tools import terminal_tool
+
+    def _cleanup_task_environment(physical_id: str = attempt_id) -> None:
+        try:
+            terminal_tool.cleanup_vm(physical_id, force_remove=True)
+        finally:
+            terminal_tool.clear_task_env_overrides(physical_id)
+
+    attempt_scope_registry.add_resource(
+        attempt_id,
+        "task-environment",
+        _cleanup_task_environment,
+    )
+    scope = authority.invocation_scope
+    terminal_tool.register_task_env_overrides(
+        attempt_id,
+        {
+            "env_type": scope.profile.backend,
+            "docker_image": scope.profile.image,
+            "cwd": str(scope.workdir),
+            "delegation_scope_id": authority.scope_id,
+        },
+    )
+
+
 def _parse_reveal(reveal: Sequence[Mapping[str, str]] | None) -> tuple[RevealRequest, ...]:
     if reveal is None:
         return ()
@@ -291,17 +377,9 @@ def _is_within(path: PurePosixPath, prefix: PurePosixPath) -> bool:
 
 
 def _validate_reveal_destination(
-    path: PurePosixPath, protected_prefixes: tuple[PurePosixPath | str, ...]
+    path: PurePosixPath,
+    protected_prefixes: tuple[PurePosixPath | str, ...],
 ) -> None:
-    if path == PurePosixPath("/var/run/docker.sock"):
-        raise ValueError("delegate_task: the Docker socket is forbidden.")
-    if _is_within(path, PurePosixPath("/home")) or _is_within(
-        path, PurePosixPath("/root")
-    ):
-        raise ValueError(f"delegate_task: host home path {path} is forbidden.")
-    credential_markers = {".env", ".ssh", ".aws", ".gnupg", "credentials"}
-    if credential_markers.intersection(path.parts):
-        raise ValueError(f"delegate_task: credential path {path} is forbidden.")
     for prefix in protected_prefixes:
         canonical_prefix = normalize_visible_path(prefix)
         if _is_within(path, canonical_prefix):
@@ -342,6 +420,7 @@ _PROFILE_KEYS = frozenset(
         "image",
         "default_workdir",
         "allowed_toolsets",
+        "allowed_tools",
         "qualified_mcp_servers",
         "network",
         "cpu",
@@ -392,11 +471,16 @@ def parse_execution_profiles(config: Mapping[str, Any]) -> Mapping[str, Executio
         if not isinstance(image, str) or not image.strip():
             raise ValueError(f"execution profile {name!r} image must be a non-empty string")
         toolsets = raw["allowed_toolsets"]
+        tools = raw.get("allowed_tools", ())
         mcp_servers = raw.get("qualified_mcp_servers", ())
         if not isinstance(toolsets, (list, tuple, set, frozenset)) or not all(
             isinstance(item, str) and item for item in toolsets
         ):
             raise ValueError(f"execution profile {name!r} allowed_toolsets must be strings")
+        if not isinstance(tools, (list, tuple, set, frozenset)) or not all(
+            isinstance(item, str) and item for item in tools
+        ):
+            raise ValueError(f"execution profile {name!r} allowed_tools must be strings")
         if not isinstance(mcp_servers, (list, tuple, set, frozenset)) or not all(
             isinstance(item, str) and item for item in mcp_servers
         ):
@@ -409,6 +493,7 @@ def parse_execution_profiles(config: Mapping[str, Any]) -> Mapping[str, Executio
             image=image,
             default_workdir=raw["default_workdir"],
             allowed_toolsets=frozenset(toolsets),
+            allowed_tools=frozenset(tools),
             qualified_mcp_servers=frozenset(mcp_servers),
             network=raw.get("network", "inherit"),
             cpu=raw.get("cpu"),
@@ -434,6 +519,8 @@ def execution_profile_hash(profile: ExecutionProfile) -> str:
         "shm_mb": profile.shm_mb,
         "pids_limit": profile.pids_limit,
     }
+    if profile.allowed_tools:
+        payload["allowed_tools"] = sorted(profile.allowed_tools)
     if profile.runtime_identity is not None:
         payload["runtime_identity"] = {
             "uid": profile.runtime_identity[0],
@@ -460,6 +547,8 @@ def _execution_profile_payload(profile: ExecutionProfile) -> dict[str, Any]:
         "shm_mb": profile.shm_mb,
         "pids_limit": profile.pids_limit,
     }
+    if profile.allowed_tools:
+        payload["allowed_tools"] = sorted(profile.allowed_tools)
     if profile.runtime_identity is not None:
         payload["runtime_identity"] = {
             "uid": profile.runtime_identity[0],
@@ -665,6 +754,7 @@ def deserialize_delegation_authority(
             image=snapshot["image"],
             default_workdir=snapshot["default_workdir"],
             allowed_toolsets=frozenset(snapshot["allowed_toolsets"]),
+            allowed_tools=frozenset(snapshot.get("allowed_tools", ())),
             qualified_mcp_servers=frozenset(snapshot.get("qualified_mcp_servers", ())),
             network=snapshot.get("network", "inherit"),
             cpu=snapshot.get("cpu"),
@@ -789,6 +879,163 @@ def deserialize_delegation_authority(
     )
 
 
+def admit_trusted_run_execution(
+    base_policy: DelegationSessionPolicy | None,
+    execution: Mapping[str, Any],
+    *,
+    inherited_network: bool,
+) -> TrustedRunExecution:
+    """Materialize a trusted Runs execution into existing delegation authority."""
+
+    if not isinstance(base_policy, DelegationSessionPolicy):
+        raise ValueError("Runs protected execution requires admitted filesystem isolation")
+    if not isinstance(execution, Mapping) or set(execution) != {
+        "profile",
+        "workdir",
+        "reveal",
+    }:
+        raise ValueError("Runs execution must contain exactly profile, workdir, and reveal")
+
+    requests = _parse_reveal(execution.get("reveal"))
+    if not requests:
+        raise ValueError("Runs execution reveal must contain at least one directory")
+
+    grants: list[VisibleObjectGrant] = []
+    records: dict[str, BackingObjectRecord] = {}
+    for request in requests:
+        host_path = Path(str(request.path))
+        try:
+            stat_result = host_path.lstat()
+            resolved = host_path.resolve(strict=True)
+        except OSError as exc:
+            raise ValueError(f"Runs execution reveal path is unavailable: {request.path}") from exc
+        if host_path.is_symlink() or resolved != host_path or not host_path.is_dir():
+            raise ValueError(
+                f"Runs execution reveal must be a real canonical directory: {request.path}"
+            )
+        revision = f"{stat_result.st_dev}:{stat_result.st_ino}"
+        object_id = "run_host_" + hashlib.sha256(
+            f"{request.path}\0{revision}".encode("utf-8")
+        ).hexdigest()
+        backing = BackingObjectRef(
+            object_id=object_id,
+            kind="host_path",
+            identity=str(request.path),
+            revision=revision,
+        )
+        grant = VisibleObjectGrant(
+            visible_path=request.path,
+            mode=AccessMode(request.mode),
+            backing=backing,
+            object_type="directory",
+        )
+        grants.append(grant)
+        records[object_id] = BackingObjectRecord(
+            backing=backing,
+            object_type="directory",
+            trusted_host_path=True,
+        )
+
+    policy = DelegationSessionPolicy(
+        profile_required=base_policy.profile_required,
+        allow_profile_none=base_policy.allow_profile_none,
+        allowed_profiles=base_policy.allowed_profiles,
+        profile_snapshots=base_policy.profile_snapshots,
+        visible_objects=tuple(grants),
+        protected_prefixes=base_policy.protected_prefixes,
+    )
+    registry = BackingObjectRegistry(records)
+    scope = resolve_invocation_scope(
+        policy,
+        execution.get("profile"),
+        execution.get("workdir"),
+        execution.get("reveal"),
+        backing_registry=registry,
+        inherited_network=inherited_network,
+    )
+    if scope is None:
+        raise ValueError("Runs protected execution did not resolve an invocation scope")
+    return TrustedRunExecution(policy, registry, scope)
+
+
+def _derive_host_descendant_grant(
+    policy: DelegationSessionPolicy,
+    request: RevealRequest,
+    backing_registry: BackingObjectRegistry | None,
+) -> VisibleObjectGrant:
+    candidates = [
+        grant
+        for grant in policy.visible_objects
+        if grant.object_type == "directory"
+        and request.path != grant.visible_path
+        and _is_within(request.path, normalize_visible_path(grant.visible_path))
+    ]
+    if not candidates or backing_registry is None:
+        raise ValueError(
+            f"delegate_task: reveal path {request.path} is outside parent/session ceiling."
+        )
+    ceiling = max(
+        candidates,
+        key=lambda grant: len(normalize_visible_path(grant.visible_path).parts),
+    )
+    attenuate_mode(ceiling.mode, AccessMode(request.mode))
+    parent_record = backing_registry.get(ceiling.backing.object_id)
+    if (
+        parent_record is None
+        or not parent_record.exists
+        or parent_record.root_symlink
+        or parent_record.object_type != "directory"
+        or parent_record.backing.kind != "host_path"
+    ):
+        raise ValueError("delegate_task: descendant backing parent is unavailable.")
+
+    relative = request.path.relative_to(normalize_visible_path(ceiling.visible_path))
+    host_path = Path(parent_record.backing.identity).joinpath(*relative.parts)
+    try:
+        stat_result = host_path.lstat()
+        resolved = host_path.resolve(strict=True)
+        parent_resolved = Path(parent_record.backing.identity).resolve(strict=True)
+    except OSError as exc:
+        raise ValueError(
+            f"delegate_task: descendant reveal path {request.path} is unavailable."
+        ) from exc
+    if (
+        host_path.is_symlink()
+        or resolved != host_path
+        or not host_path.is_dir()
+        or parent_resolved not in resolved.parents
+    ):
+        raise ValueError(
+            f"delegate_task: descendant reveal must be a real directory below its parent: {request.path}."
+        )
+
+    revision = f"{stat_result.st_dev}:{stat_result.st_ino}"
+    object_id = "derived_host_" + hashlib.sha256(
+        (
+            f"{ceiling.backing.object_id}\0{request.path}\0"
+            f"{host_path}\0{revision}"
+        ).encode("utf-8")
+    ).hexdigest()
+    backing = BackingObjectRef(
+        object_id=object_id,
+        kind="host_path",
+        identity=str(host_path),
+        revision=revision,
+    )
+    record = BackingObjectRecord(
+        backing=backing,
+        object_type="directory",
+        trusted_host_path=parent_record.trusted_host_path,
+    )
+    backing_registry.register_derived(ceiling.backing.object_id, record)
+    return VisibleObjectGrant(
+        visible_path=request.path,
+        mode=AccessMode(request.mode),
+        backing=backing,
+        object_type="directory",
+    )
+
+
 def resolve_invocation_scope(
     policy: DelegationSessionPolicy | None,
     profile: str | None,
@@ -840,24 +1087,33 @@ def resolve_invocation_scope(
         for right in reveal_requests[index + 1 :]:
             if left.path == right.path:
                 raise ValueError(f"delegate_task: duplicate reveal path {left.path}.")
-            if (
-                _is_within(left.path, right.path) or _is_within(right.path, left.path)
-            ) and left.mode != right.mode:
+            if _is_within(left.path, right.path) or _is_within(
+                right.path, left.path
+            ):
                 raise ValueError(
-                    f"delegate_task: overlapping reveal paths {left.path} and {right.path} have conflicting modes."
+                    f"delegate_task: overlapping reveal paths {left.path} and {right.path} are forbidden."
                 )
     grants_by_path = {grant.visible_path: grant for grant in policy.visible_objects}
     resolved_grants: list[VisibleObjectGrant] = []
     for request in reveal_requests:
-        _validate_reveal_destination(request.path, policy.protected_prefixes)
-        if request.path not in grants_by_path:
-            raise ValueError(
-                f"delegate_task: reveal path {request.path} is outside parent/session ceiling."
+        grant = grants_by_path.get(request.path)
+        if grant is None:
+            grant = _derive_host_descendant_grant(
+                policy,
+                request,
+                backing_registry,
             )
-        grant = grants_by_path[request.path]
         attenuate_mode(grant.mode, AccessMode(request.mode))
+        record = (
+            backing_registry.get(grant.backing.object_id)
+            if backing_registry is not None
+            else None
+        )
+        _validate_reveal_destination(
+            request.path,
+            policy.protected_prefixes,
+        )
         if backing_registry is not None:
-            record = backing_registry.get(grant.backing.object_id)
             if record is None or not record.exists:
                 raise ValueError(
                     f"delegate_task: backing object for {request.path} no longer exists."

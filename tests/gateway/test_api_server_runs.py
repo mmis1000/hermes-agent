@@ -26,6 +26,7 @@ from gateway.platforms.api_server import (
     security_headers_middleware,
 )
 from tools import approval as approval_mod
+from agent.delegation_policy import DelegationSessionPolicy, ExecutionProfile
 
 
 # ---------------------------------------------------------------------------
@@ -154,6 +155,136 @@ class TestStartRun:
         delegation dispatch reads HERMES_SESSION_CHAT_ID to pick its wake
         self-post target, and an empty binding forces background delegations
         on this route back to synchronous execution."""
+    @pytest.mark.parametrize(
+        ("allowed_tools", "expected_tool_names"),
+        [
+            (
+                {"delegate_task", "skills_list", "skill_view"},
+                {"terminal", "delegate_task", "skills_list", "skill_view"},
+            ),
+            (set(), {"terminal"}),
+        ],
+    )
+    async def test_protected_start_uses_root_attempt_as_task_id(
+        self,
+        adapter,
+        tmp_path,
+        allowed_tools,
+        expected_tool_names,
+    ):
+        repository = tmp_path / "repository"
+        repository.mkdir()
+        profile = ExecutionProfile(
+            name="filesystem-isolated",
+            backend="docker",
+            image="example@sha256:abc",
+            default_workdir="/workspace",
+            allowed_toolsets={"terminal", "file"},
+            allowed_tools=allowed_tools,
+        )
+        base_policy = DelegationSessionPolicy(
+            profile_required=True,
+            allow_profile_none=False,
+            allowed_profiles={profile.name},
+            profile_snapshots={profile.name: profile},
+            visible_objects=(),
+            protected_prefixes=(),
+        )
+        root_registry = MagicMock()
+        root_registry.reserve.return_value.attempt_id = "runs-root-attempt"
+        root_registry.cleanup.return_value = ()
+        mock_agent = MagicMock()
+        mock_agent.run_conversation.return_value = {"final_response": "done"}
+        mock_agent.session_prompt_tokens = 0
+        mock_agent.session_completion_tokens = 0
+        mock_agent.session_total_tokens = 0
+        mock_agent.tools = [
+            {"function": {"name": name}}
+            for name in (
+                "terminal",
+                "memory",
+                "delegate_task",
+                "skills_list",
+                "skill_view",
+                "skill_manage",
+            )
+        ]
+        mock_agent.valid_tool_names = {
+            item["function"]["name"] for item in mock_agent.tools
+        }
+
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with (
+                patch(
+                    "agent.agent_init._admit_standard_delegation_policy",
+                    return_value=base_policy,
+                ),
+                patch(
+                    "tools.delegation_scope.attempt_scope_registry",
+                    root_registry,
+                ),
+                patch(
+                    "tools.delegation_scope.configure_protected_attempt_environment"
+                ) as configure_environment,
+                patch(
+                    "tools.terminal_tool._get_env_config",
+                    return_value={"docker_network": False},
+                ),
+                patch.object(adapter, "_create_agent", return_value=mock_agent) as create,
+            ):
+                response = await cli.post(
+                    "/v1/runs",
+                    json={
+                        "input": "hello",
+                        "session_id": "client-session",
+                        "execution": {
+                            "profile": profile.name,
+                            "workdir": str(repository),
+                            "reveal": [{"path": str(repository), "mode": "rw"}],
+                        },
+                    },
+                )
+                assert response.status == 202
+                run_id = (await response.json())["run_id"]
+                for _ in range(20):
+                    if run_id not in adapter._active_run_tasks:
+                        break
+                    await asyncio.sleep(0.05)
+
+        create.assert_called_once()
+        assert create.call_args.kwargs["delegation_policy"].visible_objects
+        assert root_registry.reserve.call_args.args[0].profile.network == "none"
+        mock_agent.run_conversation.assert_called_once()
+        assert mock_agent.run_conversation.call_args.kwargs["task_id"] == "runs-root-attempt"
+        root_registry.prepare_idmapped_reveals.assert_called_once_with("runs-root-attempt")
+        configure_environment.assert_called_once_with("runs-root-attempt")
+        root_registry.activate.assert_called_once()
+        root_registry.cleanup.assert_called_once_with("runs-root-attempt")
+        assert {
+            item["function"]["name"] for item in mock_agent.tools
+        } == expected_tool_names
+
+    @pytest.mark.asyncio
+    async def test_explicit_null_execution_fails_closed_without_allocating_run(
+        self,
+        adapter,
+    ):
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            response = await cli.post(
+                "/v1/runs",
+                json={"input": "hello", "execution": None},
+            )
+            body = await response.json()
+
+        assert response.status == 400
+        assert body["error"]["code"] == "invalid_execution"
+        assert adapter._run_statuses == {}
+        assert adapter._run_streams == {}
+
+    @pytest.mark.asyncio
+    async def test_start_invalid_json_returns_400(self, adapter):
         app = _create_runs_app(adapter)
         captured = {}
 
