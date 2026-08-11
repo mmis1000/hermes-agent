@@ -20,6 +20,7 @@ import uuid
 import weakref
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional
+from agent.delegation_policy import ExecutionProfile
 
 from tools.terminal_tool import set_approval_callback as _set_subagent_approval_cb  # noqa: F401  (used via _ChildRun.await_child)
 from utils import is_truthy_value
@@ -752,28 +753,7 @@ def delegate_task(
                 reserved_ids.append(attempt_id)
                 protected_attempt_registry.prepare_idmapped_reveals(attempt_id)
 
-                def _cleanup_attempt_environment(
-                    physical_id: str = attempt_id,
-                ) -> None:
-                    try:
-                        _terminal_tool.cleanup_vm(physical_id, force_remove=True)
-                    finally:
-                        _terminal_tool.clear_task_env_overrides(physical_id)
-
-                protected_attempt_registry.add_resource(
-                    attempt_id,
-                    "task-environment",
-                    _cleanup_attempt_environment,
-                )
-                _terminal_tool.register_task_env_overrides(
-                    attempt_id,
-                    {
-                        "env_type": resolved_scope.profile.backend,
-                        "docker_image": resolved_scope.profile.image,
-                        "cwd": str(resolved_scope.workdir),
-                        "delegation_scope_id": authority.scope_id,
-                    },
-                )
+                _delegation_scope.configure_protected_attempt_environment(attempt_id)
                 protected_attempt_ids[logical_id] = attempt_id
                 child._delegation_attempt_id = attempt_id
                 child._delegation_scope_id = authority.scope_id
@@ -1051,8 +1031,9 @@ def _qualified_protected_tool_names(
     candidate_names: set[str],
     allowed_profile_toolsets: set[str],
     qualified_mcp_servers: frozenset[str],
+    allowed_profile_tools: frozenset[str] | set[str] | tuple[str, ...] = frozenset(),
 ) -> set[str]:
-    """Apply profile toolset and exact MCP-server qualification admission."""
+    """Apply profile toolset/exact-tool and MCP-server qualification admission."""
 
     import model_tools
     from tools.mcp_tool import get_mcp_tool_server_qualification
@@ -1060,7 +1041,7 @@ def _qualified_protected_tool_names(
     admitted: set[str] = set()
     for name in candidate_names:
         toolset = model_tools.get_toolset_for_tool(name)
-        if toolset not in allowed_profile_toolsets:
+        if toolset not in allowed_profile_toolsets and name not in allowed_profile_tools:
             continue
         if _is_mcp_toolset_name(toolset or ""):
             server = get_mcp_tool_server_qualification(name)
@@ -1070,6 +1051,49 @@ def _qualified_protected_tool_names(
     return admitted
 
 from tools.delegate_tool_toolsets import _is_mcp_toolset_name
+
+
+def configure_protected_agent_tools(
+    agent: Any,
+    profile: ExecutionProfile,
+) -> frozenset[str]:
+    """Pin a positive tool snapshot for any protected agent attempt."""
+
+    candidate_names = set(getattr(agent, "valid_tool_names", set()))
+    protected_names = _qualified_protected_tool_names(
+        candidate_names,
+        set(profile.allowed_toolsets),
+        profile.qualified_mcp_servers,
+        profile.allowed_tools,
+    )
+    protected_tools = [
+        item
+        for item in (getattr(agent, "tools", None) or [])
+        if item.get("function", {}).get("name") in protected_names
+    ]
+    snapshot = frozenset(protected_names)
+    setattr(agent, "tools", protected_tools)
+    setattr(agent, "valid_tool_names", set(protected_names))
+    setattr(agent, "_protected_tool_snapshot", snapshot)
+    setattr(
+        agent,
+        "_protected_qualified_mcp_servers",
+        frozenset(profile.qualified_mcp_servers),
+    )
+    from tools.mcp_tool import get_mcp_tool_server_qualification
+
+    setattr(
+        agent,
+        "_protected_mcp_tool_provenance",
+        {
+            name: provenance
+            for name in protected_names
+            if (provenance := get_mcp_tool_server_qualification(name)) is not None
+        },
+    )
+    return snapshot
+
+from agent.delegation_policy import ExecutionProfile
 
 
 def _route_delegate_control_action(

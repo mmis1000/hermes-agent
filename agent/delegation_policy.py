@@ -75,6 +75,7 @@ class ExecutionProfile:
     default_workdir: PurePosixPath | str
     allowed_toolsets: frozenset[str] | set[str] | tuple[str, ...]
     qualified_mcp_servers: frozenset[str] = frozenset()
+    allowed_tools: frozenset[str] | set[str] | tuple[str, ...] = frozenset()
     network: str = "inherit"
     cpu: float | None = None
     memory_mb: int | None = None
@@ -86,6 +87,7 @@ class ExecutionProfile:
         object.__setattr__(self, "default_workdir", normalize_visible_path(self.default_workdir))
         object.__setattr__(self, "allowed_toolsets", frozenset(self.allowed_toolsets))
         object.__setattr__(self, "qualified_mcp_servers", frozenset(self.qualified_mcp_servers))
+        object.__setattr__(self, "allowed_tools", frozenset(self.allowed_tools))
         if self.runtime_identity is not None:
             if (
                 not isinstance(self.runtime_identity, tuple)
@@ -141,10 +143,34 @@ def derive_child_policy(
     parent_by_path = {grant.visible_path: grant for grant in parent.visible_objects}
     child_grants: list[VisibleObjectGrant] = []
     for grant in visible_objects:
-        ceiling = parent_by_path.get(grant.visible_path)
+        grant_path = normalize_visible_path(grant.visible_path)
+        ceiling = parent_by_path.get(grant_path)
         if ceiling is None:
-            raise ValueError(f"visible object outside parent ceiling: {grant.visible_path}")
-        if grant.backing != ceiling.backing or grant.object_type != ceiling.object_type:
+            candidates = [
+                candidate
+                for candidate in parent.visible_objects
+                if candidate.object_type == "directory"
+                and normalize_visible_path(candidate.visible_path) in grant_path.parents
+            ]
+            if not candidates:
+                raise ValueError(f"visible object outside parent ceiling: {grant.visible_path}")
+            ceiling = max(
+                candidates,
+                key=lambda item: len(normalize_visible_path(item.visible_path).parts),
+            )
+            ceiling_path = normalize_visible_path(ceiling.visible_path)
+            parent_backing = PurePosixPath(ceiling.backing.identity)
+            child_backing = PurePosixPath(grant.backing.identity)
+            if (
+                ceiling.backing.kind != "host_path"
+                or grant.backing.kind != "host_path"
+                or grant.object_type != "directory"
+                or parent_backing not in child_backing.parents
+                or grant_path.relative_to(ceiling_path)
+                != child_backing.relative_to(parent_backing)
+            ):
+                raise ValueError(f"visible object identity changed: {grant.visible_path}")
+        elif grant.backing != ceiling.backing or grant.object_type != ceiling.object_type:
             raise ValueError(f"visible object identity changed: {grant.visible_path}")
         attenuate_mode(ceiling.mode, grant.mode)
         child_grants.append(grant)
