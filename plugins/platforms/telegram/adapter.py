@@ -10,6 +10,7 @@ Uses python-telegram-bot library for:
 import asyncio
 import dataclasses
 import faulthandler
+import hashlib
 import inspect
 import json
 import logging
@@ -1592,6 +1593,284 @@ class TelegramAdapter(BasePlatformAdapter):
             and self._bot_supports_rich()
         )
 
+    def _unexpected_local_rich_downgrade(
+        self, content: str, *, draft: bool = False
+    ) -> Optional[tuple[str, str]]:
+        """Classify a local rich-to-legacy choice that users may not expect.
+
+        An explicit ``rich_messages: false`` opt-out is expected and therefore
+        intentionally silent. The other reasons below preserve rich intent but
+        choose legacy delivery for safety, limits, or missing capability.
+        """
+        if (
+            not self._rich_delivery_enabled()
+            or not content
+            or not content.strip()
+            or (not draft and not self._needs_rich_rendering(content))
+        ):
+            return None
+        if getattr(self, "_rich_send_disabled", False):
+            return ("local_rich_capability_unavailable", "rich_capability_latched_off")
+        if draft and getattr(self, "_rich_draft_disabled", False):
+            return (
+                "local_rich_capability_unavailable",
+                "rich_draft_capability_latched_off",
+            )
+        if self._has_telegram_desktop_details_math_crash_shape(content):
+            return (
+                "local_rich_safety_guard",
+                "telegram_desktop_details_math_crash_guard",
+            )
+        if self._has_telegram_desktop_cjk_rich_garble_shape(content):
+            return (
+                "local_rich_safety_guard",
+                "telegram_desktop_cjk_rich_garble_guard",
+            )
+        if not self._content_fits_rich_limits(content):
+            return ("local_rich_limit", "content_exceeds_rich_character_limit")
+        if not self._bot_supports_rich():
+            return ("local_rich_capability_unavailable", "rich_endpoint_unavailable")
+        return None
+
+    def _rich_features(self, content: str) -> List[str]:
+        features: List[str] = []
+        if any(_TABLE_SEPARATOR_RE.match(line) for line in content.splitlines()):
+            features.append("table")
+        if re.search(r"(?m)^\s*[-*]\s+\[[ xX]\]\s+", content):
+            features.append("task_list")
+        if re.search(r"(?m)^<details\b|^</details>|^<summary\b|^</summary>", content):
+            features.append("details")
+        if "$$" in content:
+            features.append("block_math")
+        return features
+
+    @staticmethod
+    def _rich_response_format(response: object) -> Optional[str]:
+        """Return an explicit rich/plain response representation when present.
+
+        Raw Bot API calls may return a Message dict, an ``{"result": Message}``
+        envelope, a PTB-like object, or only a message id/bool. Absence of a
+        representation is ``None`` rather than evidence of a downgrade.
+        """
+        try:
+            body = response
+            if isinstance(body, dict) and "result" in body:
+                body = body.get("result")
+            if isinstance(body, dict):
+                if body.get("rich_message") is not None:
+                    return "rich"
+                if body.get("text") is not None or body.get("caption") is not None:
+                    return "plain"
+                return None
+
+            api_kwargs = getattr(body, "api_kwargs", None)
+            api_kwargs_get = getattr(api_kwargs, "get", None)
+            if callable(api_kwargs_get) and api_kwargs_get("rich_message") is not None:
+                return "rich"
+            if getattr(body, "rich_message", None) is not None:
+                return "rich"
+            if (
+                getattr(body, "text", None) is not None
+                or getattr(body, "caption", None) is not None
+            ):
+                return "plain"
+        except Exception:
+            # This runs after Telegram has accepted the request. Response
+            # introspection is observability only and must never turn a
+            # successful delivery into a retry or a propagated edit failure.
+            return None
+        return None
+
+    @staticmethod
+    def _api_message_id(response: object) -> Optional[object]:
+        """Extract a Bot API message id from bare or enveloped responses."""
+        try:
+            body = response
+            if isinstance(body, dict) and "result" in body:
+                body = body.get("result")
+            if isinstance(body, dict):
+                return body.get("message_id")
+            return getattr(body, "message_id", None)
+        except Exception:
+            return None
+
+    def _classify_rich_api_error(self, error: Exception) -> str:
+        """Map a rich-operation exception to a content-free reason category."""
+        try:
+            text = str(error).lower()
+        except Exception:
+            text = ""
+        try:
+            if self._is_bad_request_error(error):
+                if "method not found" in text or "endpoint" in text:
+                    return "telegram_bad_request_rich_method_unavailable"
+                if "can't parse" in text or "cannot parse" in text:
+                    return "telegram_bad_request_cannot_parse_rich_message"
+                if "too long" in text:
+                    return "telegram_bad_request_message_too_long"
+                return "telegram_bad_request_rejected_rich_message"
+            if isinstance(error, (AttributeError, TypeError, NotImplementedError)):
+                return "hermes_local_rich_capability_unavailable"
+            if self._is_rich_capability_error(error):
+                return "rich_capability_unavailable_source_unknown"
+        except Exception:
+            pass
+        if "timed out" in text or "timeout" in text:
+            return "telegram_rich_api_timeout"
+        class_name = re.sub(
+            r"[^a-z0-9]+", "_", error.__class__.__name__.lower()
+        ).strip("_")
+        return f"telegram_rich_api_{class_name or 'error'}"
+
+    def _rich_downgrade_trigger(self, error: Exception, *, draft: bool = False) -> str:
+        """Attribute the fallback decision without overstating API evidence."""
+        rejected = (
+            "telegram_api_rejected_rich_draft_request"
+            if draft
+            else "telegram_api_rejected_rich_request"
+        )
+        try:
+            if self._is_bad_request_error(error):
+                return rejected
+            if isinstance(error, (AttributeError, TypeError, NotImplementedError)):
+                return "local_rich_capability_unavailable"
+            if self._is_rich_capability_error(error):
+                return "rich_capability_unavailable_source_unknown"
+        except Exception:
+            pass
+        return (
+            "rich_draft_request_failed_outcome_unknown"
+            if draft
+            else "rich_request_failed_outcome_unknown"
+        )
+
+    def _api_error_is_explicit_rejection(self, error: Exception) -> bool:
+        """Return true only when Telegram explicitly rejected the request."""
+        try:
+            return self._is_bad_request_error(error)
+        except Exception:
+            return False
+
+    def _markdown_v2_downgrade_trigger(self, error: Exception) -> str:
+        if self._api_error_is_explicit_rejection(error):
+            return "telegram_api_rejected_markdown_v2_request"
+        return "markdown_v2_request_failed_outcome_unknown"
+
+    @staticmethod
+    def _exception_sha256(error: object) -> str:
+        try:
+            error_text = str(error)
+        except Exception:
+            error_text = error.__class__.__name__
+        return hashlib.sha256(
+            error_text.encode("utf-8", errors="surrogatepass")
+        ).hexdigest()
+
+    def _classify_markdown_v2_api_error(self, error: Exception) -> str:
+        """Map a MarkdownV2 rejection to a content-free reason category."""
+        try:
+            text = str(error).lower()
+        except Exception:
+            text = ""
+        try:
+            if self._is_bad_request_error(error):
+                if (
+                    "can't parse" in text
+                    or "cannot parse" in text
+                    or "parse entities" in text
+                ):
+                    return "telegram_bad_request_cannot_parse_markdown_v2"
+                return "telegram_bad_request_rejected_markdown_v2"
+        except Exception:
+            pass
+        class_name = re.sub(
+            r"[^a-z0-9]+", "_", error.__class__.__name__.lower()
+        ).strip("_")
+        return f"telegram_markdown_v2_api_{class_name or 'error'}"
+
+    def _log_message_format_downgrade(
+        self,
+        *,
+        downgrade_origin: str,
+        trigger: str,
+        requested_format: str,
+        selected_fallback_format: Optional[str],
+        observed_api_format: Optional[str],
+        content: str,
+        chat_id: str,
+        message_id: Optional[str],
+        api_method: Optional[str],
+        fallback_api_method: Optional[str],
+        reason: str,
+        reason_class: Optional[str] = None,
+        api_error: Optional[object] = None,
+        draft_id: Optional[int] = None,
+    ) -> None:
+        """Emit one structured warning without exposing content or breaking delivery."""
+        try:
+            # ``reason`` is deliberately categorical. Reject accidental free-form
+            # strings so an upstream exception or message body can never leak via
+            # a future call site.
+            if not re.fullmatch(r"[a-z0-9_]{1,120}", reason):
+                reason = "unclassified_rich_message_downgrade"
+            safe_reason_class = None
+            if reason_class is not None:
+                candidate = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(reason_class))[:120]
+                safe_reason_class = candidate or None
+
+            api_error_sha256 = None
+            if api_error is not None:
+                api_error_sha256 = self._exception_sha256(api_error)
+
+            try:
+                content_utf16_units = utf16_len(content)
+            except Exception:
+                content_utf16_units = None
+
+            payload = {
+                "api_error_sha256": api_error_sha256,
+                "api_method": api_method,
+                "chat_id": str(chat_id),
+                "content_chars": len(content),
+                "content_sha256": hashlib.sha256(
+                    content.encode("utf-8", errors="surrogatepass")
+                ).hexdigest(),
+                "content_utf16_units": content_utf16_units,
+                "details_blocks": len(re.findall(r"(?m)^<details\b", content)),
+                "downgrade_origin": downgrade_origin,
+                "draft_id": int(draft_id) if draft_id is not None else None,
+                "fallback_api_method": fallback_api_method,
+                "message_id": str(message_id) if message_id is not None else None,
+                "observed_api_format": observed_api_format,
+                "reason": reason,
+                "reason_class": safe_reason_class,
+                "requested_format": requested_format,
+                "rich_features": self._rich_features(content),
+                "selected_fallback_format": selected_fallback_format,
+                "trigger": trigger,
+            }
+            logger.warning(
+                "[%s] message_format_downgrade %s",
+                self.name,
+                json.dumps(
+                    payload,
+                    ensure_ascii=True,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+            )
+        except Exception:
+            # Observability must never alter a send/edit outcome. This fallback
+            # intentionally contains no content-, chat-, or error-derived text.
+            try:
+                logger.warning(
+                    "[Telegram] message_format_downgrade "
+                    '{"downgrade_origin":"unknown","reason":"logging_failed",'
+                    '"trigger":"observability_failure"}'
+                )
+            except Exception:
+                pass
+
     def _should_attempt_rich(
         self, content: str, metadata: Optional[Dict[str, Any]] = None
     ) -> bool:
@@ -1785,9 +2064,20 @@ class TelegramAdapter(BasePlatformAdapter):
                     # Endpoint missing (old PTB/server) — latch rich off so
                     # every later send doesn't pay a doomed extra roundtrip.
                     self._rich_send_disabled = True
-                logger.debug(
-                    "[%s] sendRichMessage rejected (%s) — falling back to MarkdownV2",
-                    self.name, _redact_telegram_error_text(exc),
+                self._log_message_format_downgrade(
+                    downgrade_origin="hermes",
+                    trigger=self._rich_downgrade_trigger(exc),
+                    requested_format="rich_markdown",
+                    selected_fallback_format="markdown_v2",
+                    observed_api_format=None,
+                    content=content,
+                    chat_id=chat_id,
+                    message_id=None,
+                    api_method="sendRichMessage",
+                    fallback_api_method="sendMessage",
+                    reason=self._classify_rich_api_error(exc),
+                    reason_class=exc.__class__.__name__,
+                    api_error=exc,
                 )
                 return None
             # Transient / network / unknown: the request may have reached
@@ -1821,13 +2111,22 @@ class TelegramAdapter(BasePlatformAdapter):
                 retry_after=_retry_after,
             )
 
-        message_id = None
-        if isinstance(msg, dict):
-            message_id = msg.get("message_id")
-            if message_id is None:
-                message_id = (msg.get("result") or {}).get("message_id")
-        else:
-            message_id = getattr(msg, "message_id", None)
+        message_id = self._api_message_id(msg)
+        if self._rich_response_format(msg) == "plain":
+            self._log_message_format_downgrade(
+                downgrade_origin="telegram_api",
+                trigger="rich_request_accepted_but_plain_response",
+                requested_format="rich_markdown",
+                selected_fallback_format=None,
+                observed_api_format="plain_text",
+                content=content,
+                chat_id=chat_id,
+                message_id=str(message_id) if message_id is not None else None,
+                api_method="sendRichMessage",
+                fallback_api_method=None,
+                reason="telegram_api_returned_plain_representation",
+                reason_class=None,
+            )
         if message_id is not None:
             # Telegram won't echo rich content in reply_to_message, so remember
             # what we sent — replies to this message resolve via this index.
@@ -1881,7 +2180,7 @@ class TelegramAdapter(BasePlatformAdapter):
             # Raw Bot API result; do not request return_type=Message (PTB does
             # not fully model the 10.1 response shape yet — a post-edit parse
             # error must not be mistaken for a failed edit).
-            await self._bot.do_api_request("editMessageText", api_kwargs=payload)
+            msg = await self._bot.do_api_request("editMessageText", api_kwargs=payload)
         except Exception as exc:
             if self._is_rich_fallback_error(exc):
                 if self._is_rich_capability_error(exc):
@@ -1891,9 +2190,20 @@ class TelegramAdapter(BasePlatformAdapter):
                 # not fall through to a redundant legacy edit.
                 if "not modified" in str(exc).lower():
                     return SendResult(success=True, message_id=message_id)
-                logger.debug(
-                    "[%s] rich editMessageText rejected (%s) — falling back to MarkdownV2 edit",
-                    self.name, _redact_telegram_error_text(exc),
+                self._log_message_format_downgrade(
+                    downgrade_origin="hermes",
+                    trigger=self._rich_downgrade_trigger(exc),
+                    requested_format="rich_markdown",
+                    selected_fallback_format="markdown_v2",
+                    observed_api_format=None,
+                    content=content,
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    api_method="editMessageText",
+                    fallback_api_method="editMessageText",
+                    reason=self._classify_rich_api_error(exc),
+                    reason_class=exc.__class__.__name__,
+                    api_error=exc,
                 )
                 return None
             if "not modified" in str(exc).lower():
@@ -1914,6 +2224,21 @@ class TelegramAdapter(BasePlatformAdapter):
                 success=False,
                 error=safe_error,
                 retryable=(is_connect_timeout or not is_timeout),
+            )
+        if self._rich_response_format(msg) == "plain":
+            self._log_message_format_downgrade(
+                downgrade_origin="telegram_api",
+                trigger="rich_request_accepted_but_plain_response",
+                requested_format="rich_markdown",
+                selected_fallback_format=None,
+                observed_api_format="plain_text",
+                content=content,
+                chat_id=chat_id,
+                message_id=message_id,
+                api_method="editMessageText",
+                fallback_api_method=None,
+                reason="telegram_api_returned_plain_representation",
+                reason_class=None,
             )
         # Telegram won't echo rich content for messages that predate the bot's
         # first rich send, so mirror the fresh-send index here too: a streamed
@@ -1965,19 +2290,68 @@ class TelegramAdapter(BasePlatformAdapter):
             payload["message_thread_id"] = int(thread_id)
         try:
             ok = await self._bot.do_api_request("sendRichMessageDraft", api_kwargs=payload)
-            return bool(ok)
+            if self._rich_response_format(ok) == "plain":
+                self._log_message_format_downgrade(
+                    downgrade_origin="telegram_api",
+                    trigger="rich_request_accepted_but_plain_response",
+                    requested_format="rich_markdown",
+                    selected_fallback_format=None,
+                    observed_api_format="plain_text",
+                    content=content,
+                    chat_id=chat_id,
+                    message_id=None,
+                    api_method="sendRichMessageDraft",
+                    fallback_api_method=None,
+                    reason="telegram_api_returned_plain_representation",
+                    reason_class=None,
+                    draft_id=draft_id,
+                )
+            if ok:
+                return True
+            explicit_false = ok is False
+            self._log_message_format_downgrade(
+                downgrade_origin="hermes",
+                trigger=(
+                    "telegram_api_returned_false_for_rich_draft"
+                    if explicit_false
+                    else "rich_draft_response_outcome_unknown"
+                ),
+                requested_format="rich_markdown",
+                selected_fallback_format="markdown_v2",
+                observed_api_format=None,
+                content=content,
+                chat_id=chat_id,
+                message_id=None,
+                api_method="sendRichMessageDraft",
+                fallback_api_method="sendMessageDraft",
+                reason=(
+                    "telegram_api_returned_false"
+                    if explicit_false
+                    else "rich_draft_response_representation_unknown"
+                ),
+                reason_class=None,
+                draft_id=draft_id,
+            )
+            return False
         except Exception as exc:
             if self._is_rich_capability_error(exc):
                 self._rich_draft_disabled = True
-                logger.debug(
-                    "[%s] sendRichMessageDraft unsupported (%s) — using legacy drafts",
-                    self.name, _redact_telegram_error_text(exc),
-                )
-            else:
-                logger.debug(
-                    "[%s] sendRichMessageDraft transient failure (%s) — legacy draft this frame",
-                    self.name, _redact_telegram_error_text(exc),
-                )
+            self._log_message_format_downgrade(
+                downgrade_origin="hermes",
+                trigger=self._rich_downgrade_trigger(exc, draft=True),
+                requested_format="rich_markdown",
+                selected_fallback_format="markdown_v2",
+                observed_api_format=None,
+                content=content,
+                chat_id=chat_id,
+                message_id=None,
+                api_method="sendRichMessageDraft",
+                fallback_api_method="sendMessageDraft",
+                reason=self._classify_rich_api_error(exc),
+                reason_class=exc.__class__.__name__,
+                api_error=exc,
+                draft_id=draft_id,
+            )
             return False
 
     async def _drain_polling_connections(self) -> None:
@@ -4057,6 +4431,24 @@ class TelegramAdapter(BasePlatformAdapter):
                             except Exception:
                                 pass  # Typing failures are non-fatal
                     return rich_result
+            elif not (metadata or {}).get("expect_edits"):
+                local_downgrade = self._unexpected_local_rich_downgrade(content)
+                if local_downgrade is not None:
+                    trigger, reason = local_downgrade
+                    self._log_message_format_downgrade(
+                        downgrade_origin="hermes",
+                        trigger=trigger,
+                        requested_format="rich_markdown",
+                        selected_fallback_format="markdown_v2",
+                        observed_api_format=None,
+                        content=content,
+                        chat_id=chat_id,
+                        message_id=None,
+                        api_method=None,
+                        fallback_api_method="sendMessage",
+                        reason=reason,
+                        reason_class=None,
+                    )
 
             # Format and split message if needed
             formatted = self.format_message(content)
@@ -4154,7 +4546,21 @@ class TelegramAdapter(BasePlatformAdapter):
                         except Exception as md_error:
                             # Markdown parsing failed, try plain text
                             if "parse" in str(md_error).lower() or "markdown" in str(md_error).lower():
-                                logger.warning("[%s] MarkdownV2 parse failed, falling back to plain text: %s", self.name, md_error)
+                                self._log_message_format_downgrade(
+                                    downgrade_origin="hermes",
+                                    trigger=self._markdown_v2_downgrade_trigger(md_error),
+                                    requested_format="markdown_v2",
+                                    selected_fallback_format="plain_text",
+                                    observed_api_format=None,
+                                    content=chunk,
+                                    chat_id=chat_id,
+                                    message_id=None,
+                                    api_method="sendMessage",
+                                    fallback_api_method="sendMessage",
+                                    reason=self._classify_markdown_v2_api_error(md_error),
+                                    reason_class=md_error.__class__.__name__,
+                                    api_error=md_error,
+                                )
                                 plain_chunk = _strip_mdv2(chunk)
                                 msg = await self._bot.send_message(
                                     chat_id=normalize_telegram_chat_id(chat_id),
@@ -4409,12 +4815,31 @@ class TelegramAdapter(BasePlatformAdapter):
         # table that exceeds the MarkdownV2 limit must not be split into legacy
         # chunks.  Falls back to the legacy edit path (overflow split included)
         # on capability/permanent rejection.
-        if finalize and self._rich_eligible(content):
-            rich_result = await self._try_edit_rich(
-                chat_id, message_id, content, metadata=metadata,
-            )
-            if rich_result is not None:
-                return rich_result
+        if finalize:
+            if self._rich_eligible(content):
+                rich_result = await self._try_edit_rich(
+                    chat_id, message_id, content, metadata=metadata,
+                )
+                if rich_result is not None:
+                    return rich_result
+            else:
+                local_downgrade = self._unexpected_local_rich_downgrade(content)
+                if local_downgrade is not None:
+                    trigger, reason = local_downgrade
+                    self._log_message_format_downgrade(
+                        downgrade_origin="hermes",
+                        trigger=trigger,
+                        requested_format="rich_markdown",
+                        selected_fallback_format="markdown_v2",
+                        observed_api_format=None,
+                        content=content,
+                        chat_id=chat_id,
+                        message_id=message_id,
+                        api_method=None,
+                        fallback_api_method="editMessageText",
+                        reason=reason,
+                        reason_class=None,
+                    )
 
         # Pre-flight: if content already exceeds the limit, split-and-deliver
         # without round-tripping a doomed edit.  During streaming
@@ -4474,11 +4899,20 @@ class TelegramAdapter(BasePlatformAdapter):
                 if "not modified" in str(fmt_err).lower():
                     return SendResult(success=True, message_id=message_id)
                 # Fallback: strip MarkdownV2 escapes and retry as clean plain text
-                safe_format_error = _redact_telegram_error_text(fmt_err)
-                logger.warning(
-                    "[%s] MarkdownV2 edit failed, falling back to plain text: %s",
-                    self.name,
-                    safe_format_error,
+                self._log_message_format_downgrade(
+                    downgrade_origin="hermes",
+                    trigger=self._markdown_v2_downgrade_trigger(fmt_err),
+                    requested_format="markdown_v2",
+                    selected_fallback_format="plain_text",
+                    observed_api_format=None,
+                    content=formatted,
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    api_method="editMessageText",
+                    fallback_api_method="editMessageText",
+                    reason=self._classify_markdown_v2_api_error(fmt_err),
+                    reason_class=fmt_err.__class__.__name__,
+                    api_error=fmt_err,
                 )
                 _plain = _strip_mdv2(content) if content else content
                 await self._bot.edit_message_text(
@@ -4648,10 +5082,20 @@ class TelegramAdapter(BasePlatformAdapter):
                     )
                 except Exception as fmt_err:
                     if "not modified" not in str(fmt_err).lower():
-                        logger.warning(
-                            "[%s] Overflow split: MarkdownV2 first-chunk edit "
-                            "failed, falling back to plain text: %s",
-                            self.name, _redact_telegram_error_text(fmt_err),
+                        self._log_message_format_downgrade(
+                            downgrade_origin="hermes",
+                            trigger=self._markdown_v2_downgrade_trigger(fmt_err),
+                            requested_format="markdown_v2",
+                            selected_fallback_format="plain_text",
+                            observed_api_format=None,
+                            content=formatted,
+                            chat_id=chat_id,
+                            message_id=message_id,
+                            api_method="editMessageText",
+                            fallback_api_method="editMessageText",
+                            reason=self._classify_markdown_v2_api_error(fmt_err),
+                            reason_class=fmt_err.__class__.__name__,
+                            api_error=fmt_err,
                         )
                         await self._bot.edit_message_text(
                             chat_id=normalize_telegram_chat_id(chat_id),
@@ -4719,7 +5163,46 @@ class TelegramAdapter(BasePlatformAdapter):
                     )
                     break
                 except Exception as send_err:
-                    if "reply message not found" in str(send_err).lower():
+                    reply_anchor_rejected = (
+                        "reply message not found" in str(send_err).lower()
+                    )
+                    explicit_reply_anchor_rejection = (
+                        reply_anchor_rejected
+                        and self._api_error_is_explicit_rejection(send_err)
+                    )
+                    if use_markdown:
+                        self._log_message_format_downgrade(
+                            downgrade_origin="hermes",
+                            trigger=(
+                                "telegram_api_rejected_reply_anchor"
+                                if explicit_reply_anchor_rejection
+                                else (
+                                    "reply_anchor_failure_outcome_unknown"
+                                    if reply_anchor_rejected
+                                    else self._markdown_v2_downgrade_trigger(send_err)
+                                )
+                            ),
+                            requested_format="markdown_v2",
+                            selected_fallback_format="plain_text",
+                            observed_api_format=None,
+                            content=chunk,
+                            chat_id=chat_id,
+                            message_id=None,
+                            api_method="sendMessage",
+                            fallback_api_method="sendMessage",
+                            reason=(
+                                "telegram_reply_message_not_found"
+                                if explicit_reply_anchor_rejection
+                                else (
+                                    "reply_message_not_found_source_unknown"
+                                    if reply_anchor_rejected
+                                    else self._classify_markdown_v2_api_error(send_err)
+                                )
+                            ),
+                            reason_class=send_err.__class__.__name__,
+                            api_error=send_err,
+                        )
+                    if reply_anchor_rejected:
                         # Drop the reply anchor and try again.  Private DM
                         # topic fallback needs the anchor and topic id together;
                         # forum topics can still safely keep message_thread_id.
@@ -4875,6 +5358,30 @@ class TelegramAdapter(BasePlatformAdapter):
             if await self._try_send_rich_draft(chat_id, draft_id, content, metadata):
                 # Drafts have no message_id; report success without one.
                 return SendResult(success=True, message_id=None)
+        elif (
+            getattr(self, "_rich_messages_enabled", True)
+            and getattr(self, "_rich_drafts_enabled", False)
+        ):
+            local_downgrade = self._unexpected_local_rich_downgrade(
+                content, draft=True
+            )
+            if local_downgrade is not None:
+                trigger, reason = local_downgrade
+                self._log_message_format_downgrade(
+                    downgrade_origin="hermes",
+                    trigger=trigger,
+                    requested_format="rich_markdown",
+                    selected_fallback_format="markdown_v2",
+                    observed_api_format=None,
+                    content=content,
+                    chat_id=chat_id,
+                    message_id=None,
+                    api_method=None,
+                    fallback_api_method="sendMessageDraft",
+                    reason=reason,
+                    reason_class=None,
+                    draft_id=draft_id,
+                )
 
         if not hasattr(self._bot, "send_message_draft"):
             return SendResult(success=False, error="api_unavailable")
@@ -4920,15 +5427,31 @@ class TelegramAdapter(BasePlatformAdapter):
                 # on the plain-text attempt — propagates to the caller, which
                 # treats it as "fall back to edit-based for this response".
                 if use_markdown and self._is_bad_request_error(e):
-                    logger.debug(
-                        "[%s] sendMessageDraft MarkdownV2 rejected, retrying "
-                        "as plain text (chat=%s draft_id=%s): %s",
-                        self.name, chat_id, draft_id, _redact_telegram_error_text(e),
+                    self._log_message_format_downgrade(
+                        downgrade_origin="hermes",
+                        trigger=self._markdown_v2_downgrade_trigger(e),
+                        requested_format="markdown_v2",
+                        selected_fallback_format="plain_text",
+                        observed_api_format=None,
+                        content=text,
+                        chat_id=chat_id,
+                        message_id=None,
+                        api_method="sendMessageDraft",
+                        fallback_api_method="sendMessageDraft",
+                        reason=self._classify_markdown_v2_api_error(e),
+                        reason_class=e.__class__.__name__,
+                        api_error=e,
+                        draft_id=draft_id,
                     )
                     continue
                 logger.debug(
-                    "[%s] sendMessageDraft failed (chat=%s draft_id=%s): %s",
-                    self.name, chat_id, draft_id, e,
+                    "[%s] sendMessageDraft failed "
+                    "(chat=%s draft_id=%s error_class=%s error_sha256=%s)",
+                    self.name,
+                    chat_id,
+                    draft_id,
+                    e.__class__.__name__,
+                    self._exception_sha256(e),
                 )
                 return SendResult(success=False, error=_redact_telegram_error_text(e))
 
