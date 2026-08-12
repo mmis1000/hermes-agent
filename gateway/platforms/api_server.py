@@ -4888,6 +4888,17 @@ class APIServerAdapter(BasePlatformAdapter):
         # approval for one run must not unblock another run's dangerous command.
         approval_session_key = run_id
         ephemeral_system_prompt = instructions
+        if protected_execution is not None:
+            from tools.delegation_scope import format_effective_scope_context
+
+            scope_context = format_effective_scope_context(
+                protected_execution.invocation_scope
+            )
+            ephemeral_system_prompt = (
+                f"{instructions}\n\n{scope_context}"
+                if isinstance(instructions, str) and instructions.strip()
+                else scope_context
+            )
         loop = asyncio.get_running_loop()
         q: "asyncio.Queue[Optional[Dict]]" = asyncio.Queue()
         created_at = time.time()

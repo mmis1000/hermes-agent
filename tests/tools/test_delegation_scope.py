@@ -22,6 +22,7 @@ from tools.delegation_scope import (
     delegation_authority_audit_view,
     deserialize_delegation_authority,
     execution_profile_hash,
+    format_effective_scope_context,
     parse_execution_profiles,
     resolve_invocation_scope,
     serialize_delegation_authority,
@@ -81,6 +82,51 @@ def _record(grant: VisibleObjectGrant, **overrides):
     }
     values.update(overrides)
     return BackingObjectRecord(**values)
+
+
+def test_effective_scope_context_contains_only_agent_visible_filesystem_contract():
+    profile = _profile()
+    writable = _grant("/work/project", AccessMode.RW, object_id="project-object")
+    readonly = VisibleObjectGrant(
+        visible_path="/references/资料`line\nbreak.pdf",
+        mode=AccessMode.RO,
+        backing=BackingObjectRef(
+            "spec-object", "host_path", "/host/private/spec.pdf", "secret-revision"
+        ),
+        object_type="file",
+    )
+    scope = ResolvedInvocationScope(
+        profile_name=profile.name,
+        profile_hash=execution_profile_hash(profile),
+        profile=profile,
+        workdir=PurePosixPath("/work/project"),
+        reveal=(
+            RevealRequest(PurePosixPath("/work/project"), "rw"),
+            RevealRequest(PurePosixPath("/references/资料`line\nbreak.pdf"), "ro"),
+        ),
+        visible_objects=(writable, readonly),
+    )
+
+    context = format_effective_scope_context(scope)
+
+    assert context == (
+        "## Execution filesystem\n"
+        "- Working directory: \"/work/project\"\n"
+        "- Available paths:\n"
+        "  - \"/work/project\" — directory, read-write\n"
+        "  - \"/references/资料`line\\nbreak.pdf\" — file, read-only\n"
+        "- Other host paths are not available in this attempt."
+    )
+    for hidden in (
+        profile.name,
+        execution_profile_hash(profile),
+        profile.image,
+        "project-object",
+        "spec-object",
+        "/host/private/spec.pdf",
+        "secret-revision",
+    ):
+        assert hidden not in context
 
 
 def test_trusted_run_execution_admits_real_directory_as_root_scope(tmp_path):

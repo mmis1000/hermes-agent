@@ -53,6 +53,32 @@ class BackingObjectRecord:
     trusted_host_path: bool = False
 
 
+def format_effective_scope_context(scope: ResolvedInvocationScope) -> str:
+    """Describe only the agent-visible filesystem contract of an admitted scope.
+
+    This text is informative. Runtime authority remains the immutable scope and
+    its attempt registration; prompt text is never parsed back into authority.
+    """
+
+    mode_labels = {
+        AccessMode.RO: "read-only",
+        AccessMode.RW: "read-write",
+    }
+    path_literal = lambda path: json.dumps(str(path), ensure_ascii=False)
+    lines = [
+        "## Execution filesystem",
+        f"- Working directory: {path_literal(scope.workdir)}",
+        "- Available paths:",
+    ]
+    lines.extend(
+        f"  - {path_literal(grant.visible_path)} — {grant.object_type}, "
+        f"{mode_labels[grant.mode]}"
+        for grant in scope.visible_objects
+    )
+    lines.append("- Other host paths are not available in this attempt.")
+    return "\n".join(lines)
+
+
 class BackingObjectRegistry:
     """Pinned backing registry with internal descendant admission."""
 

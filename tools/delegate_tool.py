@@ -1009,6 +1009,7 @@ def _build_child_system_prompt(
     context: Optional[str] = None,
     *,
     workspace_path: Optional[str] = None,
+    effective_scope_context: Optional[str] = None,
     role: str = "leaf",
     max_spawn_depth: int = 2,
     child_depth: int = 1,
@@ -1028,7 +1029,9 @@ def _build_child_system_prompt(
     ]
     if context and context.strip():
         parts.append(f"\nCONTEXT:\n{context}")
-    if workspace_path and str(workspace_path).strip():
+    if effective_scope_context and effective_scope_context.strip():
+        parts.append(f"\n{effective_scope_context}")
+    elif workspace_path and str(workspace_path).strip():
         parts.append(
             "\nWORKSPACE PATH:\n"
             f"{workspace_path}\n"
@@ -1870,11 +1873,21 @@ def _build_child_agent(
     ):
         child_toolsets.append("delegation")
 
-    workspace_hint = workspace_override or _resolve_workspace_hint(parent_agent)
+    protected_scope_context = None
+    if isinstance(resolved_scope, ResolvedInvocationScope):
+        from tools.delegation_scope import format_effective_scope_context
+
+        protected_scope_context = format_effective_scope_context(resolved_scope)
+    workspace_hint = (
+        None
+        if protected_scope_context is not None
+        else workspace_override or _resolve_workspace_hint(parent_agent)
+    )
     child_prompt = _build_child_system_prompt(
         goal,
         context,
         workspace_path=workspace_hint,
+        effective_scope_context=protected_scope_context,
         role=effective_role,
         max_spawn_depth=max_spawn,
         child_depth=child_depth,
