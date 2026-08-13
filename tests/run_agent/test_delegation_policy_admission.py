@@ -64,8 +64,12 @@ def test_standard_agent_admits_enabled_profiles_without_mutating_ordinary_schema
     assert policy.profile_required is True
     assert policy.allow_profile_none is False
     assert policy.allowed_profiles == frozenset({"filesystem-isolated"})
-    assert policy.visible_objects == ()
-    assert getattr(agent, "delegation_backing_registry", None) is None
+    assert policy.visible_objects is None
+    from tools.delegation_scope import BackingObjectRegistry
+
+    assert isinstance(
+        getattr(agent, "delegation_backing_registry", None), BackingObjectRegistry
+    )
     schema = _delegate_schema(agent)["parameters"]
     assert schema["properties"]["profile"]["enum"] == ["filesystem-isolated"]
     assert "profile" in schema["required"]

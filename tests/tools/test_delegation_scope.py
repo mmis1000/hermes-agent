@@ -59,7 +59,9 @@ def _policy(*, required: bool = True, profiles=("isolated",), visible_objects=()
         allow_profile_none=not required,
         allowed_profiles=frozenset(profiles),
         profile_snapshots=snapshots,
-        visible_objects=tuple(visible_objects),
+        visible_objects=(
+            None if visible_objects is None else tuple(visible_objects)
+        ),
         protected_prefixes=("/protected",),
     )
 
@@ -754,6 +756,65 @@ def test_reveal_must_match_a_registered_object_in_parent_ceiling():
             "isolated",
             None,
             [{"path": "/work/hidden", "mode": "ro"}],
+        )
+
+
+def test_unbounded_parent_resolves_valid_host_path_as_bounded_child_scope(tmp_path):
+    selected = tmp_path / "selected"
+    selected.mkdir()
+    registry = BackingObjectRegistry()
+
+    scope = resolve_invocation_scope(
+        _policy(visible_objects=None),
+        "isolated",
+        None,
+        [{"path": str(selected), "mode": "ro"}],
+        backing_registry=registry,
+    )
+
+    assert scope is not None
+    assert scope.visible_objects == (
+        VisibleObjectGrant(
+            visible_path=str(selected),
+            mode=AccessMode.RO,
+            backing=scope.visible_objects[0].backing,
+            object_type="directory",
+        ),
+    )
+    record = registry.get(scope.visible_objects[0].backing.object_id)
+    assert record is not None
+    assert record.backing == scope.visible_objects[0].backing
+    assert record.trusted_host_path is True
+
+
+def test_unbounded_parent_resolves_valid_host_file_as_bounded_child_scope(tmp_path):
+    selected = tmp_path / "selected.txt"
+    selected.write_text("selected", encoding="utf-8")
+    registry = BackingObjectRegistry()
+
+    scope = resolve_invocation_scope(
+        _policy(visible_objects=None),
+        "isolated",
+        None,
+        [{"path": str(selected), "mode": "ro"}],
+        backing_registry=registry,
+    )
+
+    assert scope is not None
+    assert scope.visible_objects[0].object_type == "file"
+    assert registry.get(scope.visible_objects[0].backing.object_id) is not None
+
+
+def test_unbounded_parent_rejects_invalid_host_path(tmp_path):
+    missing = tmp_path / "missing"
+
+    with pytest.raises(ValueError, match="unavailable"):
+        resolve_invocation_scope(
+            _policy(visible_objects=None),
+            "isolated",
+            None,
+            [{"path": str(missing), "mode": "ro"}],
+            backing_registry=BackingObjectRegistry(),
         )
 
 

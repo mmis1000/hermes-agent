@@ -1826,9 +1826,18 @@ def _build_child_agent(
                 .intersection(protected_profile_tools)
             )
         ]
+        child_visible_objects = (
+            None
+            if (
+                parent_policy.visible_objects is None
+                and not resolved_scope.reveal
+                and not resolved_scope.visible_objects
+            )
+            else resolved_scope.visible_objects
+        )
         child_delegation_policy = derive_child_policy(
             parent_policy,
-            resolved_scope.visible_objects,
+            child_visible_objects,
             allowed_profiles={resolved_scope.profile_name},
         )
 

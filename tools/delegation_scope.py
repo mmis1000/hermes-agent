@@ -97,11 +97,17 @@ class BackingObjectRegistry:
                     current = path.lstat()
                 except OSError:
                     return None
+                expected_type = (
+                    stat.S_ISDIR(current.st_mode)
+                    if record.object_type == "directory"
+                    else stat.S_ISREG(current.st_mode)
+                    if record.object_type == "file"
+                    else False
+                )
                 if (
                     path.is_symlink()
                     or record.backing.kind != "host_path"
-                    or record.object_type != "directory"
-                    or not stat.S_ISDIR(current.st_mode)
+                    or not expected_type
                     or record.backing.revision
                     != f"{current.st_dev}:{current.st_ino}"
                 ):
@@ -132,6 +138,17 @@ class BackingObjectRegistry:
             existing = self._records.get(record.backing.object_id)
             if existing is not None and existing != record:
                 raise ValueError("derived backing identity changed")
+            self._records[record.backing.object_id] = record
+
+    def register_admitted(self, record: BackingObjectRecord) -> None:
+        """Pin one host object already admitted by the authority resolver."""
+
+        with self._lock:
+            if record.backing.kind != "host_path" or not record.trusted_host_path:
+                raise ValueError("admitted backing must be a trusted host path")
+            existing = self._records.get(record.backing.object_id)
+            if existing is not None and existing != record:
+                raise ValueError("admitted backing identity changed")
             self._records[record.backing.object_id] = record
 
 
@@ -991,7 +1008,7 @@ def _derive_host_descendant_grant(
 ) -> VisibleObjectGrant:
     candidates = [
         grant
-        for grant in policy.visible_objects
+        for grant in policy.visible_objects or ()
         if grant.object_type == "directory"
         and request.path != grant.visible_path
         and _is_within(request.path, normalize_visible_path(grant.visible_path))
@@ -1062,6 +1079,58 @@ def _derive_host_descendant_grant(
     )
 
 
+def _admit_unbounded_host_grant(
+    request: RevealRequest,
+    backing_registry: BackingObjectRegistry | None,
+) -> VisibleObjectGrant:
+    if backing_registry is None:
+        raise ValueError("delegate_task: unbounded filesystem backing registry is unavailable.")
+
+    host_path = Path(str(request.path))
+    try:
+        stat_result = host_path.lstat()
+        resolved = host_path.resolve(strict=True)
+    except OSError as exc:
+        raise ValueError(
+            f"delegate_task: reveal path {request.path} is unavailable."
+        ) from exc
+    if host_path.is_symlink() or resolved != host_path:
+        raise ValueError(
+            f"delegate_task: reveal path {request.path} must be a real canonical host path."
+        )
+    if stat.S_ISDIR(stat_result.st_mode):
+        object_type = "directory"
+    elif stat.S_ISREG(stat_result.st_mode):
+        object_type = "file"
+    else:
+        raise ValueError(
+            f"delegate_task: reveal path {request.path} must be a regular file or directory."
+        )
+
+    revision = f"{stat_result.st_dev}:{stat_result.st_ino}"
+    object_id = "unbounded_host_" + hashlib.sha256(
+        f"{request.path}\0{object_type}\0{revision}".encode("utf-8")
+    ).hexdigest()
+    backing = BackingObjectRef(
+        object_id=object_id,
+        kind="host_path",
+        identity=str(request.path),
+        revision=revision,
+    )
+    record = BackingObjectRecord(
+        backing=backing,
+        object_type=object_type,
+        trusted_host_path=True,
+    )
+    backing_registry.register_admitted(record)
+    return VisibleObjectGrant(
+        visible_path=request.path,
+        mode=AccessMode(request.mode),
+        backing=backing,
+        object_type=object_type,
+    )
+
+
 def resolve_invocation_scope(
     policy: DelegationSessionPolicy | None,
     profile: str | None,
@@ -1119,25 +1188,30 @@ def resolve_invocation_scope(
                 raise ValueError(
                     f"delegate_task: overlapping reveal paths {left.path} and {right.path} are forbidden."
                 )
-    grants_by_path = {grant.visible_path: grant for grant in policy.visible_objects}
+    grants_by_path = {
+        grant.visible_path: grant for grant in policy.visible_objects or ()
+    }
     resolved_grants: list[VisibleObjectGrant] = []
     for request in reveal_requests:
+        _validate_reveal_destination(
+            request.path,
+            policy.protected_prefixes,
+        )
         grant = grants_by_path.get(request.path)
         if grant is None:
-            grant = _derive_host_descendant_grant(
-                policy,
-                request,
-                backing_registry,
-            )
+            if policy.visible_objects is None:
+                grant = _admit_unbounded_host_grant(request, backing_registry)
+            else:
+                grant = _derive_host_descendant_grant(
+                    policy,
+                    request,
+                    backing_registry,
+                )
         attenuate_mode(grant.mode, AccessMode(request.mode))
         record = (
             backing_registry.get(grant.backing.object_id)
             if backing_registry is not None
             else None
-        )
-        _validate_reveal_destination(
-            request.path,
-            policy.protected_prefixes,
         )
         if backing_registry is not None:
             if record is None or not record.exists:
