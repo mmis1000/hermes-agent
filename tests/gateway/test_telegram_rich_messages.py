@@ -10,6 +10,7 @@ The ``telegram`` package is mocked by ``tests/gateway/conftest.py``
 ``TelegramAdapter`` and wire a mock bot.
 """
 
+import json
 import logging
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -81,6 +82,15 @@ def _rich_api_kwargs(adapter):
     call = adapter._bot.do_api_request.call_args
     assert call.args[0] == "sendRichMessage"
     return call.kwargs["api_kwargs"]
+
+
+def _downgrade_events(caplog):
+    marker = "message_format_downgrade "
+    return [
+        json.loads(record.getMessage().split(marker, 1)[1])
+        for record in caplog.records
+        if marker in record.getMessage()
+    ]
 
 
 @pytest.mark.asyncio
@@ -372,15 +382,349 @@ async def test_permanent_rich_error_falls_back_to_legacy(exc):
 
 
 @pytest.mark.asyncio
-async def test_unknown_endpoint_error_falls_back_to_legacy():
-    """A non-BadRequest 'Method not found' (old PTB/endpoint) degrades gracefully."""
+async def test_rich_send_rejection_logs_hermes_downgrade_reason(caplog):
     adapter = _make_adapter()
-    adapter._bot.do_api_request = AsyncMock(side_effect=RuntimeError("Method not found"))
+    bot = adapter._bot
+    assert bot is not None
+    bot.do_api_request = AsyncMock(
+        side_effect=BadRequest("can't parse rich message")
+    )
+
+    with caplog.at_level(logging.WARNING):
+        result = await adapter.send("12345", RICH_CONTENT)
+
+    assert result.success is True
+    event = _downgrade_events(caplog)[0]
+    assert event["downgrade_origin"] == "hermes"
+    assert event["trigger"] == "telegram_api_rejected_rich_request"
+    assert event["requested_format"] == "rich_markdown"
+    assert event["selected_fallback_format"] == "markdown_v2"
+    assert event["observed_api_format"] is None
+    assert "actual_format" not in event
+    assert event["api_method"] == "sendRichMessage"
+    assert event["fallback_api_method"] == "sendMessage"
+    assert event["reason_class"] == "BadRequest"
+    assert event["reason"] == "telegram_bad_request_cannot_parse_rich_message"
+    assert event["api_error_sha256"]
+    assert event["chat_id"] == "12345"
+    assert event["message_id"] is None
+    assert event["content_chars"] == len(RICH_CONTENT)
+    assert event["content_sha256"]
+    assert "table" in event["rich_features"]
+
+
+@pytest.mark.asyncio
+async def test_rich_send_plain_api_response_logs_api_downgrade(caplog):
+    adapter = _make_adapter()
+    bot = adapter._bot
+    assert bot is not None
+    bot.do_api_request = AsyncMock(
+        return_value={"message_id": 123, "text": "plain server representation"}
+    )
+
+    with caplog.at_level(logging.WARNING):
+        result = await adapter.send("12345", RICH_CONTENT)
+
+    assert result.success is True
+    event = _downgrade_events(caplog)[0]
+    assert event["downgrade_origin"] == "telegram_api"
+    assert event["trigger"] == "rich_request_accepted_but_plain_response"
+    assert event["requested_format"] == "rich_markdown"
+    assert event["selected_fallback_format"] is None
+    assert event["observed_api_format"] == "plain_text"
+    assert "actual_format" not in event
+    assert event["api_method"] == "sendRichMessage"
+    assert event["fallback_api_method"] is None
+    assert event["message_id"] == "123"
+
+
+@pytest.mark.asyncio
+async def test_rich_send_plain_object_envelope_logs_api_downgrade(caplog):
+    adapter = _make_adapter()
+    bot = adapter._bot
+    assert bot is not None
+    bot.do_api_request = AsyncMock(
+        return_value={
+            "result": SimpleNamespace(
+                message_id=124, text="plain server representation",
+            )
+        }
+    )
+
+    with caplog.at_level(logging.WARNING):
+        result = await adapter.send("12345", RICH_CONTENT)
+
+    assert result.success is True
+    event = _downgrade_events(caplog)[0]
+    assert event["downgrade_origin"] == "telegram_api"
+    assert event["observed_api_format"] == "plain_text"
+    assert event["selected_fallback_format"] is None
+
+
+@pytest.mark.asyncio
+async def test_local_rich_safety_guard_logs_hermes_downgrade(caplog):
+    adapter = _make_adapter()
+
+    with caplog.at_level(logging.WARNING):
+        result = await adapter.send("12345", CJK_RICH_CONTENT)
+
+    assert result.success is True
+    event = _downgrade_events(caplog)[0]
+    assert event["downgrade_origin"] == "hermes"
+    assert event["trigger"] == "local_rich_safety_guard"
+    assert event["reason"] == "telegram_desktop_cjk_rich_garble_guard"
+    assert event["selected_fallback_format"] == "markdown_v2"
+    assert event["api_method"] is None
+    assert event["fallback_api_method"] == "sendMessage"
+
+
+@pytest.mark.asyncio
+async def test_oversized_rich_send_logs_local_limit_before_legacy_delivery(caplog):
+    adapter = _make_adapter()
+    content = f"{RICH_CONTENT}\n" + ("a" * TelegramAdapter.RICH_MESSAGE_MAX_CHARS)
+
+    with caplog.at_level(logging.WARNING):
+        result = await adapter.send("12345", content)
+
+    assert result.success is True
+    event = _downgrade_events(caplog)[0]
+    assert event["downgrade_origin"] == "hermes"
+    assert event["trigger"] == "local_rich_limit"
+    assert event["reason"] == "content_exceeds_rich_character_limit"
+    assert event["selected_fallback_format"] == "markdown_v2"
+
+
+@pytest.mark.asyncio
+async def test_transient_rich_send_failure_has_no_downgrade_without_fallback(caplog):
+    adapter = _make_adapter()
+    bot = adapter._bot
+    assert bot is not None
+    bot.do_api_request = AsyncMock(side_effect=TimedOut("timed out"))
+
+    with caplog.at_level(logging.WARNING):
+        result = await adapter.send("12345", RICH_CONTENT)
+
+    assert result.success is False
+    bot.send_message.assert_not_awaited()
+    assert _downgrade_events(caplog) == []
+
+
+@pytest.mark.asyncio
+async def test_rich_opt_out_is_expected_and_does_not_log_downgrade(caplog):
+    adapter = _make_adapter(extra={"rich_messages": False})
+
+    with caplog.at_level(logging.WARNING):
+        result = await adapter.send("12345", RICH_CONTENT)
+
+    assert result.success is True
+    assert _downgrade_events(caplog) == []
+
+
+@pytest.mark.asyncio
+async def test_markdownv2_send_rejection_logs_plain_fallback_without_content(caplog):
+    marker = "private-markdown-message-body"
+    content = f"normal **bold** answer {marker}"
+    adapter = _make_adapter(extra={"rich_messages": False})
+    bot = adapter._bot
+    assert bot is not None
+    bot.send_message = AsyncMock(
+        side_effect=[
+            BadRequest(f"can't parse entities in {content}"),
+            MagicMock(message_id=321),
+        ]
+    )
+
+    with caplog.at_level(logging.WARNING):
+        result = await adapter.send("12345", content)
+
+    assert result.success is True
+    event = _downgrade_events(caplog)[0]
+    assert event["downgrade_origin"] == "hermes"
+    assert event["trigger"] == "telegram_api_rejected_markdown_v2_request"
+    assert event["requested_format"] == "markdown_v2"
+    assert event["selected_fallback_format"] == "plain_text"
+    assert event["observed_api_format"] is None
+    assert event["api_method"] == "sendMessage"
+    assert event["fallback_api_method"] == "sendMessage"
+    assert event["reason"] == "telegram_bad_request_cannot_parse_markdown_v2"
+    assert marker not in caplog.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "api_result",
+    [
+        SimpleNamespace(message_id=123),
+        {"message_id": 123, "rich_message": {"blocks": []}},
+        {"result": {"message_id": 123, "rich_message": {"blocks": []}}},
+    ],
+)
+async def test_rich_success_without_plain_evidence_does_not_log_downgrade(
+    api_result, caplog
+):
+    adapter = _make_adapter()
+    bot = adapter._bot
+    assert bot is not None
+    bot.do_api_request = AsyncMock(return_value=api_result)
+
+    with caplog.at_level(logging.WARNING):
+        result = await adapter.send("12345", RICH_CONTENT)
+
+    assert result.success is True
+    assert _downgrade_events(caplog) == []
+
+
+@pytest.mark.asyncio
+async def test_rich_response_introspection_failure_cannot_break_send_or_edit(caplog):
+    class ExplosiveResponse:
+        message_id = 123
+
+        @property
+        def api_kwargs(self):
+            raise RuntimeError("response accessor failed")
+
+    send_adapter = _make_adapter()
+    send_bot = send_adapter._bot
+    assert send_bot is not None
+    send_bot.do_api_request = AsyncMock(return_value=ExplosiveResponse())
+
+    edit_adapter = _make_adapter()
+    edit_bot = edit_adapter._bot
+    assert edit_bot is not None
+    edit_bot.do_api_request = AsyncMock(return_value=ExplosiveResponse())
+
+    with caplog.at_level(logging.WARNING):
+        send_result = await send_adapter.send("12345", RICH_CONTENT)
+        edit_result = await edit_adapter.edit_message(
+            "12345", "555", RICH_CONTENT, finalize=True,
+        )
+
+    assert send_result.success is True
+    assert edit_result.success is True
+    assert _downgrade_events(caplog) == []
+
+
+@pytest.mark.asyncio
+async def test_downgrade_logger_failure_cannot_change_delivery(monkeypatch):
+    import importlib
+
+    adapter_module = importlib.import_module(
+        "plugins.platforms.telegram.adapter"
+    )
+    adapter = _make_adapter()
+    bot = adapter._bot
+    assert bot is not None
+    bot.do_api_request = AsyncMock(side_effect=BadRequest("can't parse rich message"))
+
+    def _raise_from_logger(*_args, **_kwargs):
+        raise RuntimeError("logging handler failed")
+
+    monkeypatch.setattr(adapter_module.logger, "warning", _raise_from_logger)
 
     result = await adapter.send("12345", RICH_CONTENT)
 
     assert result.success is True
+    bot.send_message.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_rich_downgrade_reason_never_logs_quoted_message_content(caplog):
+    payload_marker = "private-message-body-quoted-by-upstream"
+    content = f"{RICH_CONTENT}\n\n{payload_marker}"
+    adapter = _make_adapter()
+    bot = adapter._bot
+    assert bot is not None
+    bot.do_api_request = AsyncMock(
+        side_effect=BadRequest(f"can't parse payload: {content}")
+    )
+
+    with caplog.at_level(logging.WARNING):
+        result = await adapter.send("12345", content)
+
+    assert result.success is True
+    event = _downgrade_events(caplog)[0]
+    assert event["reason"] == "telegram_bad_request_cannot_parse_rich_message"
+    assert payload_marker not in event["reason"]
+    assert payload_marker not in caplog.text
+    assert event["api_error_sha256"]
+
+
+@pytest.mark.asyncio
+async def test_rich_downgrade_reason_is_redacted_and_single_line(monkeypatch, caplog):
+    import agent.redact as redact
+
+    monkeypatch.setattr(redact, "_REDACT_ENABLED", False)
+    token = "123456789:" + "AAExampleSecretTokenValue012345678901"
+    adapter = _make_adapter()
+    bot = adapter._bot
+    assert bot is not None
+    bot.do_api_request = AsyncMock(
+        side_effect=BadRequest(
+            f"can't parse\nhttps://api.telegram.org/bot{token}/sendRichMessage"
+        )
+    )
+
+    with caplog.at_level(logging.WARNING):
+        result = await adapter.send("12345", RICH_CONTENT)
+
+    assert result.success is True
+    event = _downgrade_events(caplog)[0]
+    assert token not in event["reason"]
+    assert token not in caplog.text
+    assert event["reason"] == "telegram_bad_request_cannot_parse_rich_message"
+    assert "\n" not in event["reason"]
+
+
+@pytest.mark.asyncio
+async def test_unknown_endpoint_error_falls_back_to_legacy_without_api_blame(caplog):
+    """A non-BadRequest 'Method not found' degrades with unknown source."""
+    adapter = _make_adapter()
+    adapter._bot.do_api_request = AsyncMock(side_effect=RuntimeError("Method not found"))
+
+    with caplog.at_level(logging.WARNING):
+        result = await adapter.send("12345", RICH_CONTENT)
+
+    assert result.success is True
     adapter._bot.send_message.assert_awaited()
+    event = _downgrade_events(caplog)[0]
+    assert event["downgrade_origin"] == "hermes"
+    assert event["trigger"] == "rich_capability_unavailable_source_unknown"
+    assert not event["trigger"].startswith("telegram_api_rejected")
+
+
+@pytest.mark.asyncio
+async def test_local_rich_signature_error_logs_hermes_local_capability(caplog):
+    adapter = _make_adapter()
+    bot = adapter._bot
+    assert bot is not None
+    bot.do_api_request = AsyncMock(
+        side_effect=TypeError("unexpected keyword argument 'rich_message'")
+    )
+
+    with caplog.at_level(logging.WARNING):
+        result = await adapter.send("12345", RICH_CONTENT)
+
+    assert result.success is True
+    event = _downgrade_events(caplog)[0]
+    assert event["downgrade_origin"] == "hermes"
+    assert event["trigger"] == "local_rich_capability_unavailable"
+    assert event["reason"] == "hermes_local_rich_capability_unavailable"
+
+
+@pytest.mark.asyncio
+async def test_bad_request_capability_error_records_explicit_api_rejection(caplog):
+    adapter = _make_adapter()
+    bot = adapter._bot
+    assert bot is not None
+    bot.do_api_request = AsyncMock(side_effect=BadRequest("Method not found"))
+
+    with caplog.at_level(logging.WARNING):
+        result = await adapter.send("12345", RICH_CONTENT)
+
+    assert result.success is True
+    event = _downgrade_events(caplog)[0]
+    assert event["trigger"] == "telegram_api_rejected_rich_request"
+    assert event["reason"] == "telegram_bad_request_rich_method_unavailable"
 
 
 @pytest.mark.asyncio
@@ -744,28 +1088,227 @@ async def test_rich_draft_capability_failure_falls_back_and_latches_off():
 
 
 @pytest.mark.asyncio
-async def test_rich_draft_transient_failure_does_not_latch_off():
+async def test_rich_draft_transient_failure_does_not_latch_off(caplog):
     adapter = _make_adapter(extra={"rich_drafts": True})
     adapter._bot.do_api_request = AsyncMock(side_effect=TimedOut("timed out"))
 
-    result = await adapter.send_draft("12345", draft_id=7, content=RICH_CONTENT)
+    with caplog.at_level(logging.WARNING):
+        result = await adapter.send_draft(
+            "12345", draft_id=7, content=RICH_CONTENT,
+        )
 
     assert result.success is True  # legacy draft carried this frame
     adapter._bot.send_message_draft.assert_awaited_once()
     # Transient errors must NOT permanently disable rich drafts.
     assert adapter._rich_draft_disabled is False
+    event = _downgrade_events(caplog)[0]
+    assert event["downgrade_origin"] == "hermes"
+    assert event["trigger"] == "rich_draft_request_failed_outcome_unknown"
+    assert event["selected_fallback_format"] == "markdown_v2"
+    assert event["reason"] == "telegram_rich_api_timeout"
 
 
 @pytest.mark.asyncio
-async def test_rich_draft_oversized_uses_legacy():
+async def test_rich_draft_api_rejection_logs_hermes_fallback_selection(caplog):
+    adapter = _make_adapter(extra={"rich_drafts": True})
+    bot = adapter._bot
+    assert bot is not None
+    bot.do_api_request = AsyncMock(side_effect=BadRequest("Method not found"))
+
+    with caplog.at_level(logging.WARNING):
+        result = await adapter.send_draft(
+            "12345", draft_id=7, content=RICH_CONTENT,
+        )
+
+    assert result.success is True
+    event = _downgrade_events(caplog)[0]
+    assert event["downgrade_origin"] == "hermes"
+    assert event["trigger"] == "telegram_api_rejected_rich_draft_request"
+    assert event["requested_format"] == "rich_markdown"
+    assert event["selected_fallback_format"] == "markdown_v2"
+    assert event["observed_api_format"] is None
+    assert event["api_method"] == "sendRichMessageDraft"
+    assert event["fallback_api_method"] == "sendMessageDraft"
+    assert event["draft_id"] == 7
+    assert event["reason"] == "telegram_bad_request_rich_method_unavailable"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("rich_response", "expected_trigger", "expected_reason"),
+    [
+        (
+            None,
+            "rich_draft_response_outcome_unknown",
+            "rich_draft_response_representation_unknown",
+        ),
+        (
+            {},
+            "rich_draft_response_outcome_unknown",
+            "rich_draft_response_representation_unknown",
+        ),
+        (
+            {"rich_message": {"blocks": []}},
+            "rich_draft_response_outcome_unknown",
+            "rich_draft_response_representation_unknown",
+        ),
+        (
+            False,
+            "telegram_api_returned_false_for_rich_draft",
+            "telegram_api_returned_false",
+        ),
+    ],
+)
+async def test_rich_draft_falsy_response_attribution(
+    rich_response, expected_trigger, expected_reason, caplog,
+):
+    adapter = _make_adapter(extra={"rich_drafts": True})
+    bot = adapter._bot
+    assert bot is not None
+    bot.do_api_request = AsyncMock(return_value=rich_response)
+
+    with caplog.at_level(logging.WARNING):
+        result = await adapter.send_draft("12345", 7, "**preview**")
+
+    assert result.success is True
+    event = _downgrade_events(caplog)[0]
+    assert event["downgrade_origin"] == "hermes"
+    assert event["trigger"] == expected_trigger
+    assert event["reason"] == expected_reason
+    assert event["selected_fallback_format"] == "markdown_v2"
+    bot.send_message_draft.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_rich_draft_true_success_is_silent(caplog):
+    adapter = _make_adapter(extra={"rich_drafts": True})
+    bot = adapter._bot
+    assert bot is not None
+    bot.do_api_request = AsyncMock(return_value=True)
+
+    with caplog.at_level(logging.WARNING):
+        result = await adapter.send_draft(
+            "12345", draft_id=11, content=RICH_CONTENT,
+        )
+
+    assert result.success is True
+    assert _downgrade_events(caplog) == []
+
+
+@pytest.mark.asyncio
+async def test_local_rich_draft_safety_guard_logs_hermes_selection(caplog):
+    adapter = _make_adapter(extra={"rich_drafts": True})
+
+    with caplog.at_level(logging.WARNING):
+        result = await adapter.send_draft(
+            "12345", draft_id=8, content=DANGEROUS_DETAILS_MATH,
+        )
+
+    assert result.success is True
+    event = _downgrade_events(caplog)[0]
+    assert event["downgrade_origin"] == "hermes"
+    assert event["trigger"] == "local_rich_safety_guard"
+    assert event["selected_fallback_format"] == "markdown_v2"
+    assert event["reason"] == "telegram_desktop_details_math_crash_guard"
+    assert event["draft_id"] == 8
+
+
+@pytest.mark.asyncio
+async def test_rich_draft_opt_out_is_expected_and_silent(caplog):
+    adapter = _make_adapter(extra={"rich_drafts": False})
+
+    with caplog.at_level(logging.WARNING):
+        result = await adapter.send_draft(
+            "12345", draft_id=9, content=RICH_CONTENT,
+        )
+
+    assert result.success is True
+    assert _downgrade_events(caplog) == []
+
+
+@pytest.mark.asyncio
+async def test_markdownv2_draft_rejection_logs_plain_fallback_without_content(caplog):
+    marker = "private-markdown-draft-body"
+    content = f"draft **bold** answer {marker}"
+    adapter = _make_adapter(extra={"rich_drafts": False})
+    bot = adapter._bot
+    assert bot is not None
+
+    async def _draft(**kwargs):
+        if "parse_mode" in kwargs:
+            raise BadRequest(f"can't parse entities in {content}")
+        return True
+
+    bot.send_message_draft = AsyncMock(side_effect=_draft)
+
+    with caplog.at_level(logging.WARNING):
+        result = await adapter.send_draft(
+            "12345", draft_id=12, content=content,
+        )
+
+    assert result.success is True
+    event = _downgrade_events(caplog)[0]
+    assert event["downgrade_origin"] == "hermes"
+    assert event["trigger"] == "telegram_api_rejected_markdown_v2_request"
+    assert event["requested_format"] == "markdown_v2"
+    assert event["selected_fallback_format"] == "plain_text"
+    assert event["api_method"] == "sendMessageDraft"
+    assert event["fallback_api_method"] == "sendMessageDraft"
+    assert event["draft_id"] == 12
+    assert event["reason"] == "telegram_bad_request_cannot_parse_markdown_v2"
+    assert marker not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_plain_draft_retry_failure_redacts_error_body_and_token(monkeypatch, caplog):
+    import agent.redact as redact
+
+    monkeypatch.setattr(redact, "_REDACT_ENABLED", False)
+    marker = "private-plain-draft-error-body"
+    token = "123456789:" + "AAExampleSecretTokenValue012345678901"
+    adapter = _make_adapter(extra={"rich_drafts": False})
+    bot = adapter._bot
+    assert bot is not None
+
+    async def _draft(**kwargs):
+        if "parse_mode" in kwargs:
+            raise BadRequest("can't parse entities")
+        raise RuntimeError(
+            f"plain retry failed {marker} "
+            f"https://api.telegram.org/bot{token}/sendMessageDraft"
+        )
+
+    bot.send_message_draft = AsyncMock(side_effect=_draft)
+
+    with caplog.at_level(logging.DEBUG):
+        result = await adapter.send_draft(
+            "12345", draft_id=13, content="draft **bold** answer",
+        )
+
+    assert result.success is False
+    assert marker not in caplog.text
+    assert token not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_rich_draft_oversized_uses_legacy_and_logs_local_limit(caplog):
     adapter = _make_adapter(extra={"rich_drafts": True})
     oversized = "a" * 40000
 
-    result = await adapter.send_draft("12345", draft_id=7, content=oversized)
+    with caplog.at_level(logging.WARNING):
+        result = await adapter.send_draft(
+            "12345", draft_id=7, content=oversized,
+        )
 
     assert result.success is True
     adapter._bot.do_api_request.assert_not_called()
     adapter._bot.send_message_draft.assert_awaited_once()
+    event = _downgrade_events(caplog)[0]
+    assert event["downgrade_origin"] == "hermes"
+    assert event["trigger"] == "local_rich_limit"
+    assert event["reason"] == "content_exceeds_rich_character_limit"
+    assert event["selected_fallback_format"] == "markdown_v2"
+    assert event["draft_id"] == 7
 
 
 # ----------------------------------------------------------------------
@@ -802,6 +1345,125 @@ def test_streaming_overflow_limit_none_when_rich_latched_off():
     adapter = _make_adapter()
     adapter._rich_send_disabled = True
     assert adapter.streaming_overflow_limit() is None
+
+
+@pytest.mark.asyncio
+async def test_overflow_first_chunk_markdown_rejection_logs_plain_selection(caplog):
+    adapter = _make_adapter(extra={"rich_messages": False})
+    object.__setattr__(adapter, "MAX_MESSAGE_LENGTH", 100)
+    bot = adapter._bot
+    assert bot is not None
+    marker = "private-overflow-edit-error-body"
+    bot.edit_message_text = AsyncMock(
+        side_effect=[BadRequest(f"can't parse entities {marker}"), None]
+    )
+    next_id = 600
+
+    async def _send(**_kwargs):
+        nonlocal next_id
+        next_id += 1
+        return MagicMock(message_id=next_id)
+
+    bot.send_message = AsyncMock(side_effect=_send)
+
+    with caplog.at_level(logging.WARNING):
+        result = await adapter._edit_overflow_split(
+            "12345", "555", "word " * 120, finalize=True,
+        )
+
+    assert result.success is True
+    events = _downgrade_events(caplog)
+    assert len(events) == 1
+    assert events[0]["api_method"] == "editMessageText"
+    assert events[0]["selected_fallback_format"] == "plain_text"
+    assert events[0]["reason"] == "telegram_bad_request_cannot_parse_markdown_v2"
+    assert marker not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_overflow_continuation_markdown_rejection_logs_plain_selection(caplog):
+    adapter = _make_adapter(extra={"rich_messages": False})
+    object.__setattr__(adapter, "MAX_MESSAGE_LENGTH", 100)
+    bot = adapter._bot
+    assert bot is not None
+    bot.edit_message_text = AsyncMock(return_value=True)
+    marker = "private-overflow-send-error-body"
+    rejected_once = False
+    next_id = 700
+
+    async def _send(**kwargs):
+        nonlocal rejected_once, next_id
+        if kwargs.get("parse_mode") is not None and not rejected_once:
+            rejected_once = True
+            raise BadRequest(f"can't parse entities {marker}")
+        next_id += 1
+        return MagicMock(message_id=next_id)
+
+    bot.send_message = AsyncMock(side_effect=_send)
+
+    with caplog.at_level(logging.WARNING):
+        result = await adapter._edit_overflow_split(
+            "12345", "555", "word " * 120, finalize=True,
+        )
+
+    assert result.success is True
+    events = _downgrade_events(caplog)
+    assert len(events) == 1
+    assert events[0]["api_method"] == "sendMessage"
+    assert events[0]["selected_fallback_format"] == "plain_text"
+    assert events[0]["reason"] == "telegram_bad_request_cannot_parse_markdown_v2"
+    assert marker not in caplog.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("reply_error", "expected_trigger", "expected_reason"),
+    [
+        (
+            BadRequest("Reply message not found"),
+            "telegram_api_rejected_reply_anchor",
+            "telegram_reply_message_not_found",
+        ),
+        (
+            RuntimeError("Reply message not found"),
+            "reply_anchor_failure_outcome_unknown",
+            "reply_message_not_found_source_unknown",
+        ),
+    ],
+)
+async def test_overflow_reply_anchor_failure_attribution(
+    reply_error, expected_trigger, expected_reason, caplog,
+):
+    adapter = _make_adapter(extra={"rich_messages": False})
+    object.__setattr__(adapter, "MAX_MESSAGE_LENGTH", 100)
+    bot = adapter._bot
+    assert bot is not None
+    bot.edit_message_text = AsyncMock(return_value=True)
+    rejected_once = False
+    next_id = 800
+
+    async def _send(**kwargs):
+        nonlocal rejected_once, next_id
+        if kwargs.get("parse_mode") is not None and not rejected_once:
+            rejected_once = True
+            raise reply_error
+        next_id += 1
+        return MagicMock(message_id=next_id)
+
+    bot.send_message = AsyncMock(side_effect=_send)
+
+    with caplog.at_level(logging.WARNING):
+        result = await adapter._edit_overflow_split(
+            "12345", "555", "word " * 120, finalize=True,
+        )
+
+    assert result.success is True
+    events = _downgrade_events(caplog)
+    assert len(events) == 1
+    assert events[0]["downgrade_origin"] == "hermes"
+    assert events[0]["trigger"] == expected_trigger
+    assert events[0]["reason"] == expected_reason
+    assert events[0]["selected_fallback_format"] == "plain_text"
 
 
 @pytest.mark.asyncio
@@ -869,6 +1531,91 @@ async def test_finalize_edit_plain_content_stays_legacy():
 
 
 @pytest.mark.asyncio
+async def test_markdownv2_edit_rejection_logs_plain_fallback_without_content(caplog):
+    marker = "private-markdown-edit-body"
+    content = f"final **bold** answer {marker}"
+    adapter = _make_adapter(extra={"rich_messages": False})
+    bot = adapter._bot
+    assert bot is not None
+    bot.edit_message_text = AsyncMock(
+        side_effect=[BadRequest(f"can't parse entities in {content}"), None]
+    )
+
+    with caplog.at_level(logging.WARNING):
+        result = await adapter.edit_message(
+            "12345", "555", content, finalize=True,
+        )
+
+    assert result.success is True
+    event = _downgrade_events(caplog)[0]
+    assert event["downgrade_origin"] == "hermes"
+    assert event["trigger"] == "telegram_api_rejected_markdown_v2_request"
+    assert event["requested_format"] == "markdown_v2"
+    assert event["selected_fallback_format"] == "plain_text"
+    assert event["api_method"] == "editMessageText"
+    assert event["fallback_api_method"] == "editMessageText"
+    assert event["message_id"] == "555"
+    assert event["reason"] == "telegram_bad_request_cannot_parse_markdown_v2"
+    assert marker not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_transient_rich_edit_failure_has_no_downgrade_without_fallback(caplog):
+    adapter = _make_adapter()
+    bot = adapter._bot
+    assert bot is not None
+    bot.do_api_request = AsyncMock(side_effect=TimedOut("timed out"))
+
+    with caplog.at_level(logging.WARNING):
+        result = await adapter.edit_message(
+            "12345", "555", RICH_CONTENT, finalize=True,
+        )
+
+    assert result.success is False
+    bot.edit_message_text.assert_not_awaited()
+    assert _downgrade_events(caplog) == []
+
+
+@pytest.mark.asyncio
+async def test_transient_markdown_edit_fallback_uses_outcome_unknown_trigger(caplog):
+    adapter = _make_adapter(extra={"rich_messages": False})
+    bot = adapter._bot
+    assert bot is not None
+    bot.edit_message_text = AsyncMock(
+        side_effect=[RuntimeError("connection reset"), None]
+    )
+
+    with caplog.at_level(logging.WARNING):
+        result = await adapter.edit_message(
+            "12345", "555", "final **bold**", finalize=True,
+        )
+
+    assert result.success is True
+    event = _downgrade_events(caplog)[0]
+    assert event["downgrade_origin"] == "hermes"
+    assert event["trigger"] == "markdown_v2_request_failed_outcome_unknown"
+    assert event["selected_fallback_format"] == "plain_text"
+
+
+@pytest.mark.asyncio
+async def test_oversized_rich_edit_logs_local_limit_before_overflow_delivery(caplog):
+    adapter = _make_adapter()
+    content = f"{RICH_CONTENT}\n" + ("a" * TelegramAdapter.RICH_MESSAGE_MAX_CHARS)
+
+    with caplog.at_level(logging.WARNING):
+        result = await adapter.edit_message(
+            "12345", "555", content, finalize=True,
+        )
+
+    assert result.success is True
+    event = _downgrade_events(caplog)[0]
+    assert event["downgrade_origin"] == "hermes"
+    assert event["trigger"] == "local_rich_limit"
+    assert event["reason"] == "content_exceeds_rich_character_limit"
+    assert event["selected_fallback_format"] == "markdown_v2"
+
+
+@pytest.mark.asyncio
 async def test_legacy_edit_error_logs_redacted_bot_token_without_traceback(monkeypatch, caplog):
     import agent.redact as redact
 
@@ -921,6 +1668,68 @@ async def test_finalize_edit_rich_capability_error_falls_back_to_legacy():
     assert result.success is True
     assert adapter._rich_send_disabled is True
     adapter._bot.edit_message_text.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_rich_edit_rejection_logs_hermes_downgrade_reason(caplog):
+    adapter = _make_adapter()
+    bot = adapter._bot
+    assert bot is not None
+    bot.do_api_request = AsyncMock(
+        side_effect=BadRequest("can't parse expanded details blocks")
+    )
+    content = "\n".join(
+        f"<details><summary>Tool {index}</summary>\n\n"
+        f"```json\n{{\"private-payload-marker\": {index}}}\n```\n\n</details>"
+        for index in range(6)
+    )
+
+    with caplog.at_level(logging.WARNING):
+        result = await adapter.edit_message(
+            "12345", "555", content, finalize=True,
+        )
+
+    assert result.success is True
+    event = _downgrade_events(caplog)[0]
+    assert event["downgrade_origin"] == "hermes"
+    assert event["trigger"] == "telegram_api_rejected_rich_request"
+    assert event["selected_fallback_format"] == "markdown_v2"
+    assert event["observed_api_format"] is None
+    assert "actual_format" not in event
+    assert event["api_method"] == "editMessageText"
+    assert event["fallback_api_method"] == "editMessageText"
+    assert event["message_id"] == "555"
+    assert event["reason"] == "telegram_bad_request_cannot_parse_rich_message"
+    assert event["api_error_sha256"]
+    assert event["details_blocks"] == 6
+    assert "details" in event["rich_features"]
+    assert "private-payload-marker" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_rich_edit_plain_api_response_logs_api_downgrade(caplog):
+    adapter = _make_adapter()
+    bot = adapter._bot
+    assert bot is not None
+    bot.do_api_request = AsyncMock(
+        return_value={"message_id": 555, "text": "plain server representation"}
+    )
+
+    with caplog.at_level(logging.WARNING):
+        result = await adapter.edit_message(
+            "12345", "555", RICH_CONTENT, finalize=True,
+        )
+
+    assert result.success is True
+    event = _downgrade_events(caplog)[0]
+    assert event["downgrade_origin"] == "telegram_api"
+    assert event["trigger"] == "rich_request_accepted_but_plain_response"
+    assert event["selected_fallback_format"] is None
+    assert event["observed_api_format"] == "plain_text"
+    assert "actual_format" not in event
+    assert event["api_method"] == "editMessageText"
+    assert event["fallback_api_method"] is None
+    assert event["message_id"] == "555"
 
 
 @pytest.mark.asyncio
