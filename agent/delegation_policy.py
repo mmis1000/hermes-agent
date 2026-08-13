@@ -106,7 +106,7 @@ class DelegationSessionPolicy:
     allow_profile_none: bool
     allowed_profiles: frozenset[str] | set[str] | tuple[str, ...]
     profile_snapshots: Mapping[str, ExecutionProfile]
-    visible_objects: tuple[VisibleObjectGrant, ...]
+    visible_objects: tuple[VisibleObjectGrant, ...] | None
     protected_prefixes: tuple[PurePosixPath | str, ...]
 
     def __post_init__(self) -> None:
@@ -115,9 +115,9 @@ class DelegationSessionPolicy:
         if not allowed.issubset(snapshots):
             missing = sorted(allowed.difference(snapshots))
             raise ValueError(f"allowed profiles missing snapshots: {missing}")
-        grants = tuple(self.visible_objects)
+        grants = None if self.visible_objects is None else tuple(self.visible_objects)
         seen_paths: set[PurePosixPath] = set()
-        for grant in grants:
+        for grant in grants or ():
             path = normalize_visible_path(grant.visible_path)
             if path in seen_paths:
                 raise ValueError(f"duplicate visible path: {path}")
@@ -134,15 +134,25 @@ class DelegationSessionPolicy:
 
 def derive_child_policy(
     parent: DelegationSessionPolicy,
-    visible_objects: tuple[VisibleObjectGrant, ...],
+    visible_objects: tuple[VisibleObjectGrant, ...] | None,
     *,
     allowed_profiles: frozenset[str] | set[str] | tuple[str, ...] | None = None,
 ) -> DelegationSessionPolicy:
     """Derive a nested orchestrator policy without widening parent authority."""
 
-    parent_by_path = {grant.visible_path: grant for grant in parent.visible_objects}
+    if visible_objects is None and parent.visible_objects is not None:
+        raise ValueError("unbounded child requires an unbounded parent")
+
+    parent_by_path = (
+        None
+        if parent.visible_objects is None
+        else {grant.visible_path: grant for grant in parent.visible_objects}
+    )
     child_grants: list[VisibleObjectGrant] = []
-    for grant in visible_objects:
+    for grant in visible_objects or ():
+        if parent_by_path is None:
+            child_grants.append(grant)
+            continue
         grant_path = normalize_visible_path(grant.visible_path)
         ceiling = parent_by_path.get(grant_path)
         if ceiling is None:
@@ -186,6 +196,6 @@ def derive_child_policy(
         allow_profile_none=False,
         allowed_profiles=selected_profiles,
         profile_snapshots=snapshots,
-        visible_objects=tuple(child_grants),
+        visible_objects=None if visible_objects is None else tuple(child_grants),
         protected_prefixes=parent.protected_prefixes,
     )

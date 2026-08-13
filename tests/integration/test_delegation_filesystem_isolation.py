@@ -1,6 +1,7 @@
 """Live adversarial gates for protected delegation Docker materialization."""
 
 import asyncio
+import base64
 import json
 import shutil
 import subprocess
@@ -296,6 +297,90 @@ def test_leaf_reveal_is_readable_but_ancestor_sibling_and_host_authority_are_not
         assert probe.get("returncode") == 0, probe
     finally:
         env.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_protected_public_readers_respect_live_reveal_boundary(
+    protected_image, tmp_path
+):
+    from tools.file_tools import read_file_tool
+    from tools.image_source import (
+        ImageResolutionError,
+        ResolveContext,
+        resolve_image_source,
+    )
+
+    revealed = tmp_path / "revealed"
+    unrevealed = tmp_path / "unrevealed"
+    revealed.mkdir()
+    unrevealed.mkdir()
+    (revealed / "visible.txt").write_text("VISIBLE-TEXT", encoding="utf-8")
+    png = base64.b64decode(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
+    )
+    (revealed / "visible.png").write_bytes(png)
+    hidden_text = unrevealed / "hidden.txt"
+    hidden_image = unrevealed / "hidden.png"
+    hidden_text.write_text("HIDDEN-TEXT", encoding="utf-8")
+    hidden_image.write_bytes(png)
+
+    profile = ExecutionProfile(
+        name="isolated",
+        backend="docker",
+        image=protected_image,
+        default_workdir="/workspace",
+        allowed_toolsets=frozenset({"file", "vision"}),
+        network="none",
+    )
+    policy = DelegationSessionPolicy(
+        profile_required=True,
+        allow_profile_none=False,
+        allowed_profiles=frozenset({profile.name}),
+        profile_snapshots={profile.name: profile},
+        visible_objects=None,
+        protected_prefixes=(),
+    )
+    admitted = admit_trusted_run_execution(
+        policy,
+        {
+            "profile": profile.name,
+            "workdir": "/workspace",
+            "reveal": [{"path": str(revealed), "mode": "ro"}],
+        },
+        inherited_network=False,
+    )
+    task_id = "integration-protected-public-readers"
+    attempt_scope_registry.reserve(
+        admitted.invocation_scope,
+        "integration-session",
+        attempt_id=task_id,
+        backing_registry=admitted.backing_registry,
+    )
+    try:
+        configure_protected_attempt_environment(task_id)
+        attempt_scope_registry.activate(task_id, run_id="integration-run")
+
+        visible_text = json.loads(
+            read_file_tool(str(revealed / "visible.txt"), task_id=task_id)
+        )
+        hidden_text_result = json.loads(
+            read_file_tool(str(hidden_text), task_id=task_id)
+        )
+        visible_image = await resolve_image_source(
+            str(revealed / "visible.png"), ResolveContext(task_id=task_id)
+        )
+
+        assert "VISIBLE-TEXT" in visible_text["content"]
+        assert "HIDDEN-TEXT" not in json.dumps(hidden_text_result)
+        assert "error" in hidden_text_result
+        assert visible_image.origin == "container"
+        assert visible_image.data == png
+        with pytest.raises(ImageResolutionError):
+            await resolve_image_source(
+                str(hidden_image), ResolveContext(task_id=task_id)
+            )
+    finally:
+        assert attempt_scope_registry.cleanup(task_id) == ()
 
 
 def test_parallel_attempts_have_distinct_containers_and_private_roots(protected_image):
