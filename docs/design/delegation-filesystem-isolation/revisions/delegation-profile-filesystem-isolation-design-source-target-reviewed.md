@@ -1,7 +1,7 @@
 # Delegation Profile Filesystem Isolation — Design Plan
 
-Date: 2026-08-10  
-Status: Revised after strict design review; pending final verification  
+Date: 2026-08-10<br>
+Status: Revised after strict design review; pending final verification<br>
 Scope: Product and runtime contract; not an implementation plan
 
 ## 1. Decision summary

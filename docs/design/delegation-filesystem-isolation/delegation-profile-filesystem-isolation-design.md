@@ -1,7 +1,7 @@
 # Hermes Delegation Execution Profiles and Filesystem Isolation — Design Plan
 
-Date: 2026-08-10  
-Status: Revised as a generic Hermes capability; pending strict re-review  
+Date: 2026-08-10<br>
+Status: Revised as a generic Hermes capability; pending strict re-review<br>
 Scope: Product and runtime contract; not an implementation plan
 
 ## 1. Decision summary

@@ -884,13 +884,6 @@ class ShellFileOperations(FileOperations):
         except ValueError as exc:
             raise OSError(f"invalid scoped byte stream for: {path}") from exc
 
-    def stat_size(self, path: str) -> int:
-        """Return byte size without consulting the host filesystem."""
-        result = self._exec(f"wc -c < {shlex.quote(path)}")
-        if result.exit_code != 0:
-            raise OSError(f"could not stat scoped file: {path}")
-        return int(result.stdout.strip())
-    
     def _is_likely_binary(self, path: str, content_sample: str = None) -> bool:
         """
         Check if a file is likely binary.

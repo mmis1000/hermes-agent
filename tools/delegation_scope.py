@@ -53,6 +53,32 @@ class BackingObjectRecord:
     trusted_host_path: bool = False
 
 
+def format_effective_scope_context(scope: ResolvedInvocationScope) -> str:
+    """Describe only the agent-visible filesystem contract of an admitted scope.
+
+    This text is informative. Runtime authority remains the immutable scope and
+    its attempt registration; prompt text is never parsed back into authority.
+    """
+
+    mode_labels = {
+        AccessMode.RO: "read-only",
+        AccessMode.RW: "read-write",
+    }
+    path_literal = lambda path: json.dumps(str(path), ensure_ascii=False)
+    lines = [
+        "## Execution filesystem",
+        f"- Working directory: {path_literal(scope.workdir)}",
+        "- Available paths:",
+    ]
+    lines.extend(
+        f"  - {path_literal(grant.visible_path)} — {grant.object_type}, "
+        f"{mode_labels[grant.mode]}"
+        for grant in scope.visible_objects
+    )
+    lines.append("- Other host paths are not available in this attempt.")
+    return "\n".join(lines)
+
+
 class BackingObjectRegistry:
     """Pinned backing registry with internal descendant admission."""
 
@@ -71,11 +97,17 @@ class BackingObjectRegistry:
                     current = path.lstat()
                 except OSError:
                     return None
+                expected_type = (
+                    stat.S_ISDIR(current.st_mode)
+                    if record.object_type == "directory"
+                    else stat.S_ISREG(current.st_mode)
+                    if record.object_type == "file"
+                    else False
+                )
                 if (
                     path.is_symlink()
                     or record.backing.kind != "host_path"
-                    or record.object_type != "directory"
-                    or not stat.S_ISDIR(current.st_mode)
+                    or not expected_type
                     or record.backing.revision
                     != f"{current.st_dev}:{current.st_ino}"
                 ):
@@ -107,6 +139,29 @@ class BackingObjectRegistry:
             if existing is not None and existing != record:
                 raise ValueError("derived backing identity changed")
             self._records[record.backing.object_id] = record
+
+    def register_admitted(self, record: BackingObjectRecord) -> None:
+        """Pin one host object already admitted by the authority resolver."""
+
+        self.register_admitted_many((record,))
+
+    def register_admitted_many(
+        self,
+        records: Sequence[BackingObjectRecord],
+    ) -> None:
+        """Atomically pin host objects admitted by one authority resolution."""
+
+        with self._lock:
+            staged: dict[str, BackingObjectRecord] = {}
+            for record in records:
+                if record.backing.kind != "host_path" or not record.trusted_host_path:
+                    raise ValueError("admitted backing must be a trusted host path")
+                object_id = record.backing.object_id
+                existing = staged.get(object_id, self._records.get(object_id))
+                if existing is not None and existing != record:
+                    raise ValueError("admitted backing identity changed")
+                staged[object_id] = record
+            self._records.update(staged)
 
 
 @dataclass(frozen=True)
@@ -965,7 +1020,7 @@ def _derive_host_descendant_grant(
 ) -> VisibleObjectGrant:
     candidates = [
         grant
-        for grant in policy.visible_objects
+        for grant in policy.visible_objects or ()
         if grant.object_type == "directory"
         and request.path != grant.visible_path
         and _is_within(request.path, normalize_visible_path(grant.visible_path))
@@ -1036,6 +1091,56 @@ def _derive_host_descendant_grant(
     )
 
 
+def _admit_unbounded_host_grant(
+    request: RevealRequest,
+) -> tuple[VisibleObjectGrant, BackingObjectRecord]:
+    host_path = Path(str(request.path))
+    try:
+        stat_result = host_path.lstat()
+        resolved = host_path.resolve(strict=True)
+    except OSError as exc:
+        raise ValueError(
+            f"delegate_task: reveal path {request.path} is unavailable."
+        ) from exc
+    if host_path.is_symlink() or resolved != host_path:
+        raise ValueError(
+            f"delegate_task: reveal path {request.path} must be a real canonical host path."
+        )
+    if stat.S_ISDIR(stat_result.st_mode):
+        object_type = "directory"
+    elif stat.S_ISREG(stat_result.st_mode):
+        object_type = "file"
+    else:
+        raise ValueError(
+            f"delegate_task: reveal path {request.path} must be a regular file or directory."
+        )
+
+    revision = f"{stat_result.st_dev}:{stat_result.st_ino}"
+    object_id = "unbounded_host_" + hashlib.sha256(
+        f"{request.path}\0{object_type}\0{revision}".encode("utf-8")
+    ).hexdigest()
+    backing = BackingObjectRef(
+        object_id=object_id,
+        kind="host_path",
+        identity=str(request.path),
+        revision=revision,
+    )
+    record = BackingObjectRecord(
+        backing=backing,
+        object_type=object_type,
+        trusted_host_path=True,
+    )
+    return (
+        VisibleObjectGrant(
+            visible_path=request.path,
+            mode=AccessMode(request.mode),
+            backing=backing,
+            object_type=object_type,
+        ),
+        record,
+    )
+
+
 def resolve_invocation_scope(
     policy: DelegationSessionPolicy | None,
     profile: str | None,
@@ -1093,25 +1198,39 @@ def resolve_invocation_scope(
                 raise ValueError(
                     f"delegate_task: overlapping reveal paths {left.path} and {right.path} are forbidden."
                 )
-    grants_by_path = {grant.visible_path: grant for grant in policy.visible_objects}
+    grants_by_path = {
+        grant.visible_path: grant for grant in policy.visible_objects or ()
+    }
     resolved_grants: list[VisibleObjectGrant] = []
+    staged_admitted_records: dict[str, BackingObjectRecord] = {}
     for request in reveal_requests:
-        grant = grants_by_path.get(request.path)
-        if grant is None:
-            grant = _derive_host_descendant_grant(
-                policy,
-                request,
-                backing_registry,
-            )
-        attenuate_mode(grant.mode, AccessMode(request.mode))
-        record = (
-            backing_registry.get(grant.backing.object_id)
-            if backing_registry is not None
-            else None
-        )
         _validate_reveal_destination(
             request.path,
             policy.protected_prefixes,
+        )
+        grant = grants_by_path.get(request.path)
+        if grant is None:
+            if policy.visible_objects is None:
+                if backing_registry is None:
+                    raise ValueError(
+                        "delegate_task: unbounded filesystem backing registry is unavailable."
+                    )
+                grant, admitted_record = _admit_unbounded_host_grant(request)
+                staged_admitted_records[grant.backing.object_id] = admitted_record
+            else:
+                grant = _derive_host_descendant_grant(
+                    policy,
+                    request,
+                    backing_registry,
+                )
+        attenuate_mode(grant.mode, AccessMode(request.mode))
+        record = (
+            staged_admitted_records.get(grant.backing.object_id)
+            or (
+                backing_registry.get(grant.backing.object_id)
+                if backing_registry is not None
+                else None
+            )
         )
         if backing_registry is not None:
             if record is None or not record.exists:
@@ -1158,6 +1277,9 @@ def resolve_invocation_scope(
         selected_profile,
         resolved_grants,
     )
+    if staged_admitted_records:
+        assert backing_registry is not None
+        backing_registry.register_admitted_many(tuple(staged_admitted_records.values()))
     return ResolvedInvocationScope(
         profile_name=selected,
         profile_hash=execution_profile_hash(selected_profile),
