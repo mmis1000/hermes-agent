@@ -8,13 +8,14 @@ import time
 import uuid
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Mapping, Optional
 from hermes_state_schema import reconcile_state_schema
 from hermes_state_wal import apply_wal_with_fallback
 
 _ACTIVE_STATES = {"starting", "running", "finalizing", "interrupt_requested"}
 _TERMINAL_DELIVERY_STATES = {"delivered", "consumed", "suppressed"}
 _DELIVERY_STATES = _TERMINAL_DELIVERY_STATES | {"pending", "held_by_wait", "delivering"}
+_TERMINAL_ATTEMPT_STATES = {"completed", "error", "interrupted", "timeout"}
 _SCHEMA_READY: set[str] = set()
 _MATERIALIZED_READY: set[str] = set()
 _BOOTSTRAP_LOCK = threading.Lock()
@@ -32,6 +33,19 @@ def _dump(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
 
 
+def _authority_is_tombstoned(spec_json: Any) -> bool:
+    spec = _json(spec_json, {})
+    authority = spec.get("authority")
+    if authority is None:
+        return False
+    if not isinstance(authority, dict):
+        return True
+    state = authority.get("state")
+    if not isinstance(state, dict):
+        return True
+    return bool(state.get("revoked")) or bool(state.get("cleaned"))
+
+
 def _attempt_state(value: Any) -> str:
     state = str(value or "").lower()
     if state in _ACTIVE_STATES:
@@ -45,6 +59,57 @@ def _attempt_state(value: Any) -> str:
     if state == "timeout":
         return "timeout"
     return "unknown"
+
+
+def _external_authority_projection(snapshot: Dict[str, Any]) -> Dict[str, Any]:
+    """Remove canonical authority from a lifecycle snapshot.
+
+    Repository storage remains the trusted resume authority.  Every ordinary
+    snapshot is instead shaped into an audit-only view whose cleanup state is
+    derived from the current durable attempt, not from the immutable logical
+    spec captured when the child was admitted.
+    """
+
+    from tools.delegation_scope import delegation_authority_audit_view
+
+    children = snapshot.get("children")
+    if not isinstance(children, dict):
+        return snapshot
+    for child in children.values():
+        if not isinstance(child, dict) or "authority" not in child:
+            continue
+        raw = child.pop("authority")
+        if isinstance(raw, Mapping):
+            audit = delegation_authority_audit_view(raw)
+        else:
+            audit = {"outcome": {}, "state": {}}
+        status = str(child.get("status") or "unknown")
+        terminal = status in _TERMINAL_ATTEMPT_STATES
+        cleanup_failed = child.get("exit_reason") == "cleanup_error"
+        raw_state = raw.get("state") if isinstance(raw, Mapping) else None
+        raw_state = raw_state if isinstance(raw_state, Mapping) else {}
+        effective_revoked = bool(raw_state.get("revoked")) or terminal
+        effective_cleaned = bool(raw_state.get("cleaned")) or (
+            terminal and not cleanup_failed
+        )
+        if cleanup_failed:
+            cleanup_outcome = "failed"
+        elif effective_cleaned:
+            cleanup_outcome = "succeeded"
+        elif effective_revoked:
+            cleanup_outcome = "revoked_pending"
+        else:
+            cleanup_outcome = "pending"
+        outcome = audit.get("outcome")
+        outcome = dict(outcome) if isinstance(outcome, Mapping) else {}
+        outcome.update(execution=status, cleanup=cleanup_outcome)
+        audit["outcome"] = outcome
+        audit["state"] = {
+            "revoked": effective_revoked,
+            "cleaned": effective_cleaned,
+        }
+        child["authority_audit"] = audit
+    return snapshot
 
 
 def _new_id(kind: str) -> str:
@@ -186,12 +251,41 @@ class DelegationRepository:
     ) -> Dict[str, Any]:
         roots = [v for v in record.get("root_subagent_ids", []) if isinstance(v, str) and v]
         run_id = str(record.get("run_id") or _new_id("run"))
-        supplied_attempts = record.get("attempt_ids")
-        attempt_ids = (
-            [str(value) for value in supplied_attempts]
-            if isinstance(supplied_attempts, list) and len(supplied_attempts) == len(roots)
-            else [_new_id("attempt") for _ in roots]
-        )
+        supplied_mapping = record.get("attempt_ids_by_logical_id")
+        if supplied_mapping is not None:
+            if (
+                not isinstance(supplied_mapping, dict)
+                or set(supplied_mapping) != set(roots)
+                or not all(
+                    isinstance(value, str) and value
+                    for value in supplied_mapping.values()
+                )
+                or len(set(supplied_mapping.values())) != len(roots)
+            ):
+                raise ValueError(
+                    "attempt_ids_by_logical_id must contain one unique physical attempt ID per root"
+                )
+            attempt_ids = [supplied_mapping[root] for root in roots]
+            physical_worker_ids = list(attempt_ids)
+        else:
+            supplied_attempts = record.get("attempt_ids")
+            attempt_ids = (
+                [str(value) for value in supplied_attempts]
+                if isinstance(supplied_attempts, list)
+                and len(supplied_attempts) == len(roots)
+                else [_new_id("attempt") for _ in roots]
+            )
+            # Ordinary dispatch keeps its conversational worker identity.
+            physical_worker_ids = list(roots)
+        authority_by_logical_id = record.get("authority_by_logical_id")
+        if authority_by_logical_id is not None and (
+            not isinstance(authority_by_logical_id, dict)
+            or set(authority_by_logical_id) != set(roots)
+            or not all(isinstance(value, dict) for value in authority_by_logical_id.values())
+        ):
+            raise ValueError(
+                "authority_by_logical_id must contain one immutable authority object per root"
+            )
         now = time.time()
         dispatched = float(record.get("dispatched_at") or now)
         task = {key: record.get(key) for key in ("goal", "goals", "context", "toolsets", "role", "model", "is_batch") if key in record}
@@ -215,17 +309,21 @@ class DelegationRepository:
                 )
                 raw_goals = task.get("goals")
                 goals: List[Any] = raw_goals if isinstance(raw_goals, list) else []
-                for ordinal, (logical_id, attempt_id) in enumerate(zip(roots, attempt_ids)):
+                for ordinal, (logical_id, attempt_id, physical_worker_id) in enumerate(
+                    zip(roots, attempt_ids, physical_worker_ids)
+                ):
                     spec = dict(task)
                     if ordinal < len(goals):
                         spec["goal"] = goals[ordinal]
+                    if authority_by_logical_id is not None:
+                        spec["authority"] = dict(authority_by_logical_id[logical_id])
                     conn.execute(
                         "INSERT INTO delegation_logical_subagents\n                           (logical_id,delegation_id,root_ordinal,spec_json,created_at,updated_at)\n                           VALUES (?,?,?,?,?,?)",
                         (logical_id, record["delegation_id"], ordinal, _dump(spec), dispatched, now),
                     )
                     conn.execute(
                         "INSERT INTO delegation_attempts\n                           (attempt_id,logical_id,run_id,attempt_number,physical_worker_id,\n                            state,owner_pid,owner_started_at,created_at,updated_at,metadata_json)\n                           VALUES (?,?,?,1,?,'starting',?,?,?,?,'{}')",
-                        (attempt_id, logical_id, run_id, logical_id, owner_pid, owner_started_at, dispatched, now),
+                        (attempt_id, logical_id, run_id, physical_worker_id, owner_pid, owner_started_at, dispatched, now),
                     )
         except sqlite3.IntegrityError:
             conn = self._connect()
@@ -257,9 +355,15 @@ class DelegationRepository:
         run_id = run_id or _new_id("run")
         now = time.time()
         with self.write_txn() as conn:
-            logical = conn.execute("SELECT delegation_id FROM delegation_logical_subagents WHERE logical_id=?", (logical_id,)).fetchone()
+            logical = conn.execute(
+                "SELECT delegation_id,spec_json FROM delegation_logical_subagents "
+                "WHERE logical_id=?",
+                (logical_id,),
+            ).fetchone()
             if logical is None:
                 return {"status": "not_found"}
+            if _authority_is_tombstoned(logical["spec_json"]):
+                return {"status": "authority_revoked"}
             active = conn.execute(
                 "SELECT attempt_id FROM delegation_attempts WHERE logical_id=? AND state IN ('starting','running','finalizing','interrupt_requested')",
                 (logical_id,),
@@ -288,7 +392,7 @@ class DelegationRepository:
                     logical_id,
                     run_id,
                     attempt_number,
-                    physical_worker_id or logical_id,
+                    physical_worker_id or attempt_id,
                     owner_pid,
                     owner_started_at,
                     now,
@@ -317,7 +421,7 @@ class DelegationRepository:
         mailbox_id = _new_id("steer")
         with self.write_txn() as conn:
             attempt = conn.execute(
-                "SELECT a.attempt_id,a.run_id,a.state,a.attempt_number "
+                "SELECT a.attempt_id,a.run_id,a.state,a.attempt_number,l.spec_json "
                 "FROM delegation_attempts a "
                 "JOIN delegation_logical_subagents l ON l.logical_id=a.logical_id "
                 "JOIN async_delegations d ON d.delegation_id=l.delegation_id "
@@ -327,6 +431,8 @@ class DelegationRepository:
             ).fetchone()
             if attempt is None:
                 return {"status": "not_found"}
+            if _authority_is_tombstoned(attempt["spec_json"]):
+                return {"status": "authority_revoked"}
             if attempt["state"] not in _ACTIVE_STATES:
                 return {
                     "status": "already_terminal",
@@ -506,9 +612,16 @@ class DelegationRepository:
     def request_interrupt(self, attempt_id: str, reason: str = "") -> Dict[str, Any]:
         now = time.time()
         with self.write_txn() as conn:
-            row = conn.execute("SELECT state,interrupt_requested_at FROM delegation_attempts WHERE attempt_id=?", (attempt_id,)).fetchone()
+            row = conn.execute(
+                "SELECT a.state,a.interrupt_requested_at,l.spec_json "
+                "FROM delegation_attempts a JOIN delegation_logical_subagents l "
+                "ON l.logical_id=a.logical_id WHERE a.attempt_id=?",
+                (attempt_id,),
+            ).fetchone()
             if row is None:
                 return {"status": "not_found"}
+            if _authority_is_tombstoned(row["spec_json"]):
+                return {"status": "authority_revoked"}
             if row[0] == "interrupt_requested" or row[1] is not None:
                 return {"status": "already_requested"}
             if row[0] not in _ACTIVE_STATES:
@@ -525,6 +638,83 @@ class DelegationRepository:
                     (now, attempt_id),
                 )
         return {"status": "interrupt_requested" if changed == 1 else "stale"}
+
+    def tombstone_logical_authority(
+        self,
+        logical_id: str,
+        *,
+        revoked: bool = False,
+        cleaned: bool = False,
+    ) -> Dict[str, Any]:
+        """Durably narrow protected authority without rewriting immutable fields."""
+
+        if not revoked and not cleaned:
+            return {"status": "unchanged"}
+        now = time.time()
+        with self.write_txn() as conn:
+            row = conn.execute(
+                "SELECT spec_json FROM delegation_logical_subagents WHERE logical_id=?",
+                (logical_id,),
+            ).fetchone()
+            if row is None:
+                return {"status": "not_found"}
+            spec = _json(row["spec_json"], {})
+            authority = spec.get("authority")
+            if not isinstance(authority, dict):
+                return {"status": "ordinary"}
+            state = authority.get("state")
+            if not isinstance(state, dict):
+                return {"status": "malformed"}
+            immutable_before = {
+                key: value for key, value in authority.items() if key != "state"
+            }
+            authority_after = {
+                **authority,
+                "state": {
+                    "revoked": bool(state.get("revoked")) or bool(revoked),
+                    "cleaned": bool(state.get("cleaned")) or bool(cleaned),
+                },
+            }
+            if {
+                key: value for key, value in authority_after.items() if key != "state"
+            } != immutable_before:
+                raise RuntimeError("protected authority immutable snapshot changed")
+            spec["authority"] = authority_after
+            conn.execute(
+                "UPDATE delegation_logical_subagents SET spec_json=?,updated_at=? "
+                "WHERE logical_id=?",
+                (_dump(spec), now, logical_id),
+            )
+        return {"status": "tombstoned"}
+
+    def tombstone_delegation_authorities(
+        self,
+        delegation_id: str,
+        *,
+        revoked: bool = False,
+        cleaned: bool = False,
+    ) -> Dict[str, Any]:
+        """Retain protected tombstones with the logical delegation records."""
+
+        conn = self._connect()
+        try:
+            logical_ids = [
+                str(row[0])
+                for row in conn.execute(
+                    "SELECT logical_id FROM delegation_logical_subagents "
+                    "WHERE delegation_id=? ORDER BY logical_id",
+                    (delegation_id,),
+                ).fetchall()
+            ]
+        finally:
+            conn.close()
+        outcomes = {
+            logical_id: self.tombstone_logical_authority(
+                logical_id, revoked=revoked, cleaned=cleaned
+            )["status"]
+            for logical_id in logical_ids
+        }
+        return {"status": "tombstoned", "children": outcomes}
 
     def take_interrupt(self, attempt_id: str) -> Dict[str, Any]:
         now = time.time()
@@ -846,11 +1036,14 @@ class DelegationRepository:
         now = time.time()
         with self.write_txn() as conn:
             rows = conn.execute(
-                "SELECT a.*,l.delegation_id FROM delegation_attempts a\n                   JOIN delegation_logical_subagents l ON l.logical_id=a.logical_id\n                   WHERE a.state IN ('starting','running','finalizing','interrupt_requested')\n                     AND a.attempt_number=(SELECT MAX(x.attempt_number)\n                         FROM delegation_attempts x WHERE x.logical_id=a.logical_id)"
+                "SELECT a.*,l.delegation_id FROM delegation_attempts a\n                   JOIN delegation_logical_subagents l ON l.logical_id=a.logical_id\n                   WHERE (a.state IN ('starting','running','finalizing','interrupt_requested') OR a.run_id IN (SELECT run_id FROM delegation_runs WHERE completed_at IS NULL))\n                     AND a.attempt_number=(SELECT MAX(x.attempt_number)\n                         FROM delegation_attempts x WHERE x.logical_id=a.logical_id)"
             ).fetchall()
             for row in rows:
                 pid = row["owner_pid"]
                 if pid and owner_alive(int(pid), row["owner_started_at"]):
+                    continue
+                if row["state"] not in _ACTIVE_STATES:
+                    recovered.append({key: str(row[key]) for key in ("attempt_id", "run_id", "delegation_id")})
                     continue
                 changed = conn.execute(
                     "UPDATE delegation_attempts SET state='unknown',completed_at=?,updated_at=?\n                       WHERE attempt_id=? AND state=? AND owner_pid IS ? AND owner_started_at IS ?",
@@ -901,7 +1094,7 @@ class DelegationRepository:
                 return None
             snapshot["children"] = {logical_id: child}
             snapshot["root_subagent_ids"] = [logical_id]
-            return snapshot
+            return _external_authority_projection(snapshot)
         finally:
             conn.close()
 
@@ -935,6 +1128,25 @@ class DelegationRepository:
         self, delegation_id: str, *, session_key: Optional[str] = None,
         run_id: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
+        """Return a backing-redacted lifecycle projection."""
+        conn = self._connect()
+        try:
+            snapshot = self._snapshot_with_conn(
+                conn, delegation_id, session_key=session_key, run_id=run_id
+            )
+            return (
+                _external_authority_projection(snapshot)
+                if snapshot is not None
+                else None
+            )
+        finally:
+            conn.close()
+
+    def trusted_snapshot(
+        self, delegation_id: str, *, session_key: Optional[str] = None,
+        run_id: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Return canonical authority for internal resume and recovery only."""
         conn = self._connect()
         try:
             return self._snapshot_with_conn(
@@ -986,7 +1198,14 @@ class DelegationRepository:
             "a.attempt_number=(SELECT MAX(x.attempt_number) FROM delegation_attempts x WHERE x.logical_id=a.logical_id)"
         )
         attempts = conn.execute(
-            "SELECT a.*,l.parent_logical_id,l.root_ordinal,l.spec_json\n               FROM delegation_attempts a JOIN delegation_logical_subagents l\n                 ON l.logical_id=a.logical_id\n               WHERE l.delegation_id=? AND " + attempt_clause +
+            "SELECT a.*,l.parent_logical_id,l.root_ordinal,l.spec_json,\n"
+            "  (SELECT CASE WHEN first.physical_worker_id != first.logical_id "
+            "    THEN 1 ELSE 0 END FROM delegation_attempts first "
+            "    WHERE first.logical_id=a.logical_id "
+            "    ORDER BY first.attempt_number LIMIT 1) AS protected_origin\n"
+            "  FROM delegation_attempts a JOIN delegation_logical_subagents l\n"
+            "    ON l.logical_id=a.logical_id\n"
+            "  WHERE l.delegation_id=? AND " + attempt_clause +
             " ORDER BY l.root_ordinal IS NULL,l.root_ordinal,l.created_at,l.logical_id",
             (delegation_id, run_id) if run_id else (delegation_id,),
         ).fetchall()
@@ -1029,6 +1248,8 @@ class DelegationRepository:
                 "parent_id": attempt["parent_logical_id"],
                 "status": attempt["state"],
                 "attempt_id": attempt["attempt_id"],
+                "physical_worker_id": attempt["physical_worker_id"],
+                "protected_execution": bool(attempt["protected_origin"]),
                 "attempt_number": attempt["attempt_number"],
                 "run_id": attempt["run_id"],
                 "steers": steers_by_child.get(str(attempt["logical_id"]), []),
@@ -1121,7 +1342,7 @@ class DelegationRepository:
                 )
             ]
             return [
-                snap for item in ids
+                _external_authority_projection(snap) for item in ids
                 if (snap := self._snapshot_with_conn(conn, item)) is not None
             ]
         finally:

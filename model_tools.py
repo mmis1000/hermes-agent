@@ -13,6 +13,7 @@ import asyncio
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from contextvars import ContextVar
+import copy
 import logging
 import threading
 import time
@@ -212,20 +213,28 @@ def _clear_tool_defs_cache() -> None:
 
 
 def get_tool_definitions(enabled_toolsets: Optional[List[str]] = None, disabled_toolsets: Optional[List[str]] = None,
-                         quiet_mode: bool = False, skip_tool_search_assembly: bool = False) -> List[Dict[str, Any]]:
+                         quiet_mode: bool = False, skip_tool_search_assembly: bool = False,
+                         delegation_policy: Any = None) -> List[Dict[str, Any]]:
     """Tool definitions for model API calls, filtered by toolset.
 
     enabled_toolsets None = all; disabled_toolsets are subtracted after enabling.
     quiet_mode suppresses status prints and enables memoization.
     skip_tool_search_assembly returns raw schemas for every enabled tool — only
     the tool_search bridge should use it (it reads the real, uncollapsed catalog).
+    delegation_policy (trusted, set at agent construction) constrains delegate_task's ``profile``;
+    memoized results are keyed by its schema-shaping fingerprint.
     """
     def compute():
-        return _compute_tool_definitions(enabled_toolsets, disabled_toolsets, quiet_mode,
-                                         skip_tool_search_assembly=skip_tool_search_assembly)
+        definitions = _compute_tool_definitions(enabled_toolsets, disabled_toolsets, quiet_mode,
+                                                skip_tool_search_assembly=skip_tool_search_assembly)
+        if delegation_policy is None:
+            return definitions
+        return _apply_delegation_policy_schema(definitions, delegation_policy)
     if not quiet_mode:
         return compute()
     cache_key = _tool_defs_cache_key(enabled_toolsets, disabled_toolsets, skip_tool_search_assembly)
+    if cache_key is not None:
+        cache_key += (_delegation_policy_fingerprint(delegation_policy),)
     # Cache the freshly-computed list, but hand callers a shallow copy so downstream mutations (e.g.
     # run_agent appending memory/LCM tool schemas to self.tools) don't poison the cache. Without this, a
     # long-lived Gateway process accumulates duplicate tool names across agent inits and providers that
@@ -994,3 +1003,44 @@ def check_toolset_requirements() -> Dict[str, bool]:
 def check_tool_availability(quiet: bool = False) -> Tuple[List[str], List[dict]]:
     """(available_toolsets, unavailable_info)."""
     return registry.check_tool_availability(quiet=quiet)
+
+
+def _delegation_policy_fingerprint(policy: Any) -> tuple | None:
+    """Return only the immutable schema-shaping delegation policy state."""
+    if policy is None:
+        return None
+    return (
+        bool(policy.profile_required),
+        tuple(sorted(policy.allowed_profiles)),
+    )
+
+
+def _apply_delegation_policy_schema(
+    definitions: List[Dict[str, Any]], delegation_policy: Any
+) -> List[Dict[str, Any]]:
+    """Copy and constrain delegate_task without mutating the registry schema."""
+
+    result = list(definitions)
+    for index, definition in enumerate(result):
+        function = definition.get("function", {})
+        if function.get("name") != "delegate_task":
+            continue
+        owned = copy.deepcopy(definition)
+        parameters = owned["function"]["parameters"]
+        parameters["properties"]["profile"]["enum"] = sorted(
+            delegation_policy.allowed_profiles
+        )
+        required = list(parameters.get("required", []))
+        if delegation_policy.profile_required:
+            if "profile" not in required:
+                required.append("profile")
+        else:
+            required = [name for name in required if name != "profile"]
+        if required:
+            parameters["required"] = required
+        else:
+            parameters.pop("required", None)
+        result[index] = owned
+
+        break
+    return result

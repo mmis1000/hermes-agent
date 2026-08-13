@@ -318,6 +318,16 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
     delegate_task children share the parent's container; RL/benchmark task_ids
     with a registered env override keep their isolation.
     """
+    from tools.delegation_scope import attempt_scope_registry
+    if attempt_scope_registry.get(task_id or "") is not None:
+        from tools.terminal_tool import acquire_task_environment
+        env, _kind, effective = acquire_task_environment(task_id)
+        with _file_ops_lock:
+            ops = _file_ops_cache.get(effective)
+            if ops is None or getattr(ops, "env", None) is not env:
+                ops = ShellFileOperations(env)
+                _file_ops_cache[effective] = ops
+            return ops
     from tools.terminal_tool import (
         _active_environments, _env_lock, _last_activity, _start_cleanup_thread,
         _creation_locks, _creation_locks_lock, _resolve_container_task_id,

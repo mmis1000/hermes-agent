@@ -593,19 +593,26 @@ class DockerEnvironment(BaseEnvironment):
         disk: int = 0,
         persistent_filesystem: bool = False,
         task_id: str = "default",
-        volumes: list = None,
+        volumes: list | None = None,
         forward_env: list[str] | None = None,
         env: dict | None = None,
         network: bool = True,
-        host_cwd: Optional[str] = None,
+        host_cwd: str | None = None,
         auto_mount_cwd: bool = False,
         run_as_host_user: bool = False,
-        extra_args: list = None,
+        extra_args: list | None = None,
         persist_across_processes: bool = True,
         shm_size: str = _DEFAULT_SHM_SIZE,
         shared_container_key: str = "",
         snap_compat: bool = False,
-        image_pinned: bool = False):
+        image_pinned: bool = False,
+        trusted_mounts: list[dict] | None = None,
+        suppress_implicit_mounts: bool = False,
+        shm_mb: int | None = None,
+        pids_limit: int | None = None,
+        delegation_scope_id: str | None = None,
+        delegation_attempt_id: str | None = None,
+        trusted_mounts_validator=None):
         if cwd == "~":
             cwd = "/root"
         super().__init__(cwd=cwd, timeout=timeout)
@@ -618,6 +625,11 @@ class DockerEnvironment(BaseEnvironment):
         self._forward_env = _normalize_forward_env_names(forward_env)
         self._env = _normalize_env_dict(env)
         self._init_unset_passthrough_names: tuple[str, ...] = ()
+        self._suppress_implicit_mounts = bool(suppress_implicit_mounts)
+        self._forward_env = _normalize_forward_env_names(
+            [] if suppress_implicit_mounts else forward_env
+        )
+        self._env = _normalize_env_dict({} if suppress_implicit_mounts else env)
         self._container_id: Optional[str] = None
         self._init_env_values: dict[str, str] = {}
         self._workspace_dir: Optional[str] = None
@@ -627,6 +639,19 @@ class DockerEnvironment(BaseEnvironment):
             logger.warning("docker_volumes config is not a list: %r", volumes)
             volumes = []
 
+        self._trusted_mounts = list(trusted_mounts or [])
+        self._trusted_mounts_validator = trusted_mounts_validator
+        self._protected_pids_limit = pids_limit
+        if pids_limit is not None and (isinstance(pids_limit, bool) or not isinstance(pids_limit, int) or pids_limit <= 0):
+            raise ValueError("Docker pids_limit must be a positive integer")
+        if shm_mb is not None:
+            if isinstance(shm_mb, bool) or not isinstance(shm_mb, int) or shm_mb <= 0:
+                raise ValueError("Docker shm_mb must be a positive integer")
+            shm_size = f"{shm_mb}m"
+        if suppress_implicit_mounts:
+            volumes, host_cwd, auto_mount_cwd, extra_args = [], None, False, []
+            self._persistent = False
+            persist_across_processes = self._persist_across_processes = False
         _ensure_docker_available()
 
         resource_args = self._resource_args(image, cpu, memory, disk, network, shm_size, extra_args)
@@ -638,7 +663,8 @@ class DockerEnvironment(BaseEnvironment):
                 mount, cwd)
             cwd = mount
             self.cwd = mount
-        volume_args.extend(_readonly_skill_mount_args())
+        if not suppress_implicit_mounts:
+            volume_args.extend(_readonly_skill_mount_args())
         egress_label, egress_volume_args, egress_host_args, env_args, validated_extra = (
             self._egress_and_env_args(extra_args))
         volume_args.extend(egress_volume_args)
@@ -684,6 +710,10 @@ class DockerEnvironment(BaseEnvironment):
             "hermes-task-id": task_label,
             "hermes-profile": profile_name,
             _EGRESS_LABEL_KEY: egress_label}
+        for key, value in (("hermes-delegation-scope-id", delegation_scope_id),
+                           ("hermes-delegation-attempt-id", delegation_attempt_id)):
+            if value is not None:
+                self._labels[key] = _sanitize_label_value(value)
         # Saved for container recreation on "No such container" recovery.
         self._image = image
         self._image_pinned = image_pinned
@@ -719,7 +749,7 @@ class DockerEnvironment(BaseEnvironment):
         self._run_env_values = dict(merged_env)
 
         validated_extra = []
-        for arg in (extra_args or []):
+        for arg in (() if self._suppress_implicit_mounts else (extra_args or [])):
             if not isinstance(arg, str):
                 logger.warning("Ignoring non-string docker_extra_args entry: %r", arg)
                 continue
@@ -736,7 +766,7 @@ class DockerEnvironment(BaseEnvironment):
                 args.extend(["--cpus", str(cpu)])
             if memory > 0:
                 args.extend(["--memory", f"{memory}m"])
-            args.extend(["--pids-limit", _DEFAULT_PIDS_LIMIT])
+            args.extend(["--pids-limit", str(getattr(self, "_protected_pids_limit", None) or _DEFAULT_PIDS_LIMIT)])
         # --shm-size is a tmpfs option, not cgroup-gated. Skipped when the user
         # sets it in docker_extra_args or opts out with empty/"0".
         shm = str(shm_size or "").strip()
@@ -787,7 +817,23 @@ class DockerEnvironment(BaseEnvironment):
                 logger.warning("Docker volume '%s' missing colon, skipping", vol)
                 continue
             volume_args.extend(["-v", vol])
-        workspace_explicitly_mounted = any(":/workspace" in v for v in volume_args)
+        trusted_workspace = False
+        for mount in getattr(self, "_trusted_mounts", []):
+            if not isinstance(mount, dict):
+                raise ValueError("trusted Docker mounts must be structured objects")
+            kind, source, target, mode = (mount.get(k) for k in ("kind", "source", "target", "mode"))
+            if kind not in {"host_path", "named_volume"} or mode not in {"ro", "rw"}:
+                raise ValueError("invalid trusted Docker mount kind or mode")
+            if not isinstance(source, str) or not source or any(c in source for c in ",\n\r"):
+                raise ValueError("trusted Docker mount source is invalid")
+            if not isinstance(target, str) or not target.startswith("/") or any(c in target for c in ",\n\r"):
+                raise ValueError("trusted Docker mount target must be an absolute path")
+            spec = f"type={'bind' if kind == 'host_path' else 'volume'},src={source},dst={target}"
+            if mode == "ro":
+                spec += ",readonly"
+            volume_args.extend(["--mount", spec])
+            trusted_workspace |= target == "/workspace"
+        workspace_explicitly_mounted = trusted_workspace or any(":/workspace" in v for v in volume_args)
 
         host_cwd_abs = _abs_host_cwd(host_cwd) if host_cwd else ""
         windows_cwd = _is_windows_drive_path(host_cwd or "") or _is_windows_drive_path(host_cwd_abs)
@@ -832,7 +878,8 @@ class DockerEnvironment(BaseEnvironment):
                 writable_args += ["-v", f"{self._workspace_dir}:/workspace"]
         else:
             writable_args += ["--tmpfs", "/workspace:rw,exec,size=10g"] if mount_workspace else []
-            writable_args += ["--tmpfs", "/home:rw,exec,size=1g", "--tmpfs", "/root:rw,exec,size=1g"]
+            root_tmpfs_mode = "0755" if any(str(m.get("target") or "") == "/root" or str(m.get("target") or "").startswith("/root/") for m in self._trusted_mounts or ()) else "0700"
+            writable_args += ["--tmpfs", "/home:rw,exec,nosuid,nodev,mode=1777,size=1g", "--tmpfs", f"/root:rw,exec,nosuid,nodev,mode={root_tmpfs_mode},size=1g"]
 
         if bind_target:
             logger.info("Mounting configured host cwd to %s: %s", bind_target, host_cwd_abs)
@@ -956,6 +1003,9 @@ class DockerEnvironment(BaseEnvironment):
         """Start a fresh container and return its id. A failed ``docker run`` (exit 125, timeout
         mid-pull) can leave a "Created" orphan the exited-only reaper never catches, so it is
         removed by name before re-raising."""
+        validator = getattr(self, "_trusted_mounts_validator", None)
+        if validator is not None:
+            validator()
         container_name = f"hermes-{uuid.uuid4().hex[:8]}"
         run_cmd = self._run_command(container_name, cwd)
         logger.debug("Starting container: %s", ' '.join(run_cmd))
@@ -992,7 +1042,7 @@ class DockerEnvironment(BaseEnvironment):
         The VALUES intentionally do not appear in the argv — they are passed via the docker client
         subprocess env (see _docker_client_env and issue #96268); the flags here are name-only ``-e KEY``.
         """
-        passthrough_env, unset_names = self._resolve_passthrough_env()
+        passthrough_env, unset_names = ({}, ()) if self._suppress_implicit_mounts else self._resolve_passthrough_env()
         exec_env = {**self._env, **passthrough_env}
         for name in unset_names:
             exec_env.pop(name, None)
@@ -1010,7 +1060,7 @@ class DockerEnvironment(BaseEnvironment):
 
         See #96268.
         """
-        passthrough_env, unset_names = self._resolve_passthrough_env()
+        passthrough_env, unset_names = ({}, ()) if self._suppress_implicit_mounts else self._resolve_passthrough_env()
         return _name_only_env_args(passthrough_env), tuple(sorted(unset_names)), dict(passthrough_env)
 
     def _run_bash(self, cmd_string: str, *, login: bool = False,
@@ -1218,6 +1268,17 @@ class DockerEnvironment(BaseEnvironment):
             # Drop the in-process handle so a fresh __init__ re-probes via
             # labels instead of reusing a stale Python reference.
             self._container_id = None
+            return
+
+        if force_remove:
+            removed = subprocess.run(
+                [self._docker_exe, "rm", "-f", container_id],
+                capture_output=True, timeout=30, stdin=subprocess.DEVNULL)
+            if removed.returncode != 0:
+                raise RuntimeError(f"docker rm failed: {removed.stderr}")
+            self._container_id = None
+            if not self._persistent:
+                self._remove_bind_dirs()
             return
 
         # Capture what the worker needs — the thread can outlive ``self``.

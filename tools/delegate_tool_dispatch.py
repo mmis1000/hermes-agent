@@ -10,7 +10,7 @@ import json
 import logging
 import time
 from concurrent.futures import FIRST_COMPLETED, wait as _cf_wait
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, replace, field
 from typing import Any, Dict, List, Optional
 
 from hermes_cli.observability.shared_metrics_loop import begin_delegation_run, finish_delegation_unit
@@ -49,6 +49,9 @@ class _Batch:
     # Set on per-group units carved out by ``_dispatch_background``; None for the whole batch / ungrouped units.
     group: Optional[str] = None
     unit_id: Optional[str] = None  # the async registry id this unit runs under (``<call_id>-k`` for split calls)
+
+    protected_attempt_ids: dict = field(default_factory=dict)
+    protected_authority_by_logical_id: dict = field(default_factory=dict)
 
     def owner_kwargs(self) -> Dict[str, Any]:
         """Steer/stop authority of the originating session, passed to every child run."""
@@ -113,7 +116,13 @@ def _record_finished_child(batch: _Batch, entry: Any, honor_parent_interrupt: bo
     one-child unit — loses only children still running, never finished work (#116000). Best-effort by construction:
     ``record_unit_child`` never raises into the join."""
     if not honor_parent_interrupt and batch.unit_id and isinstance(entry, dict):
-        record_unit_child(batch.unit_id, entry)
+        from tools.async_delegation import _repository
+        for i, _, child in batch.children:
+            if i == entry.get("task_index"):
+                attempt_id = getattr(child, "_delegation_attempt_id", None)
+                if isinstance(attempt_id, str):
+                    _repository().transition_attempt(attempt_id, {"starting", "running", "interrupt_requested"}, entry.get("status", "completed"), metadata={"finished_result": entry})
+                break
 
 def _run_children_parallel(batch: _Batch, results: list, *, honor_parent_interrupt: bool) -> None:
     """Run the batch's children in parallel, appending entries to ``results`` (sorted by task_index on return, one
@@ -352,6 +361,12 @@ def _dispatched_payload(batch: _Batch, units: List[tuple[_Batch, str]]) -> dict:
         "delegation_id": batch.live_deleg_id or units[0][1], "goals": goals,
         "note": _BACKGROUND_NOTES["one"] if n == 1 else _BACKGROUND_NOTES["many"].format(n=n, k=len(units)),
     }
+    for unit, uid in units:
+        from tools.async_delegation import get_durable_delegation
+        snapshot = get_durable_delegation(uid)
+        if snapshot and len(units) == 1:
+            payload["run_id"] = snapshot["run_id"]
+            payload["subagents"] = [{"subagent_id": c._subagent_id, "run_id": snapshot["run_id"], "status": "starting"} for _, _, c in unit.children]
     if len(units) > 1:
         payload["units"] = [
             {"delegation_id": uid, "group": unit.group, "task_indexes": [i for (i, _, _) in unit.children]}
@@ -388,6 +403,28 @@ def _dispatch_unit(unit: _Batch, unit_id: Optional[str], slot_key: Optional[str]
     from tools.async_delegation import dispatch_async_delegation_batch
     child_agents = [c for (_, _, c) in unit.children]
 
+    roots = [c._subagent_id if isinstance(getattr(c, "_subagent_id", None), str) else f"sa-{unit_id}-{i}" for i, c in enumerate(child_agents)]
+    for c, logical_id in zip(child_agents, roots):
+        c._subagent_id = logical_id
+    attempts = {k: v for k, v in unit.protected_attempt_ids.items() if k in roots}
+    authority = {k: v for k, v in unit.protected_authority_by_logical_id.items() if k in roots}
+
+    def _bind_attempts(run_id, mapping):
+        from tools.delegation_scope import attempt_scope_registry
+        for c in child_agents:
+            logical_id = c._subagent_id
+            c._delegation_id = unit_id
+            c._delegation_run_id = run_id
+            c._delegation_attempt_id = mapping[logical_id]
+            ref = getattr(c, "_delegation_session_ref", None)
+            if isinstance(ref, dict):
+                ref.update(run_id=run_id, attempt_id=mapping[logical_id], delegation_id=unit_id)
+            from tools.async_delegation import _repository
+            metadata = getattr(c, "_delegation_runtime_metadata", {})
+            _repository().transition_attempt(mapping[logical_id], {"starting"}, "running", metadata=metadata if isinstance(metadata, dict) else {})
+            if logical_id in attempts:
+                attempt_scope_registry.activate(mapping[logical_id], delegation_id=unit_id, run_id=run_id)
+
     def _interrupt():
         for c in child_agents:
             _signal_child_stop(c, "Async delegation cancelled")
@@ -397,6 +434,8 @@ def _dispatch_unit(unit: _Batch, unit_id: Optional[str], slot_key: Optional[str]
         goals=[t["goal"] for t in unit.task_list], context=unit.context,
         toolsets=None,  # metadata for the completion block only; subagents inherit the parent's toolsets
         role=unit.top_role, model=unit.creds["model"],
+        root_subagent_ids=roots, attempt_ids_by_logical_id=attempts or None,
+        authority_by_logical_id=authority or None, _bind_attempts=_bind_attempts,
         runner=lambda: _execute_and_aggregate(unit, honor_parent_interrupt=False),
         interrupt_fn=_interrupt, delegation_id=unit_id, slot_key=slot_key,
         task_indexes=[i for (i, _, _) in unit.children] if len(unit.children) < len(unit.task_list) else None,
@@ -449,6 +488,13 @@ def _dispatch_background(batch: _Batch) -> str:
             slot_key = slot_key or dispatch["delegation_id"]
             dispatched.append((unit, dispatch["delegation_id"]))
             continue
+        if unit.protected_attempt_ids and dispatch.get("reason") == "dispatch_setup_failed":
+            from tools.delegation_scope import attempt_scope_registry
+            for _, _, c in unit.children:
+                attempt_scope_registry.cleanup(unit.protected_attempt_ids[c._subagent_id])
+                from tools.delegate_tool_child_run import _close_child
+                _close_child(c, "protected dispatch rejection close")
+            return json.dumps({"error": dispatch.get("error"), "reason": "dispatch_setup_failed"})
         _restore_parent_cancellation(unit)
         if not dispatched:
             logger.info(

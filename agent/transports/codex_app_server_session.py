@@ -52,6 +52,7 @@ class TurnResult:
     # Exact turn/start text distinguishes the input echo from a new user event.
     submitted_user_text: Optional[str] = None
     token_usage_last: Optional[dict[str, Any]] = None
+    token_usage_total: Optional[dict[str, Any]] = None
     model_context_window: Optional[int] = None
     compacted: bool = False
     # Codex likely wedged (turn timeout, dead subprocess, token refresh failure): caller respawns next turn.
@@ -213,6 +214,7 @@ class CodexAppServerSession:
         codex_home: Optional[str] = None, permission_profile: Optional[str] = None,
         approval_callback: Optional[Callable[..., str]] = None,
         on_event: Optional[Callable[[dict], None]] = None,
+        on_token_usage: Optional[Callable[[dict], None]] = None,
         request_routing: Optional[_ServerRequestRouting] = None,
         client_factory: Optional[Callable[..., CodexAppServerClient]] = None,
         model: Optional[str] = None, model_provider: Optional[str] = None,
@@ -428,6 +430,12 @@ class CodexAppServerSession:
             except Exception:  # pragma: no cover - display callback
                 logger.debug("on_event callback raised", exc_info=True)
         _apply_accounting_notification(result, note)
+        usage_update = _apply_token_usage_notification(result, note)
+        if usage_update is not None and self._on_token_usage is not None:
+            try:
+                self._on_token_usage(usage_update)
+            except Exception:
+                logger.debug("on_token_usage callback raised", exc_info=True)
         self._track_pending_file_change(note)
         projection = projector.project(note)
         if projection.messages:
@@ -831,3 +839,39 @@ def _get_hermes_version() -> str:
         return version("hermes-agent")
     except Exception:  # pragma: no cover
         return "0.0.0"
+
+
+def _apply_token_usage_notification(
+    result: TurnResult, note: dict
+) -> Optional[dict]:
+    """Capture and normalize one Codex app-server usage notification.
+
+    ``last`` is the per-model-request breakdown while ``total`` is cumulative.
+    The returned payload feeds the optional observability callback; ``None``
+    means the notification carried no usable token-usage data.
+    """
+    if not isinstance(note, dict) or note.get("method") != "thread/tokenUsage/updated":
+        return None
+    params = note.get("params") or {}
+    token_usage = params.get("tokenUsage") or {}
+    if not isinstance(token_usage, dict):
+        return None
+    update: dict[str, Any] = {
+        "thread_id": params.get("threadId"),
+        "turn_id": params.get("turnId"),
+    }
+    last = token_usage.get("last")
+    total = token_usage.get("total")
+    if isinstance(last, dict):
+        result.token_usage_last = dict(last)
+        update["last"] = dict(last)
+    if isinstance(total, dict):
+        result.token_usage_total = dict(total)
+        update["total"] = dict(total)
+    window = token_usage.get("modelContextWindow")
+    if isinstance(window, int) and not isinstance(window, bool) and window > 0:
+        result.model_context_window = window
+        update["model_context_window"] = window
+    if any(key in update for key in ("last", "total", "model_context_window")):
+        return update
+    return None

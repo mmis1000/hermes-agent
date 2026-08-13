@@ -5,6 +5,8 @@ import pytest
 from hermes_state import SessionDB
 
 
+
+
 @pytest.fixture
 def db(tmp_path):
     return SessionDB(tmp_path / "state.db")
@@ -288,6 +290,44 @@ def test_async_loader_is_authorized_and_keeps_provider_history_internal(
     assert foreign == {"status": "not_found"}
     assert "history" not in repr(projected)
     assert "private chain" not in repr(projected)
+    ad._reset_for_tests()
+
+
+def test_protected_resume_missing_immutable_authority_fails_closed(tmp_path, monkeypatch):
+    from tools import async_delegation as ad
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    ad._reset_for_tests()
+    db = SessionDB()
+    _session(db, "parent", source="discord", owner=None)
+    _session(db, "child-1", parent="parent")
+    db.append_message("child-1", "user", "goal")
+    repository = ad._repository()
+    initial = repository.register_initial_dispatch(
+        {
+            "delegation_id": "deleg-protected-missing-authority",
+            "session_key": "parent",
+            "dispatched_at": 1.0,
+            "root_subagent_ids": ["logical-child"],
+            "attempt_ids_by_logical_id": {"logical-child": "attempt-protected"},
+        }
+    )
+    repository.transition_attempt(
+        initial["attempts"][0]["attempt_id"],
+        {"starting"},
+        "completed",
+        metadata=_metadata(),
+        completed_at=2.0,
+    )
+
+    loaded = ad.load_subagent_resume_bundle(
+        "deleg-protected-missing-authority", "logical-child", session_key="parent"
+    )
+
+    assert loaded == {
+        "status": "resume_unavailable",
+        "reason": "protected authority is missing",
+    }
     ad._reset_for_tests()
 
 
