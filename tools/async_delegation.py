@@ -42,7 +42,7 @@ import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Mapping, Optional
 
 from hermes_constants import get_hermes_home
 from tools.daemon_pool import DaemonThreadPoolExecutor
@@ -297,7 +297,7 @@ def _terminal(snapshot: Dict[str, Any]) -> bool:
 
 def get_durable_delegation(delegation_id: str) -> Optional[Dict[str, Any]]:
     """Internal durable lookup. Model-facing callers must use the authorised view."""
-    return _repository().snapshot(delegation_id)
+    return _repository().trusted_snapshot(delegation_id)
 
 
 def get_async_delegation(
@@ -353,12 +353,29 @@ def load_subagent_resume_bundle(
     session_key: str,
 ) -> Dict[str, Any]:
     """Load one authorized child's validated provider-facing replay bundle."""
-    snapshot = get_async_delegation(delegation_id, session_key=session_key)
+    # Resume reconstruction is the sole consumer of canonical authority.  It
+    # remains owner-authorized but bypasses the ordinary audit projection so
+    # backing identity/revision can be revalidated before use.
+    snapshot = _repository().trusted_snapshot(
+        delegation_id, session_key=session_key
+    )
     if snapshot is None:
         return {"status": "not_found"}
     child = (snapshot.get("children") or {}).get(logical_id)
     if not isinstance(child, dict):
         return {"status": "not_found"}
+    protected = bool(child.get("protected_execution"))
+    authority = child.get("authority")
+    if protected and not isinstance(authority, dict):
+        return {
+            "status": "resume_unavailable",
+            "reason": "protected authority is missing",
+        }
+    if authority is not None and not isinstance(authority, dict):
+        return {
+            "status": "resume_unavailable",
+            "reason": "protected authority is malformed",
+        }
     metadata = {
         key: child.get(key)
         for key in _RESUME_METADATA_FIELDS
@@ -410,6 +427,8 @@ def load_subagent_resume_bundle(
         "attempt_id": child.get("attempt_id"),
         "attempt_number": child.get("attempt_number"),
         "run_id": child.get("run_id"),
+        "authority": dict(authority) if isinstance(authority, dict) else None,
+        "protected": protected,
         "bundle": bundle,
     }
 
@@ -442,6 +461,33 @@ def dispatch_resumed_subagent(
     if loaded.get("status") != "ready":
         return loaded
 
+    restored_scope = None
+    expected_policy = None
+    if loaded.get("protected"):
+        from agent.delegation_policy import DelegationSessionPolicy
+        from tools.delegation_scope import deserialize_delegation_authority
+
+        authority = loaded.get("authority")
+        if not isinstance(authority, Mapping):
+            return {
+                "status": "resume_unavailable",
+                "reason": "protected authority is malformed",
+            }
+        parent_policy = getattr(parent_agent, "delegation_policy", None)
+        expected_policy = (
+            parent_policy if isinstance(parent_policy, DelegationSessionPolicy) else None
+        )
+        try:
+            restored_scope = deserialize_delegation_authority(
+                authority,
+                backing_registry=getattr(
+                    parent_agent, "delegation_backing_registry", None
+                ),
+                expected_policy=expected_policy,
+            )
+        except (TypeError, ValueError) as exc:
+            return {"status": "resume_unavailable", "reason": str(exc)}
+
     bundle = loaded["bundle"]
     from tools import delegate_tool as _delegate
 
@@ -454,6 +500,11 @@ def dispatch_resumed_subagent(
         **dict(bundle["reconstruction_metadata"]),
         "child_session_id": bundle["prior_child_session_id"],
     }
+    authority_tools = None
+    if loaded.get("protected"):
+        authority_tools = dict(loaded["authority"]["tools"])
+        metadata["enabled_toolsets"] = list(authority_tools["enabled_toolsets"])
+        metadata["disabled_toolsets"] = list(authority_tools["disabled_toolsets"])
     try:
         from gateway.status import get_process_start_time
 
@@ -462,7 +513,7 @@ def dispatch_resumed_subagent(
         owner_started_at = None
     reserved = _repository().reserve_resumed_attempt(
         logical_id,
-        physical_worker_id=logical_id,
+        physical_worker_id=None if loaded.get("protected") else logical_id,
         owner_pid=os.getpid(),
         owner_started_at=owner_started_at,
         metadata=metadata,
@@ -474,6 +525,8 @@ def dispatch_resumed_subagent(
     run_id = str(reserved["run_id"])
     attempt_id = str(reserved["attempt_id"])
     dispatched_at = time.time()
+    protected_attempt_registry = None
+    protected_attempt_authority = None
     event_record = {
         "delegation_id": delegation_id,
         "run_id": run_id,
@@ -498,34 +551,30 @@ def dispatch_resumed_subagent(
         result.setdefault("run_id", run_id)
         _push_completion_event(completed, result, status)
 
-    try:
-        child = _delegate.build_resumed_child_agent(
-            bundle=bundle,
-            logical_id=logical_id,
-            goal=str(event_record["goal"] or "resumed subagent"),
-            parent_agent=parent_agent,
-            continuation=continuation,
-        )
-        child._delegation_run_id = run_id
-        child._delegation_attempt_id = attempt_id
-        child._delegation_session_ref.update(
-            {"run_id": run_id, "attempt_id": attempt_id}
-        )
-        child_metadata = dict(child._delegation_runtime_metadata)
-        # Keep the prior segment only in durable in-flight metadata.  The
-        # reconstructed child must retain its newly allocated session ID so a
-        # successful completion can advance the replay anchor.
-        metadata = {
-            **child_metadata,
-            "child_session_id": bundle["prior_child_session_id"],
-        }
-    except Exception as exc:
+    def fail_before_execution(exc: Exception) -> Dict[str, Any]:
+        cleanup_errors: tuple[Exception, ...] = ()
+        if protected_attempt_registry is not None:
+            try:
+                cleanup_errors = tuple(
+                    protected_attempt_registry.cleanup(attempt_id)
+                )
+            except Exception as cleanup_exc:
+                cleanup_errors = (cleanup_exc,)
+        error = f"{type(exc).__name__}: {exc}"
+        exit_reason = "dispatch_failed"
+        if cleanup_errors:
+            cleanup_detail = "; ".join(
+                f"{type(item).__name__}: {item}" for item in cleanup_errors
+            )
+            error = f"{error}; cleanup failed: {cleanup_detail}"
+            exit_reason = "cleanup_error"
         result = {
             "status": "error",
             "summary": None,
-            "error": f"{type(exc).__name__}: {exc}",
-            # Construction failed before the continuation session existed;
-            # keep the last persisted child segment as the retry anchor.
+            "error": error,
+            "exit_reason": exit_reason,
+            # Failure occurred before the continuation session ran; keep the
+            # last persisted child segment as the retry anchor.
             "child_session_id": bundle["prior_child_session_id"],
             "api_calls": 0,
             "duration_seconds": round(time.time() - dispatched_at, 2),
@@ -538,15 +587,115 @@ def dispatch_resumed_subagent(
             "run_id": run_id,
             "attempt_id": attempt_id,
             "attempt_number": reserved["attempt_number"],
-            "error": result["error"],
+            "error": error,
+            "exit_reason": exit_reason,
         }
 
-    executor = _get_executor(max_async_children)
+    if loaded.get("protected"):
+        from tools import delegation_scope as _delegation_scope
+        from tools import terminal_tool as _terminal_tool
+
+        if restored_scope is None:
+            return fail_before_execution(
+                RuntimeError("protected authority scope is unavailable")
+            )
+        protected_attempt_registry = _delegation_scope.attempt_scope_registry
+        try:
+            protected_attempt_authority = protected_attempt_registry.reserve(
+                restored_scope,
+                logical_id,
+                attempt_id=attempt_id,
+                backing_registry=getattr(
+                    parent_agent, "delegation_backing_registry", None
+                ),
+            )
+
+            def _cleanup_resumed_environment() -> None:
+                try:
+                    _terminal_tool.cleanup_vm(attempt_id, force_remove=True)
+                finally:
+                    _terminal_tool.clear_task_env_overrides(attempt_id)
+
+            protected_attempt_registry.add_resource(
+                attempt_id, "task-environment", _cleanup_resumed_environment
+            )
+            _terminal_tool.register_task_env_overrides(
+                attempt_id,
+                {
+                    "env_type": restored_scope.profile.backend,
+                    "docker_image": restored_scope.profile.image,
+                    "cwd": str(restored_scope.workdir),
+                    "delegation_scope_id": protected_attempt_authority.scope_id,
+                },
+            )
+        except Exception as exc:
+            return fail_before_execution(exc)
+
+    try:
+        if loaded.get("protected"):
+            # Re-resolve trusted backing identity/revision immediately before
+            # constructing a child that can consume the restored scope.
+            from tools.delegation_scope import deserialize_delegation_authority
+
+            restored_scope = deserialize_delegation_authority(
+                loaded["authority"],
+                backing_registry=getattr(
+                    parent_agent, "delegation_backing_registry", None
+                ),
+                expected_policy=expected_policy,
+            )
+        child = _delegate.build_resumed_child_agent(
+            bundle=bundle,
+            logical_id=logical_id,
+            goal=str(event_record["goal"] or "resumed subagent"),
+            parent_agent=parent_agent,
+            continuation=continuation,
+            resolved_scope=restored_scope,
+            authority_tools=authority_tools,
+        )
+        child._delegation_run_id = run_id
+        child._delegation_attempt_id = attempt_id
+        if protected_attempt_authority is not None:
+            child._delegation_scope_id = protected_attempt_authority.scope_id
+            child._current_task_id = attempt_id
+            child.resolved_attempt_authority = protected_attempt_authority
+        child._delegation_session_ref.update(
+            {"run_id": run_id, "attempt_id": attempt_id}
+        )
+        child_metadata = dict(child._delegation_runtime_metadata)
+        # Keep the prior segment only in durable in-flight metadata.  The
+        # reconstructed child must retain its newly allocated session ID so a
+        # successful completion can advance the replay anchor.
+        metadata = {
+            **child_metadata,
+            "child_session_id": bundle["prior_child_session_id"],
+        }
+    except Exception as exc:
+        return fail_before_execution(exc)
+
+    try:
+        executor = _get_executor(max_async_children)
+    except Exception as exc:
+        try:
+            child.close()
+        except Exception:
+            pass
+        return fail_before_execution(exc)
 
     def worker() -> None:
         result: Dict[str, Any]
         status = "error"
         try:
+            if loaded.get("protected"):
+                from tools.delegation_scope import deserialize_delegation_authority
+
+                deserialize_delegation_authority(
+                    loaded["authority"],
+                    backing_registry=getattr(
+                        parent_agent, "delegation_backing_registry", None
+                    ),
+                    expected_policy=expected_policy,
+                )
             _repository().transition_attempt(
                 attempt_id, {"starting"}, "running", metadata=metadata
             )
@@ -578,32 +727,17 @@ def dispatch_resumed_subagent(
         finish(result, status)
 
     try:
+        if protected_attempt_registry is not None:
+            protected_attempt_registry.activate(
+                attempt_id, delegation_id=delegation_id, run_id=run_id
+            )
         executor.submit(propagate_context_to_thread(worker))
     except Exception as exc:
         try:
             child.close()
         except Exception:
             pass
-        result = {
-            "status": "error",
-            "summary": None,
-            "error": f"{type(exc).__name__}: {exc}",
-            # Submission failed before run_conversation could persist the new
-            # segment, so preserve the prior retry anchor.
-            "child_session_id": bundle["prior_child_session_id"],
-            "api_calls": 0,
-            "duration_seconds": round(time.time() - dispatched_at, 2),
-        }
-        finish(result, "error")
-        return {
-            "status": "dispatch_failed",
-            "delegation_id": delegation_id,
-            "subagent_id": logical_id,
-            "run_id": run_id,
-            "attempt_id": attempt_id,
-            "attempt_number": reserved["attempt_number"],
-            "error": result["error"],
-        }
+        return fail_before_execution(exc)
 
     return {
         "status": "dispatched",
@@ -1043,7 +1177,7 @@ def interrupt_async_delegation(
 
         with _records_lock:
             current = _records.get(delegation_id)
-            if current is record:
+            if record is not None and current is not None and current is record:
                 current["status"] = "interrupt_requested"
         _notify_state_change()
         try:
@@ -1056,7 +1190,12 @@ def interrupt_async_delegation(
             )
             with _records_lock:
                 current = _records.get(delegation_id)
-                if current is record and current.get("status") == "interrupt_requested":
+                if (
+                    record is not None
+                    and current is not None
+                    and current is record
+                    and current.get("status") == "interrupt_requested"
+                ):
                     if current_snapshot and current_snapshot["state"] in _ACTIVE_STATES:
                         current["status"] = current_snapshot["state"]
             _notify_state_change()
@@ -1089,6 +1228,12 @@ def abandon_async_delegation(
         }
     interrupted = interrupt_async_delegation(
         delegation_id, session_key=session_key, reason=reason
+    )
+    # Physical interruption happens first so durable revocation cannot prevent
+    # the best-effort worker stop. The logical tombstone is retained in
+    # spec_json and closes every later resume/steer/interrupt path.
+    _repository().tombstone_delegation_authorities(
+        delegation_id, revoked=True, cleaned=True
     )
     worker = str(interrupted.get("status") or "interrupt_unavailable")
     return {
@@ -1494,6 +1639,8 @@ def dispatch_async_delegation_batch(
     origin_ui_session_id: str = "",
     interrupt_fn: Optional[Callable[[], None]] = None,
     root_subagent_ids: Optional[List[str]] = None,
+    attempt_ids_by_logical_id: Optional[Dict[str, str]] = None,
+    authority_by_logical_id: Optional[Dict[str, Dict[str, Any]]] = None,
     max_async_children: int = _DEFAULT_MAX_ASYNC_CHILDREN,
     delegation_id: Optional[str] = None,
     _bind_attempts: Optional[Callable[[str, Dict[str, str]], None]] = None,
@@ -1544,6 +1691,13 @@ def dispatch_async_delegation_batch(
         "root_subagent_ids": list(root_subagent_ids or []),
         "is_batch": True,
     }
+    if attempt_ids_by_logical_id is not None:
+        record["attempt_ids_by_logical_id"] = dict(attempt_ids_by_logical_id)
+    if authority_by_logical_id is not None:
+        record["authority_by_logical_id"] = {
+            logical_id: dict(authority)
+            for logical_id, authority in authority_by_logical_id.items()
+        }
     with _records_lock:
         running = sum(
             1 for r in _records.values() if r.get("status") in _ACTIVE_STATES
@@ -1560,12 +1714,22 @@ def dispatch_async_delegation_batch(
             }
         _records[delegation_id] = record
 
-    _persist_dispatch(record)
-    if _bind_attempts is not None:
-        _bind_attempts(
-            str(record["run_id"]),
-            dict(zip(record["root_subagent_ids"], record["attempt_ids"])),
-        )
+    try:
+        _persist_dispatch(record)
+        if _bind_attempts is not None:
+            _bind_attempts(
+                str(record["run_id"]),
+                dict(zip(record["root_subagent_ids"], record["attempt_ids"])),
+            )
+    except Exception as exc:
+        with _records_lock:
+            _records.pop(delegation_id, None)
+        _delete_durable_delegation(delegation_id)
+        return {
+            "status": "rejected",
+            "reason": "dispatch_setup_failed",
+            "error": f"Failed to establish durable async delegation: {exc}",
+        }
     executor = _get_executor(max_async_children)
 
     def _worker() -> None:

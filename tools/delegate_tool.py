@@ -810,6 +810,40 @@ def _is_mcp_toolset_name(name: str) -> bool:
     return bool(target and str(target).startswith("mcp-"))
 
 
+def _toolset_tool_names(definition: Any) -> tuple[str, ...]:
+    """Return only canonical string tool names from an untyped toolset entry."""
+
+    if not isinstance(definition, dict):
+        return ()
+    tools = definition.get("tools")
+    if not isinstance(tools, (list, tuple, set, frozenset)):
+        return ()
+    return tuple(tool for tool in tools if isinstance(tool, str) and tool)
+
+
+def _qualified_protected_tool_names(
+    candidate_names: set[str],
+    allowed_profile_toolsets: set[str],
+    qualified_mcp_servers: frozenset[str],
+) -> set[str]:
+    """Apply profile toolset and exact MCP-server qualification admission."""
+
+    import model_tools
+    from tools.mcp_tool import get_mcp_tool_server_qualification
+
+    admitted: set[str] = set()
+    for name in candidate_names:
+        toolset = model_tools.get_toolset_for_tool(name)
+        if toolset not in allowed_profile_toolsets:
+            continue
+        if _is_mcp_toolset_name(toolset or ""):
+            server = get_mcp_tool_server_qualification(name)
+            if server not in qualified_mcp_servers:
+                continue
+        admitted.add(name)
+    return admitted
+
+
 def _expand_parent_toolsets(parent_toolsets: set) -> set:
     """Expand composite toolsets so individual toolset names are recognized.
 
@@ -826,7 +860,7 @@ def _expand_parent_toolsets(parent_toolsets: set) -> set:
     for ts_name in parent_toolsets:
         ts_def = TOOLSETS.get(ts_name)
         if ts_def:
-            parent_tool_names.update(ts_def.get("tools", []))
+            parent_tool_names.update(_toolset_tool_names(ts_def))
 
     if not parent_tool_names:
         return set(parent_toolsets)
@@ -835,7 +869,7 @@ def _expand_parent_toolsets(parent_toolsets: set) -> set:
     for ts_name, ts_def in TOOLSETS.items():
         if ts_name in expanded:
             continue
-        ts_tools = ts_def.get("tools", [])
+        ts_tools = _toolset_tool_names(ts_def)
         if ts_tools and set(ts_tools).issubset(parent_tool_names):
             expanded.add(ts_name)
     return expanded
@@ -1047,7 +1081,7 @@ def _strip_blocked_tools(toolsets: List[str]) -> List[str]:
         name
         for name, defn in TOOLSETS.items()
         if name in _COMPOSITE_BLOCKED_TOOLSETS
-        or all(t in DELEGATE_BLOCKED_TOOLS for t in defn.get("tools", []))
+        or all(t in DELEGATE_BLOCKED_TOOLS for t in _toolset_tool_names(defn))
     }
     return [t for t in toolsets if t not in blocked_toolset_names]
 
@@ -1068,8 +1102,8 @@ def _blocked_toolsets_for_role(role: str) -> List[str]:
     blocked_toolsets = {
         name
         for name, defn in TOOLSETS.items()
-        if defn.get("tools")
-        and set(defn.get("tools", ())).issubset(blocked_names)
+        if _toolset_tool_names(defn)
+        and set(_toolset_tool_names(defn)).issubset(blocked_names)
     }
     # The delegation toolset is intentionally mixed now: leaf children must
     # lose both delegate_task and the session-scoped lifecycle controller,
@@ -1402,9 +1436,20 @@ def build_resumed_child_agent(
     goal: str,
     parent_agent,
     continuation: Optional[Dict[str, str]] = None,
+    resolved_scope: Any = None,
+    authority_tools: Optional[Dict[str, Any]] = None,
 ):
     """Reconstruct a child using persisted non-secret policy and live credentials."""
     metadata = dict(bundle.get("reconstruction_metadata") or {})
+    if resolved_scope is not None:
+        if not isinstance(authority_tools, dict):
+            raise ValueError("protected resume tool snapshot is unavailable")
+        metadata["enabled_toolsets"] = list(
+            authority_tools.get("enabled_toolsets") or []
+        )
+        metadata["disabled_toolsets"] = list(
+            authority_tools.get("disabled_toolsets") or []
+        )
     model = str(metadata.get("model") or "").strip()
     provider = str(metadata.get("provider") or "").strip()
     if not model or not provider:
@@ -1450,6 +1495,18 @@ def build_resumed_child_agent(
             acp_command=credentials.get("command"),
             acp_args=list(credentials.get("args") or []),
         )
+    delegation_policy_override = None
+    if resolved_scope is not None:
+        from agent.delegation_policy import DelegationSessionPolicy
+
+        delegation_policy_override = DelegationSessionPolicy(
+            profile_required=True,
+            allow_profile_none=False,
+            allowed_profiles={resolved_scope.profile_name},
+            profile_snapshots={resolved_scope.profile_name: resolved_scope.profile},
+            visible_objects=resolved_scope.visible_objects,
+            protected_prefixes=(),
+        )
     child = _build_child_agent(
         task_index=0,
         goal=goal,
@@ -1472,13 +1529,19 @@ def build_resumed_child_agent(
         override_acp_command=credentials.get("command"),
         override_acp_args=credentials.get("args"),
         required_disabled_toolsets=list(metadata.get("disabled_toolsets") or []),
-        workspace_override=metadata.get("workdir"),
+        workspace_override=(
+            str(resolved_scope.workdir)
+            if resolved_scope is not None
+            else metadata.get("workdir")
+        ),
         reasoning_config_override=metadata.get("reasoning_config"),
         fallback_model_override=list(metadata.get("fallback_routes") or []),
         provider_preferences_override=metadata.get("provider_preferences"),
         session_id_override=continuation["session_id"],
         parent_session_id_override=continuation["parent_session_id"],
         role=str(metadata.get("role") or "leaf"),
+        resolved_scope=resolved_scope,
+        delegation_policy_override=delegation_policy_override,
     )
 
     owner = continuation["delegate_from"]
@@ -1617,6 +1680,8 @@ def _build_child_agent(
     # 'leaf' (default) cannot; 'orchestrator' retains the delegation
     # toolset subject to depth/kill-switch bounds applied below.
     role: str = "leaf",
+    resolved_scope: Any = None,
+    delegation_policy_override: Any = None,
 ):
     """
     Build a child AIAgent on the main thread (thread-safe construction).
@@ -1691,6 +1756,28 @@ def _build_child_agent(
     else:
         child_toolsets = _strip_blocked_tools(DEFAULT_TOOLSETS)
 
+    child_delegation_policy = None
+    protected_profile_toolsets = None
+    from tools.delegation_scope import ResolvedInvocationScope
+
+    if isinstance(resolved_scope, ResolvedInvocationScope):
+        from agent.delegation_policy import DelegationSessionPolicy, derive_child_policy
+
+        parent_policy = delegation_policy_override or getattr(
+            parent_agent, "delegation_policy", None
+        )
+        if not isinstance(parent_policy, DelegationSessionPolicy):
+            raise ValueError("protected child requires a pinned parent delegation policy")
+        protected_profile_toolsets = set(resolved_scope.profile.allowed_toolsets)
+        child_toolsets = [
+            name for name in child_toolsets if name in protected_profile_toolsets
+        ]
+        child_delegation_policy = derive_child_policy(
+            parent_policy,
+            resolved_scope.visible_objects,
+            allowed_profiles={resolved_scope.profile_name},
+        )
+
     # Blocked tools also live inside mixed platform bundles (hermes-cli,
     # hermes-telegram, etc.) that _strip_blocked_tools must keep because they
     # carry useful tools too. Pass exact one-tool deny toolsets through to the
@@ -1719,7 +1806,14 @@ def _build_child_agent(
     # removed.  The re-add is unconditional on parent-toolset membership because
     # orchestrator capability is granted by role, not inherited — see the
     # test_intersection_preserves_delegation_bound test for the design rationale.
-    if effective_role == "orchestrator" and "delegation" not in child_toolsets:
+    if (
+        effective_role == "orchestrator"
+        and "delegation" not in child_toolsets
+        and (
+            protected_profile_toolsets is None
+            or "delegation" in protected_profile_toolsets
+        )
+    ):
         child_toolsets.append("delegation")
 
     workspace_hint = workspace_override or _resolve_workspace_hint(parent_agent)
@@ -1974,8 +2068,59 @@ def _build_child_agent(
         openrouter_min_coding_score=child_openrouter_min_coding_score,
         tool_progress_callback=child_progress_cb,
         iteration_budget=None,  # fresh budget per subagent
+        delegation_policy=child_delegation_policy,
         **child_optional_kwargs,
     )
+    # Trusted invocation-wide authority template. Later container and routed
+    # tool construction consume this object directly; model-authored text is
+    # never reparsed into authority.
+    setattr(child, "resolved_invocation_scope", resolved_scope)
+    setattr(child, "_delegation_scope", resolved_scope)
+    if child_delegation_policy is not None:
+        setattr(
+            child,
+            "delegation_backing_registry",
+            getattr(parent_agent, "delegation_backing_registry", None),
+        )
+        # Final admission filter: retain only names classified into the
+        # operator-owned profile toolsets.  Pin exact names so later plugin/MCP
+        # registry growth cannot widen this protected session.
+        allowed_profile_toolsets = protected_profile_toolsets or set()
+        protected_names = _qualified_protected_tool_names(
+            set(getattr(child, "valid_tool_names", set())),
+            allowed_profile_toolsets,
+            resolved_scope.profile.qualified_mcp_servers,
+        )
+        if (
+            effective_role == "orchestrator"
+            and "delegation" in allowed_profile_toolsets
+        ):
+            protected_names.add("delegate_task")
+        protected_tools = [
+            item for item in (getattr(child, "tools", None) or [])
+            if item.get("function", {}).get("name") in protected_names
+        ]
+        setattr(child, "tools", protected_tools)
+        setattr(child, "valid_tool_names", protected_names)
+        setattr(child, "_protected_tool_snapshot", frozenset(protected_names))
+        setattr(
+            child,
+            "_protected_qualified_mcp_servers",
+            frozenset(resolved_scope.profile.qualified_mcp_servers),
+        )
+        from tools.mcp_tool import get_mcp_tool_server_qualification
+
+        setattr(
+            child,
+            "_protected_mcp_tool_provenance",
+            {
+                name: provenance
+                for name in protected_names
+                if (
+                    provenance := get_mcp_tool_server_qualification(name)
+                ) is not None
+            },
+        )
     child._print_fn = getattr(parent_agent, "_print_fn", None)
     # Now the child exists, its session id can ride on every relayed event
     # (including the spawn_requested below — first emit happens after this).
@@ -2532,6 +2677,7 @@ def _run_single_child(
     _subagent_id = _raw_sid if isinstance(_raw_sid, str) else None
     _raw_attempt_id = getattr(child, "_delegation_attempt_id", None)
     _attempt_id = _raw_attempt_id if isinstance(_raw_attempt_id, str) else None
+    _result_boundary: Dict[str, Any] | None = None
     if _subagent_id:
         _raw_depth = getattr(child, "_delegate_depth", 1)
         _tui_depth = max(0, _raw_depth - 1) if isinstance(_raw_depth, int) else 0
@@ -2732,7 +2878,7 @@ def _run_single_child(
             else:
                 _err = str(_timeout_exc)
 
-            return {
+            _result_boundary = {
                 "task_index": task_index,
                 "status": "timeout" if is_timeout else "error",
                 "summary": None,
@@ -2743,6 +2889,7 @@ def _run_single_child(
                 "_child_role": getattr(child, "_delegate_role", None),
                 "diagnostic_path": diagnostic_path,
             }
+            return _result_boundary
         finally:
             # Shut down executor without waiting — if the child thread
             # is stuck on blocking I/O, wait=True would hang forever.
@@ -2960,7 +3107,8 @@ def _run_single_child(
             except Exception as e:
                 logger.debug("Progress callback completion failed: %s", e)
 
-        return entry
+        _result_boundary = entry
+        return _result_boundary
 
     except Exception as exc:
         duration = round(time.monotonic() - child_start, 2)
@@ -2976,7 +3124,7 @@ def _run_single_child(
                 )
             except Exception as e:
                 logger.debug("Progress callback failure relay failed: %s", e)
-        return {
+        _result_boundary = {
             "task_index": task_index,
             "status": "error",
             "summary": None,
@@ -2985,8 +3133,33 @@ def _run_single_child(
             "duration_seconds": duration,
             "_child_role": getattr(child, "_delegate_role", None),
         }
+        return _result_boundary
 
     finally:
+        # Revoke protected authority before any teardown. The registry retains a
+        # cleaned tombstone so late calls from a timed-out worker cannot fall
+        # back to ordinary/default routing.
+        if _attempt_id:
+            try:
+                from tools.delegation_scope import attempt_scope_registry
+
+                cleanup_errors = attempt_scope_registry.cleanup(_attempt_id)
+                if cleanup_errors and _result_boundary is not None:
+                    details = "; ".join(str(error) for error in cleanup_errors)
+                    _result_boundary.update(
+                        status="error",
+                        error=f"Protected cleanup failed: {details}",
+                        exit_reason="cleanup_error",
+                    )
+            except Exception as cleanup_exc:
+                logger.debug("Failed to clean protected attempt resources", exc_info=True)
+                if _result_boundary is not None:
+                    _result_boundary.update(
+                        status="error",
+                        error=f"Protected cleanup failed: {cleanup_exc}",
+                        exit_reason="cleanup_error",
+                    )
+
         # Stop the heartbeat thread so it doesn't keep touching parent activity
         # after the child has finished (or failed).  Guard the join: .start()
         # now lives inside the try block, so if it raised (OS thread
@@ -3074,6 +3247,9 @@ def delegate_task(
     model: Optional[str] = None,
     provider: Optional[str] = None,
     reasoning_effort: Optional[str] = None,
+    profile: Optional[str] = None,
+    workdir: Optional[str] = None,
+    reveal: Optional[List[Dict[str, str]]] = None,
 ) -> str:
     """
     Spawn one or more child agents to handle delegated tasks.
@@ -3172,16 +3348,6 @@ def delegate_task(
                 "Use one of: none, minimal, low, medium, high, xhigh, max, ultra."
             )
 
-    # Resolve delegation credentials (provider:model pair).
-    # When delegation.provider is configured, this resolves the full credential
-    # bundle (base_url, api_key, api_mode) via the same runtime provider system
-    # used by CLI/gateway startup.  When unconfigured, returns None values so
-    # children inherit from the parent.
-    try:
-        creds = _resolve_delegation_credentials(effective_cfg, parent_agent)
-    except ValueError as exc:
-        return tool_error(str(exc))
-
     # Normalize to task list
     max_children = _get_max_concurrent_children()
     recovered_tasks, tasks_error = _recover_tasks_from_json_string(tasks)
@@ -3217,6 +3383,51 @@ def delegate_task(
         if not task.get("goal", "").strip():
             return tool_error(f"Task {i} is missing a 'goal'.")
 
+    # Atomic, side-effect-free authority preflight for the complete invocation.
+    # Preserve the legacy ordinary path exactly when all protected fields are
+    # omitted; otherwise validation must finish before credentials, transcripts,
+    # children, sessions, executors, containers, or durable dispatch state.
+    from agent.delegation_policy import DelegationSessionPolicy
+
+    candidate_policy = getattr(parent_agent, "delegation_policy", None)
+    delegation_policy = (
+        candidate_policy
+        if isinstance(candidate_policy, DelegationSessionPolicy)
+        else None
+    )
+    if (
+        delegation_policy is None
+        and profile is None
+        and workdir is None
+        and reveal is None
+    ):
+        resolved_scope = None
+    else:
+        from tools.delegation_scope import resolve_invocation_scope
+        from tools.terminal_tool import _get_env_config
+
+        try:
+            inherited_network = _get_env_config().get("docker_network", True)
+            resolved_scope = resolve_invocation_scope(
+                delegation_policy,
+                profile,
+                workdir,
+                reveal,
+                backing_registry=getattr(
+                    parent_agent, "delegation_backing_registry", None
+                ),
+                inherited_network=inherited_network,
+            )
+        except (TypeError, ValueError) as exc:
+            return tool_error(str(exc))
+
+    # Credential resolution can consult provider state, so it deliberately
+    # occurs only after the complete shared scope has passed preflight.
+    try:
+        creds = _resolve_delegation_credentials(effective_cfg, parent_agent)
+    except ValueError as exc:
+        return tool_error(str(exc))
+
     overall_start = time.monotonic()
     results = []
 
@@ -3235,9 +3446,14 @@ def delegate_task(
         wrap_progress_callback,
     )
 
-    live_deleg_id, live_writers, live_paths = create_live_transcripts(
-        task_list, context
-    )
+    if resolved_scope is None:
+        live_deleg_id, live_writers, live_paths = create_live_transcripts(
+            task_list, context
+        )
+    else:
+        # Protected invocations defer every durable transcript write until all
+        # children and physical-attempt authorities have been constructed.
+        live_deleg_id, live_writers, live_paths = None, [], []
 
     # Save parent tool names BEFORE any child construction mutates the global.
     # _build_child_agent() calls AIAgent() which calls get_tool_definitions(),
@@ -3276,6 +3492,7 @@ def delegate_task(
                 override_acp_args=creds.get("args"),
                 reasoning_config_override=reasoning_config_override,
                 role=effective_role,
+                resolved_scope=resolved_scope,
             )
             # Override with correct parent tool names (before child construction mutated global)
             child._delegate_saved_tool_names = _parent_tool_names
@@ -3291,9 +3508,110 @@ def delegate_task(
                 )
                 child._live_transcript_path = str(_writer.path)
             children.append((i, t, child))
+    except Exception as exc:
+        if resolved_scope is None:
+            raise
+        for _i, _t, constructed_child in children:
+            try:
+                constructed_child.close()
+            except Exception:
+                pass
+        return tool_error(f"protected child construction failed: {exc}")
     finally:
         # Authoritative restore: reset global to parent's tool names after all children built
         _model_tools._last_resolved_tool_names = _parent_tool_names
+
+    protected_attempt_ids: Dict[str, str] = {}
+    protected_authority_by_logical_id: Dict[str, Dict[str, Any]] = {}
+    protected_attempt_registry = None
+    if resolved_scope is not None:
+        from tools import delegation_scope as _delegation_scope
+        from tools import terminal_tool as _terminal_tool
+
+        protected_attempt_registry = _delegation_scope.attempt_scope_registry
+        reserved_ids: List[str] = []
+        try:
+            for _i, _t, child in children:
+                logical_id = getattr(child, "_subagent_id", None)
+                if not isinstance(logical_id, str) or not logical_id:
+                    raise ValueError("protected child is missing its logical identity")
+                authority = protected_attempt_registry.reserve(
+                    resolved_scope,
+                    logical_id,
+                    backing_registry=getattr(
+                        parent_agent, "delegation_backing_registry", None
+                    ),
+                )
+                attempt_id = authority.attempt_id
+                reserved_ids.append(attempt_id)
+
+                def _cleanup_attempt_environment(
+                    physical_id: str = attempt_id,
+                ) -> None:
+                    try:
+                        _terminal_tool.cleanup_vm(physical_id, force_remove=True)
+                    finally:
+                        _terminal_tool.clear_task_env_overrides(physical_id)
+
+                protected_attempt_registry.add_resource(
+                    attempt_id,
+                    "task-environment",
+                    _cleanup_attempt_environment,
+                )
+                _terminal_tool.register_task_env_overrides(
+                    attempt_id,
+                    {
+                        "env_type": resolved_scope.profile.backend,
+                        "docker_image": resolved_scope.profile.image,
+                        "cwd": str(resolved_scope.workdir),
+                        "delegation_scope_id": authority.scope_id,
+                    },
+                )
+                protected_attempt_ids[logical_id] = attempt_id
+                child._delegation_attempt_id = attempt_id
+                child._delegation_scope_id = authority.scope_id
+                child._current_task_id = attempt_id
+                child.resolved_attempt_authority = authority
+                serialized_authority = _delegation_scope.serialize_delegation_authority(
+                    resolved_scope,
+                    enabled_toolsets=tuple(
+                        getattr(child, "enabled_toolsets", None) or ()
+                    ),
+                    disabled_toolsets=tuple(
+                        getattr(child, "disabled_toolsets", None) or ()
+                    ),
+                    scope_id=authority.scope_id,
+                    attempt_id=attempt_id,
+                    parent_attempt_id=getattr(
+                        parent_agent, "_delegation_attempt_id", None
+                    ),
+                )
+                protected_authority_by_logical_id[logical_id] = serialized_authority
+                _delegation_scope.log_delegation_authority_event(
+                    "attempt_prepared", serialized_authority
+                )
+        except Exception as exc:
+            protected_attempt_registry.rollback(reserved_ids)
+            for _i, _t, child in children:
+                try:
+                    child.close()
+                except Exception:
+                    pass
+            return tool_error(f"protected attempt registration failed: {exc}")
+
+        # Only now may protected invocation transcripts become durable. Every
+        # child and physical authority exists, so any earlier failure remains
+        # side-effect free and cannot leave a partially visible batch.
+        live_deleg_id, live_writers, live_paths = create_live_transcripts(
+            task_list, context
+        )
+        for i, _t, child in children:
+            writer = live_writers[i] if i < len(live_writers) else None
+            if writer is not None:
+                child.tool_progress_callback = wrap_progress_callback(
+                    getattr(child, "tool_progress_callback", None), writer
+                )
+                child._live_transcript_path = str(writer.path)
 
     def _execute_and_aggregate() -> dict:
         """Run all built children (1 or N), join on them, aggregate results,
@@ -3305,6 +3623,11 @@ def delegate_task(
         results block. That is the contract: fan-out runs in the background,
         waits on each other, and returns together.
         """
+        if protected_attempt_registry is not None:
+            for attempt_id in protected_attempt_ids.values():
+                authority = protected_attempt_registry.get(attempt_id)
+                if authority is not None and authority.state == "starting":
+                    protected_attempt_registry.activate(attempt_id)
         if n_tasks == 1:
             # Single task -- run directly (no thread pool overhead)
             _i, _t, child = children[0]
@@ -3668,7 +3991,13 @@ def delegate_task(
                 except Exception:
                     pass
 
+        dispatch_delegation_id = live_deleg_id
+        if protected_attempt_ids and not dispatch_delegation_id:
+            dispatch_delegation_id = f"deleg_{uuid.uuid4().hex}"
+
         def _bind_batch_attempts(run_id: str, attempt_ids: Dict[str, str]) -> None:
+            if protected_attempt_ids and attempt_ids != protected_attempt_ids:
+                raise RuntimeError("durable attempt mapping does not match protected authority")
             for _c in _child_agents:
                 _sid = getattr(_c, "_subagent_id", None)
                 if not isinstance(_sid, str) or _sid not in attempt_ids:
@@ -3676,6 +4005,12 @@ def delegate_task(
                 _attempt_id = attempt_ids[_sid]
                 _c._delegation_run_id = run_id
                 _c._delegation_attempt_id = _attempt_id
+                if protected_attempt_registry is not None:
+                    protected_attempt_registry.activate(
+                        _attempt_id,
+                        delegation_id=dispatch_delegation_id,
+                        run_id=run_id,
+                    )
                 session_ref = getattr(_c, "_delegation_session_ref", None)
                 if isinstance(session_ref, dict):
                     session_ref["run_id"] = run_id
@@ -3699,10 +4034,18 @@ def delegate_task(
                 for child in _child_agents
                 if isinstance(getattr(child, "_subagent_id", None), str)
             ],
+            attempt_ids_by_logical_id=(
+                dict(protected_attempt_ids) if protected_attempt_ids else None
+            ),
+            authority_by_logical_id=(
+                dict(protected_authority_by_logical_id)
+                if protected_authority_by_logical_id
+                else None
+            ),
             max_async_children=_get_max_async_children(),
             # Reuse the live-transcript directory's id (when created) so the
             # returned delegation_id matches cache/delegation/live/<id>/.
-            delegation_id=live_deleg_id,
+            delegation_id=dispatch_delegation_id,
             _bind_attempts=_bind_batch_attempts,
         )
 
@@ -3738,6 +4081,18 @@ def delegate_task(
                     "a child work while it runs."
                 )
             return json.dumps(payload, ensure_ascii=False)
+
+        if protected_attempt_registry is not None and dispatch.get("reason") == "dispatch_setup_failed":
+            protected_attempt_registry.rollback(list(protected_attempt_ids.values()))
+            for _child in _child_agents:
+                try:
+                    _child.close()
+                except Exception:
+                    pass
+            return tool_error(
+                "Protected delegation could not be established atomically: "
+                f"{dispatch.get('error', 'durable dispatch setup failed')}"
+            )
 
         # Pool at capacity / schedule failure — children are still attached
         # (we detach above only on the parent list, but the async unit was
@@ -4205,7 +4560,7 @@ def _build_dynamic_schema_overrides() -> dict:
     }
 
 
-DELEGATE_TASK_SCHEMA = {
+DELEGATE_TASK_SCHEMA: Dict[str, Any] = {
     "name": "delegate_task",
     # NOTE: description / tasks.description / role.description are placeholder
     # values. The real text is generated per get_definitions() call by
@@ -4238,6 +4593,27 @@ DELEGATE_TASK_SCHEMA = {
                     "error messages, project structure, constraints. The more "
                     "specific you are, the better the subagent performs."
                 ),
+            },
+            "profile": {
+                "type": "string",
+                "description": "Execution profile selected from the profiles admitted for this agent.",
+            },
+            "workdir": {
+                "type": "string",
+                "description": "Canonical absolute working directory inside the selected execution profile.",
+            },
+            "reveal": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string"},
+                        "mode": {"type": "string", "enum": ["ro", "rw"]},
+                    },
+                    "required": ["path", "mode"],
+                    "additionalProperties": False,
+                },
+                "description": "Visible objects explicitly requested from the parent/session ceiling.",
             },
             "model": {
                 "type": "string",
@@ -4364,6 +4740,9 @@ registry.register(
         model=args.get("model"),
         provider=args.get("provider"),
         reasoning_effort=args.get("reasoning_effort"),
+        profile=args.get("profile"),
+        workdir=args.get("workdir"),
+        reveal=args.get("reveal"),
         background=_model_background_value(args, kw.get("parent_agent")),
         parent_agent=kw.get("parent_agent"),
     ),

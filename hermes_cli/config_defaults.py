@@ -1871,6 +1871,13 @@ DEFAULT_CONFIG = {
         # extras" without silently stripping MCP tools the parent already has.
         # Set to false for strict intersection.
         "inherit_mcp_toolsets": True,
+        # Operator-owned protected delegation profiles. Disabled unless the
+        # operator explicitly enables a named profile.
+        "filesystem_isolation": {
+            "enabled": False,
+            "allowed_profiles": [],
+            "profiles": {},
+        },
         "max_iterations": 250,  # per-subagent iteration cap (each subagent gets its own budget,
                                # independent of the parent's max_iterations)
         # Subagent summaries return to the parent's context verbatim. A batch

@@ -1,0 +1,466 @@
+# Delegation Profile Filesystem Isolation — Design Plan
+
+Date: 2026-08-10  
+Status: Revised after strict design review; pending final verification  
+Scope: Product and runtime contract; not an implementation plan
+
+## 1. Decision summary
+
+Hermes should retain the existing model-orchestrated `delegate_task` workflow and add an optional, named **execution profile** that places each delegated child attempt in a dedicated container with an explicit filesystem view.
+
+For ordinary Hermes sessions, omitting the profile preserves the current shared delegation environment.
+
+For protected archive-inspection sessions, trusted session configuration supplies an allowlist of execution profiles and disables the ordinary unprofiled/default delegation mode. The orchestrator remains free to choose among the allowed profiles and continues to provide normal free-form goals, context, evidence packets, feedback, steering, and resumes. The profile constrains the child’s technical execution environment; it does not replace the UI investigation skill or move orchestration decisions into a rigid server workflow.
+
+The first contract is deliberately narrow:
+
+- prevent delegated children from independently reading filesystem material that was not mounted into their container;
+- prevent protected runs from reaching Hermes credentials, Hermes source, the host home directory, unrelated archives, or sibling lane workspaces through governed filesystem tools;
+- preserve current orchestration and evidence-routing behavior;
+- support a browser-ready profile for Playwright and visual analysis;
+- keep existing delegation behavior unchanged when no protected session policy is active.
+
+## 2. Objective
+
+### 2.1 Archive inspection
+
+An inspection run launched by the UI archive server should be able to inspect its authorized archive material, use its normal approved MCP services, produce writable scratch/output artifacts, run browser tasks when needed, and invoke visual analysis. It has no legitimate reason to read Hermes credentials, Hermes source code, the host home directory, unrelated archives, or another inspection run.
+
+### 2.2 UI investigation knowledge lanes
+
+A source-blind builder, reviewer, comparator, or other bounded worker should be technically unable to search sibling or source-aware filesystem lanes merely because a model forgets or disobeys a prompt restriction. The orchestrator still owns packet construction and routing under the existing UI investigation skill.
+
+The desired guarantee is:
+
+> A delegated child cannot autonomously retrieve local filesystem material outside the mounts and container-local state granted to its selected execution profile and invocation.
+
+It is not a guarantee that a trusted orchestrator cannot communicate information to its own child through the goal, context, or an authorized packet.
+
+## 3. Authority and threat model
+
+### 3.1 Actors
+
+- **Archive server:** trusted caller that admits a protected inspection session and selects its session-level delegation policy.
+- **Orchestrator:** model-driven coordinator that retains normal `delegate_task` behavior inside the admitted policy.
+- **Delegated child:** potentially less reliable model whose filesystem exploration must be technically bounded.
+- **Hermes runtime:** trusted enforcement layer that resolves profiles, validates mounts, routes governed tools, and owns container lifecycle.
+- **Container runtime:** operating-system isolation mechanism.
+
+### 3.2 In-scope failures
+
+- A child recursively searches a parent or sibling directory.
+- A child uses an absolute path outside its assigned workspace.
+- A child’s terminal, file tool, or code execution reaches the shared default container.
+- An implicit credential, cache, current-working-directory, global-volume, or host-home mount makes forbidden files visible despite the explicit mount list.
+- Parallel child lanes see each other’s ephemeral files or shared workspace by default.
+- A protected-session child omits the profile and falls back to ordinary shared delegation.
+- A resumed or reconstructed child silently loses its original profile boundary.
+- Playwright screenshots exist only inside the child container and cannot be analyzed or preserved as intended.
+
+### 3.3 Explicitly out of scope
+
+This design does not attempt to defend against a malicious orchestrator that deliberately places prohibited facts in a child’s prompt or authorized packet. It does not replace existing skill rules for semantic sanitization, contamination handling, evidence freezing, source-blind feedback, or worker reuse.
+
+Also out of scope:
+
+- server-owned child prompts;
+- banning or replacing `delegate_task`;
+- a hard-coded workflow-transition state machine;
+- prohibiting ordinary free-form goal/context fields;
+- prohibiting orchestrator-created or orchestrator-routed packets;
+- automatic semantic leakage detection;
+- general outbound-network denial;
+- general MCP authorization redesign;
+- changing the existing steer/resume protocol beyond retaining the selected execution boundary;
+- erasing model pretraining or recognition of visible identities;
+- running the entire child Hermes process inside the container;
+- treating model/provider allowlists as security controls;
+- changing ordinary delegation defaults outside protected sessions.
+
+### 3.4 Boundary qualification
+
+This is a **filesystem-complete tool boundary**, not whole-agent process isolation. Every child tool that can directly read or write a local path must either resolve through the same child container or be excluded from the filesystem-isolation claim.
+
+MCP services remain independent capability channels. An MCP that can read host files can disclose those files regardless of the child container. Approved MCPs may remain available normally, but the isolation claim covers an MCP only when that MCP’s own authority does not expose prohibited host filesystem material.
+
+## 4. Core concepts
+
+### 4.1 Execution profile
+
+An execution profile is a server/operator-owned, named sandbox policy. It is distinct from a Hermes configuration profile.
+
+A profile may define:
+
+- pinned container image or image digest;
+- default container workdir;
+- suppression of implicit mounts and inherited global volumes;
+- permitted host mount roots and maximum access mode;
+- reserved/protected container targets;
+- container persistence policy;
+- resource settings needed by the workload;
+- browser runtime requirements where applicable;
+- network behavior where the profile intentionally differs from the session default;
+- tool-routing requirements needed to keep local-path access inside the boundary.
+
+The orchestrator selects a profile by name. It does not define or mutate the profile.
+
+### 4.2 Session delegation policy
+
+A protected orchestrator session carries trusted, immutable delegation constraints conceptually equivalent to:
+
+```yaml
+delegation_policy:
+  profile_required: true
+  allow_profile_none: false
+  allow_raw_container_spec: false
+  allowed_profiles:
+    - ui-isolated
+    - ui-isolated-playwright
+```
+
+The policy is attached by the trusted archive-server/runtime path, not supplied by model text. It is pinned for the admitted session so later profile-registry changes do not silently widen or alter that run.
+
+An ordinary Hermes session may retain:
+
+```yaml
+delegation_policy:
+  profile_required: false
+  allow_profile_none: true
+```
+
+### 4.3 Protected session base environment
+
+The child-profile allowlist constrains delegation; it does not by itself constrain local-path tools used directly by the parent orchestrator. An archive-server run that claims the **whole inspection session** cannot inspect the host therefore also receives a fixed base execution profile at admission.
+
+That base profile routes the orchestrator's governed local-path tools into an isolated session environment with only the run-level staging roots and approved durable documentation it needs. It excludes Hermes credentials and source, the host home directory, unrelated archives, Docker control endpoints, and other sessions. The orchestrator may construct and route packets freely within those admitted roots.
+
+The delegation policy is then an attenuation of that session ceiling:
+
+```text
+effective child filesystem authority
+  = admitted session roots
+  ∩ selected child profile roots
+  ∩ invocation mount request
+```
+
+Selecting a child profile does not reprofile the already-running orchestrator, and no allowed child profile can grant a host root absent from the admitted session ceiling. If a deployment constrains only delegated children and does not assign a base environment to the parent, it may claim child-lane isolation only—not whole inspection-session host isolation.
+
+### 4.4 Invocation mount request
+
+The orchestrator may continue to select dynamic input and output directories for a child. Mounts use structured objects:
+
+```json
+{
+  "source": "/absolute/server/path",
+  "target": "/absolute/container/path",
+  "mode": "ro"
+}
+```
+
+- `source` is the server/host-side file or directory.
+- `target` is its path inside the child container.
+- `mode` is exactly `ro` or `rw`.
+
+The selected profile and session policy define the maximum filesystem authority. An invocation may select a subset of that authority but cannot exceed it.
+
+### 4.5 Protected host-backed data sources
+
+Some Hermes tools read named server-local stores without accepting an arbitrary path—for example skill stores, session history, or shared media caches. Container mounts do not constrain those tools, so protected profiles must classify them explicitly rather than treating them as ordinary container-routed tools.
+
+For the UI investigation profiles:
+
+- unrestricted session-history search and host-side skill mutation are not part of the child filesystem lane;
+- the existing UI methodology remains usable by preloading its approved skill/document bundle or by allowing read-only skill access only to the specifically admitted bundle;
+- other network and MCP tools remain unchanged unless they independently expose prohibited host-local data;
+- tool-specific stores admitted intentionally are recorded separately from the container mount list.
+
+This is a narrow closure of local retrieval paths. It does not inspect prompt semantics, constrain evidence wording, or replace the orchestrator's packet decisions.
+
+## 5. `delegate_task` contract
+
+### 5.1 Public shape
+
+The existing tool remains. Its protected-session extension is conceptually:
+
+```json
+{
+  "goal": "Build the candidate from the supplied handoff",
+  "context": "Normal standalone assignment text",
+  "profile": "ui-isolated",
+  "workdir": "/workspace",
+  "mounts": [
+    {
+      "source": "/run/ui-inspection/job-123/builder-input",
+      "target": "/input",
+      "mode": "ro"
+    },
+    {
+      "source": "/run/ui-inspection/job-123/builder-workspace",
+      "target": "/workspace",
+      "mode": "rw"
+    }
+  ]
+}
+```
+
+`profile`, `workdir`, and `mounts` apply to the complete invocation. In a batch, the same profile declaration applies to all items, while each child attempt receives a distinct container. Mixed-profile batches use separate `delegate_task` calls.
+
+Hermes validates the invocation-wide profile and complete mount plan before starting any item in a batch. A protected batch is rejected atomically if that shared plan is invalid; it never starts a partial fan-out under an unvalidated or fallback environment.
+
+### 5.2 Ordinary-session behavior
+
+When `profile` is omitted and the session does not require one, Hermes preserves the current shared parent/child delegation environment without behavioral change.
+
+### 5.3 Protected-session behavior
+
+When the session requires a profile:
+
+- `profile` is mandatory;
+- the available model-facing values are the session’s allowed profile names;
+- `none`, `default`, an empty value, omission, and unknown profiles fail closed before child creation;
+- raw image, Docker argument, capability, or unrestricted container specifications are unavailable;
+- the normal `goal`, `context`, single/batch dispatch, steering, and result behavior remain available.
+
+A representative failure is:
+
+```text
+delegate_task: profile is required in this session. Unprofiled/default delegation is disabled. Choose one of: ui-isolated, ui-isolated-playwright.
+```
+
+The displayed schema is guidance; the runtime enforces the same rule independently.
+
+### 5.4 Mount validation contract
+
+Before a child container exists, Hermes validates that:
+
+- `source` is absolute, exists, and resolves canonically under a host root permitted by the selected profile/session;
+- symlink resolution cannot escape the permitted root;
+- `target` is absolute and normalized;
+- `mode` is `ro` or `rw`;
+- requested `rw` does not exceed the root’s maximum permitted mode;
+- duplicate or conflicting targets are rejected;
+- targets cannot shadow protected container paths;
+- device files, sockets, Docker control endpoints, and other explicitly forbidden source types are rejected;
+- no hidden or automatic mounts are added after validation in strict profiles.
+
+This validation prevents delegation from becoming a route to `/`, the host home directory, Hermes directories, credential stores, or the Docker socket while preserving orchestrator-selected directories under the admitted run roots.
+
+### 5.5 Workdir contract
+
+`workdir` is an absolute path inside the child container after mounts are established. It is never interpreted as a host path. It must exist or be validly creatable within the container policy and must not cause an implicit host-current-directory mount.
+
+## 6. Profile semantics
+
+### 6.1 `ui-isolated`
+
+Purpose: general UI investigation and archive-inspection child lane.
+
+Required properties:
+
+- fresh container per child attempt;
+- ephemeral container root;
+- no automatic Hermes credential, source, skill, cache, home, current-directory, persistent-workspace, or global-volume mounts;
+- explicit RO/RW mounts only;
+- container-routed terminal, file, and code-execution paths;
+- only explicitly admitted read-only host-backed data bundles, with session history and host-side mutation absent by default;
+- writable container-local temporary space;
+- deterministic cleanup;
+- session-default network and approved MCP behavior preserved unless separately configured.
+
+### 6.2 `ui-isolated-playwright`
+
+Purpose: the same filesystem boundary with browser execution and screenshot production.
+
+Additional properties:
+
+- pinned Playwright package and matching browser binary;
+- required browser libraries, CA certificates, and deterministic fonts;
+- headless Chromium by default;
+- approximately 2 CPU, 4 GiB memory, 1 GiB shared memory, and a browser-suitable PID ceiling as an operator-tunable baseline;
+- explicit artifact/output mount when screenshots, traces, downloads, or video must survive cleanup;
+- full Chromium, Xvfb, and optional display transport only when a separately selected headed workload requires them;
+- no Docker socket, privileged mode, or host IPC requirement.
+
+Playwright may run directly through the containerized terminal. A screenshot written to a container path must remain readable by `vision_analyze` through the same task environment. If an MCP-based Playwright service runs outside the container, its authority is reported separately and is not misrepresented as container-contained.
+
+### 6.3 Profile count
+
+The initial design uses the smallest useful profile set: one general isolated profile and one browser-ready variant. UI roles do not automatically require separate profiles when different explicit mounts provide the needed filesystem lanes. Additional profiles require an actual difference in execution policy, not merely a role name.
+
+## 7. Runtime and lifecycle behavior
+
+### 7.1 Isolation unit
+
+Each single child attempt receives a fresh container. Each child in a batch receives a different container even though the invocation-wide profile declaration is shared.
+
+A deliberately shared RW host mount remains shared state; separate containers do not change that fact.
+
+### 7.2 Persistence and resume
+
+The durable record stores the resolved declarative profile identity/hash, workdir, and validated mount specification—not an ephemeral container ID.
+
+A resumed child:
+
+- retains the same profile and mount declaration;
+- receives a fresh container;
+- sees only state preserved through explicit RW mounts;
+- cannot switch profile or add authority as part of resume.
+
+Normal conversational continuity and existing skill-defined worker reuse remain unchanged.
+
+### 7.3 Attempt authorization state
+
+A protected physical attempt has an authorization state independent of whether its container routing entry currently exists:
+
+```text
+starting → active → revoked → cleaned
+```
+
+Every governed tool dispatch checks that state. A revoked, cleaned, unknown-protected, or profile-missing attempt fails closed; it never falls back to the ordinary shared/default environment.
+
+Timeout and interruption revoke the attempt before resource teardown. Because a blocked worker thread may outlive the reported timeout, the runtime retains a denial tombstone after cleanup for as long as a late call can still arrive. Removing mutable environment routing is not equivalent to restoring ordinary authority.
+
+### 7.4 Cleanup and resource ownership
+
+One physical attempt ID owns its complete resource ledger, including:
+
+- container and environment routing;
+- background processes;
+- browser sessions;
+- file-operation environment/cache and cwd state;
+- mount grants and attached visual-evidence grants;
+- creation locks and other attempt-scoped runtime records.
+
+The owner removes or revokes those resources on:
+
+- successful completion;
+- child exception;
+- cancellation or interruption;
+- timeout;
+- partial startup failure;
+- parent shutdown cleanup.
+
+An ephemeral profile disables both persistent container filesystem reuse and cross-process container reuse. Teardown force-removes the attempt container when normal cleanup can run. Cleanup is idempotent, keyed by the physical attempt ID used for tool routing rather than the child's conversational/session identity, and removes only resources owned by that attempt. It must not collapse back to or delete the ordinary shared environment.
+
+Uncatchable host death can leave an orphan resource despite these normal-path guarantees. Protected resources therefore carry attempt ownership labels suitable for bounded orphan recovery, without making them reusable by a later attempt.
+
+### 7.5 Tool consistency
+
+All governed local-path tools for a child must resolve the same effective environment, workdir, and mounts regardless of which tool creates the environment first. A terminal-isolated child whose file tool still reads the host does not satisfy this design.
+
+Structured-document support is part of the same rule. Notebook, Word, and spreadsheet extraction must consume bytes obtained through the attempt's environment or an attempt-owned temporary copy; a container-style path must never be opened directly by a host-side parser.
+
+`vision_analyze` may receive a container path and resolve its bytes through the task-specific environment. Images that must remain available after container cleanup must be written to an explicit RW artifact mount.
+
+A protected attempt may read host-cached visual bytes only through an exact attempt-scoped evidence grant. General membership in a shared Hermes media-cache directory is not authorization. Ordinary sessions may preserve their current broad cache behavior.
+
+## 8. Preservation of the existing UI investigation skill
+
+This design intentionally does not alter the orchestrator’s methodological authority. The orchestrator may continue to:
+
+- write standalone free-form child assignments;
+- construct and audit source-aware or source-blind packets;
+- choose which authorized folders to mount;
+- route complete reviewer evidence and bounded feedback;
+- steer active workers and resume persistent workers;
+- decide when contamination has occurred;
+- preserve rejected evidence and truthful workflow status;
+- use existing repair budgets, review authority, and archive publication rules.
+
+If an orchestrator passes prohibited information through text or mounts a semantically incorrect but technically authorized packet, existing workflow contamination rules apply. The runtime does not attempt to replace those rules with a new policy engine.
+
+The profile changes one fact only: a child can no longer independently traverse the host filesystem beyond its effective mounts merely because the model disregards or forgets a folder restriction.
+
+## 9. MCP, browser, and external capability boundary
+
+MCP services remain available according to the admitted Hermes session and selected profile. The design does not add a general MCP policy system.
+
+The effective-access report must distinguish:
+
+- container-routed filesystem authority;
+- host- or network-side MCP authority;
+- browser authority and location;
+- network access.
+
+An MCP that exposes broad host filesystem reads is incompatible with a claim that the child can access only mounted files unless the MCP is independently constrained. This is an audit requirement, not a reason to disable unrelated MCPs.
+
+For Playwright:
+
+- direct Playwright inside `ui-isolated-playwright` is container-contained;
+- a task-scoped MCP inside that container may later provide equivalent containment;
+- an existing host-global Playwright MCP remains usable if intentionally allowed, but its browser process is outside this filesystem boundary and must be labeled as such.
+
+## 10. Effective configuration and observability
+
+For each profiled child, Hermes records enough non-secret information to audit the boundary:
+
+- selected profile name and pinned profile hash;
+- container image digest when available;
+- resolved workdir;
+- effective mounts with `source`, `target`, and `mode`;
+- implicit-mount suppression status;
+- admitted host-backed data bundles and exact visual-evidence grants;
+- attempt authorization state and revocation outcome;
+- environment/attempt owner identity;
+- browser mode where applicable;
+- MCP/browser location qualification where applicable;
+- creation and cleanup outcome.
+
+Credentials remain redacted. Paths and ordinary operational details are preserved rather than replaced by generic status.
+
+This record supports a truthful distinction between:
+
+- **enforced filesystem lane:** prohibited local paths were absent from the child’s governed execution environment;
+- **instruction-only lane:** technical paths or external tools still exposed prohibited material;
+- **workflow contamination:** the orchestrator or an authorized packet supplied prohibited semantics despite the filesystem boundary.
+
+## 11. Design acceptance conditions
+
+The design is acceptable when all of the following are true:
+
+1. Ordinary `delegate_task` calls without a profile retain current shared behavior outside protected sessions.
+2. A protected session cannot use unprofiled/default delegation or a profile outside its pinned allowlist.
+3. A whole-session isolation claim requires an admitted base environment for the parent orchestrator; otherwise the claim is explicitly child-only.
+4. The orchestrator retains ordinary goals, context, packet construction, steering, resume, and evidence-routing behavior.
+5. Every child attempt receives its own container and ephemeral root.
+6. A child can read only explicit mounts, container-local files, and specifically admitted host-backed bundles through every governed local retrieval path.
+7. No implicit Hermes credential, source, home, cache, workspace, or global-volume mount appears in a strict profile.
+8. Unrestricted session history, global skill reads/mutation, and cache-wide visual reads cannot bypass the protected attempt boundary; explicitly admitted read-only skill bundles remain usable.
+9. Structured-document extraction reads through the attempt environment rather than opening the host path.
+10. RO mounts reject writes; RW mounts preserve intended outputs.
+11. Sibling containers cannot see each other except through an intentionally shared mount.
+12. Resume reconstructs the same declarative boundary in a fresh container.
+13. Revoked, cleaned, or late protected attempts fail closed and never collapse to the ordinary default environment.
+14. Success, failure, cancellation, timeout, and partial startup clean the attempt-owned resource ledger and force-remove normal-path ephemeral containers.
+15. Playwright can render and save screenshots inside the browser-ready profile, and visual analysis can consume those screenshots before cleanup, from an explicit artifact mount, or through an exact attempt-owned visual grant.
+16. Effective records truthfully distinguish container filesystem access from admitted host-backed stores and external MCP/browser authority.
+17. The design makes no claim to prevent orchestrator-authored semantic leakage, malicious orchestration, model memorization, or access through an independently broad MCP.
+
+## 12. Deferred decisions
+
+These choices are intentionally deferred until implementation planning or concrete deployment binding:
+
+- the profile-registry configuration location and exact serialization format;
+- exact names of the initial profiles;
+- whether allowed host roots are expressed directly or through operator-defined aliases;
+- exact resource defaults for browser workloads on different hosts;
+- whether task-scoped Playwright MCP is needed after direct Playwright proves sufficient;
+- exact approval UX for host bind access outside archive-server-controlled runs;
+- whole-agent container execution;
+- heterogeneous per-item profiles inside one batch.
+
+None of these deferred choices changes the accepted behavioral boundary described above.
+
+## 13. Review brief
+
+A strict design review should judge this document only against the following frozen object:
+
+- it must technically bound child filesystem exploration;
+- it must keep the orchestrator and existing UI investigation skill intact;
+- it must retain `delegate_task` and allow the orchestrator to select among session-approved profiles;
+- it must disable unprofiled/default delegation only in protected sessions;
+- it must preserve ordinary delegation elsewhere;
+- it must not reintroduce malicious-orchestrator defenses, server-owned prompts, rigid workflow state machines, or needless restrictions on evidence routing;
+- it must state honestly what containers do not constrain, especially MCP and host-side browser authority.
+
+Findings that require broader workflow redesign, semantic packet policing, removal of free-form delegation, or a general authorization framework are adjacent proposals, not blockers for this design.

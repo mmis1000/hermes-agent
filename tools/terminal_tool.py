@@ -1386,6 +1386,14 @@ def _resolve_container_task_id(task_id: Optional[str]) -> str:
         return task_id
     if task_id and _docker_session_isolation_enabled():
         return _resolve_container_alias(task_id)
+    _ISOLATION_KEYS = frozenset({
+        "docker_image", "modal_image", "singularity_image",
+        "daytona_image", "env_type", "delegation_scope_id",
+    })
+    if task_id and task_id in _task_env_overrides:
+        overrides = _task_env_overrides[task_id]
+        if set(overrides.keys()) & _ISOLATION_KEYS:
+            return task_id
     return "default"
 
 
@@ -1825,6 +1833,13 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
                 else cc.get("docker_persist_across_processes", True)
             ),
             shm_size=cc.get("docker_shm_size", "1g"),
+            trusted_mounts=cc.get("trusted_mounts"),
+            suppress_implicit_mounts=cc.get("suppress_implicit_mounts", False),
+            shm_mb=cc.get("shm_mb"),
+            pids_limit=cc.get("pids_limit"),
+            delegation_scope_id=cc.get("delegation_scope_id"),
+            delegation_attempt_id=cc.get("delegation_attempt_id"),
+            trusted_mounts_validator=cc.get("trusted_mounts_validator"),
         )
         # Marker read by is_persistent_env(): a session-scoped container
         # survives BETWEEN turns (skip per-turn teardown) but is removed at
@@ -2228,6 +2243,15 @@ def cleanup_vm(task_id: str, *, force_remove: bool = False):
     except ImportError:
         pass
 
+    # Background sessions are attempt-owned resources too.  Kill them even
+    # when environment construction never completed or the container record
+    # has already disappeared.
+    try:
+        from tools.process_registry import process_registry
+        process_registry.kill_all(task_id=task_id)
+    except Exception:
+        logger.warning("Error cleaning processes for task %s", task_id, exc_info=True)
+
     if env is None:
         return
 
@@ -2249,6 +2273,16 @@ def cleanup_vm(task_id: str, *, force_remove: bool = False):
         logger.info("Manually cleaned up environment for task: %s", task_id)
 
     except Exception as e:
+        if force_remove:
+            # Protected attempt cleanup is authoritative: the resource ledger
+            # must observe removal failure and must retain the environment so
+            # a later cleanup pass can retry the same concrete container.
+            with _env_lock:
+                _active_environments.setdefault(task_id, env)
+            logger.warning(
+                "Force-removal failed for task %s: %s", task_id, e, exc_info=True
+            )
+            raise
         error_str = str(e)
         if "404" in error_str or "not found" in error_str.lower():
             logger.info("Environment for task %s already cleaned up", task_id)
@@ -2747,6 +2781,27 @@ def terminal_tool(
                     "error": guidance,
                     "status": "error",
                 }, ensure_ascii=False)
+
+        # All task-aware tools acquire the same environment through this path.
+        # The legacy cache block below remains temporarily as a parity check;
+        # central acquisition has already populated that cache.
+        try:
+            env, env_type, effective_task_id = acquire_task_environment(
+                task_id, timeout=effective_timeout
+            )
+        except ImportError as e:
+            return json.dumps(
+                {
+                    "output": "",
+                    "exit_code": -1,
+                    "error": (
+                        "Terminal tool disabled: environment creation failed "
+                        f"({e})"
+                    ),
+                    "status": "disabled",
+                },
+                ensure_ascii=False,
+            )
 
         # Start cleanup thread
         _start_cleanup_thread()

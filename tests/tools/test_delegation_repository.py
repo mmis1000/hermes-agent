@@ -82,6 +82,261 @@ def _record(delegation_id="deleg-1", roots=None, dispatched_at=10.0):
         "root_subagent_ids": roots,
     }
 
+def test_initial_dispatch_persists_supplied_attempt_mapping_atomically(repo):
+    record = _record("deleg-protected", ["sa-a", "sa-b"])
+    record["attempt_ids_by_logical_id"] = {
+        "sa-a": "attempt-physical-a",
+        "sa-b": "attempt-physical-b",
+    }
+
+    created = repo.register_initial_dispatch(record)
+
+    assert created["status"] == "registered"
+    assert [item["attempt_id"] for item in created["attempts"]] == [
+        "attempt-physical-a",
+        "attempt-physical-b",
+    ]
+    with sqlite3.connect(repo.db_path) as conn:
+        rows = conn.execute(
+            "SELECT attempt_id, logical_id, physical_worker_id "
+            "FROM delegation_attempts ORDER BY logical_id"
+        ).fetchall()
+    assert rows == [
+        ("attempt-physical-a", "sa-a", "attempt-physical-a"),
+        ("attempt-physical-b", "sa-b", "attempt-physical-b"),
+    ]
+
+
+def test_initial_dispatch_persists_authority_inside_immutable_logical_spec(repo):
+    authority = {
+        "version": 1,
+        "profile": {"name": "isolated", "hash": "hash", "snapshot": {}},
+        "state": {"revoked": False, "cleaned": False},
+    }
+    record = _record("deleg-authority", ["sa-root"])
+    record["authority_by_logical_id"] = {"sa-root": authority}
+
+    created = repo.register_initial_dispatch(record)
+    repo.transition_attempt(
+        created["attempts"][0]["attempt_id"],
+        {"starting"},
+        "completed",
+        metadata={"status_observation": "mutable"},
+    )
+
+    with sqlite3.connect(repo.db_path) as conn:
+        raw_spec = conn.execute(
+            "SELECT spec_json FROM delegation_logical_subagents WHERE logical_id=?",
+            ("sa-root",),
+        ).fetchone()[0]
+    assert json.loads(raw_spec)["authority"] == authority
+
+
+def test_external_snapshot_redacts_authority_but_trusted_resume_snapshot_keeps_it(repo):
+    authority = {
+        "version": 1,
+        "profile": {
+            "name": "isolated",
+            "hash": "profile-hash",
+            "snapshot": {
+                "backend": "docker",
+                "image": "image@sha256:abc",
+                "network": "none",
+                "qualified_mcp_servers": [],
+            },
+        },
+        "visible_objects": [
+            {
+                "path": "/workspace/input",
+                "mode": "ro",
+                "object_type": "directory",
+                "backing": {
+                    "object_id": "input",
+                    "kind": "host_path",
+                    "identity": "/host/private/input",
+                    "revision": "rev-1",
+                },
+            }
+        ],
+        "lineage": {
+            "scope_id": "scope-1",
+            "attempt_id": "attempt-authority-view",
+            "parent_attempt_id": None,
+        },
+        "state": {"revoked": False, "cleaned": False},
+    }
+    record = _record("deleg-authority-view", ["sa-authority-view"])
+    record["attempt_ids_by_logical_id"] = {
+        "sa-authority-view": "attempt-authority-view"
+    }
+    record["authority_by_logical_id"] = {"sa-authority-view": authority}
+    repo.register_initial_dispatch(record)
+    repo.transition_attempt(
+        "attempt-authority-view",
+        {"starting"},
+        "completed",
+        metadata={"status": "completed", "exit_reason": "completed"},
+    )
+
+    external_child = repo.snapshot("deleg-authority-view")["children"][
+        "sa-authority-view"
+    ]
+    trusted_child = repo.trusted_snapshot("deleg-authority-view")["children"][
+        "sa-authority-view"
+    ]
+
+    assert "authority" not in external_child
+    assert external_child["authority_audit"]["visible_objects"][0]["backing"][
+        "identity"
+    ] == "[REDACTED]"
+    assert external_child["authority_audit"]["outcome"] == {
+        "creation": "authority_reserved",
+        "cleanup": "succeeded",
+        "execution": "completed",
+    }
+    assert external_child["authority_audit"]["state"] == {
+        "revoked": True,
+        "cleaned": True,
+    }
+    assert trusted_child["authority"]["visible_objects"][0]["backing"][
+        "identity"
+    ] == "/host/private/input"
+    assert trusted_child["authority"]["state"] == {
+        "revoked": False,
+        "cleaned": False,
+    }
+
+
+def test_authority_revocation_tombstone_preserves_immutable_snapshot(repo):
+    authority = {
+        "version": 1,
+        "authority_hash": "immutable-hash",
+        "profile": {"name": "isolated"},
+        "state": {"revoked": False, "cleaned": False},
+    }
+    record = _record("deleg-authority-tombstone", ["sa-authority"])
+    record["attempt_ids_by_logical_id"] = {
+        "sa-authority": "attempt-authority"
+    }
+    record["authority_by_logical_id"] = {"sa-authority": authority}
+    repo.register_initial_dispatch(record)
+
+    outcome = repo.tombstone_logical_authority(
+        "sa-authority", revoked=True, cleaned=True
+    )
+
+    assert outcome == {"status": "tombstoned"}
+    with sqlite3.connect(repo.db_path) as conn:
+        spec = json.loads(
+            conn.execute(
+                "SELECT spec_json FROM delegation_logical_subagents WHERE logical_id = ?",
+                ("sa-authority",),
+            ).fetchone()[0]
+        )
+    assert spec["authority"] == {
+        **authority,
+        "state": {"revoked": True, "cleaned": True},
+    }
+
+
+def test_tombstoned_authority_denies_late_steer_and_interrupt(repo):
+    authority = {
+        "version": 1,
+        "authority_hash": "immutable-hash",
+        "profile": {"name": "isolated"},
+        "state": {"revoked": False, "cleaned": False},
+    }
+    record = _record("deleg-authority-denial", ["sa-authority-denial"])
+    record["attempt_ids_by_logical_id"] = {
+        "sa-authority-denial": "attempt-authority-denial"
+    }
+    record["authority_by_logical_id"] = {
+        "sa-authority-denial": authority
+    }
+    repo.register_initial_dispatch(record)
+    repo.tombstone_logical_authority("sa-authority-denial", revoked=True)
+
+    assert repo.enqueue_steer(
+        "deleg-authority-denial", "sa-authority-denial", "owner", "late"
+    ) == {"status": "authority_revoked"}
+    assert repo.request_interrupt("attempt-authority-denial", "late") == {
+        "status": "authority_revoked"
+    }
+
+
+def test_fresh_resumed_attempt_preserves_immutable_logical_authority(repo):
+    authority = {
+        "version": 1,
+        "authority_hash": "immutable-hash",
+        "lineage": {
+            "scope_id": "scope-original",
+            "attempt_id": "attempt-original",
+            "parent_attempt_id": None,
+        },
+        "state": {"revoked": False, "cleaned": False},
+    }
+    record = _record("deleg-authority-resume", ["sa-authority-resume"])
+    record["attempt_ids_by_logical_id"] = {
+        "sa-authority-resume": "attempt-original"
+    }
+    record["authority_by_logical_id"] = {
+        "sa-authority-resume": authority
+    }
+    repo.register_initial_dispatch(record)
+    repo.transition_attempt("attempt-original", {"starting"}, "completed")
+
+    resumed = repo.reserve_resumed_attempt("sa-authority-resume")
+
+    with sqlite3.connect(repo.db_path) as conn:
+        stored = json.loads(
+            conn.execute(
+                "SELECT spec_json FROM delegation_logical_subagents WHERE logical_id=?",
+                ("sa-authority-resume",),
+            ).fetchone()[0]
+        )["authority"]
+        physical_worker_id = conn.execute(
+            "SELECT physical_worker_id FROM delegation_attempts WHERE attempt_id=?",
+            (resumed["attempt_id"],),
+        ).fetchone()[0]
+    assert resumed["status"] == "reserved"
+    assert resumed["attempt_id"] != "attempt-original"
+    assert physical_worker_id == resumed["attempt_id"]
+    assert stored == authority
+
+
+def test_retry_replacement_and_resume_allocate_fresh_physical_attempt_ids(repo):
+    record = _record("deleg-retry", ["sa-a"])
+    record["attempt_ids_by_logical_id"] = {"sa-a": "attempt-initial"}
+    initial = repo.register_initial_dispatch(record)
+    assert initial["status"] == "registered"
+    assert repo.transition_attempt(
+        "attempt-initial", {"starting"}, "completed"
+    )["status"] == "updated"
+
+    resumed = repo.reserve_resumed_attempt("sa-a")
+    assert resumed["status"] == "reserved"
+    assert repo.transition_attempt(
+        resumed["attempt_id"], {"starting"}, "completed"
+    )["status"] == "updated"
+    replacement = repo.reserve_resumed_attempt("sa-a")
+    assert replacement["status"] == "reserved"
+
+    ids = {"attempt-initial", resumed["attempt_id"], replacement["attempt_id"]}
+    assert len(ids) == 3
+    conn = repo._connect()
+    try:
+        rows = conn.execute(
+            "SELECT attempt_id,physical_worker_id FROM delegation_attempts "
+            "WHERE logical_id=? ORDER BY attempt_number",
+            ("sa-a",),
+        ).fetchall()
+    finally:
+        conn.close()
+    assert {
+        str(row["attempt_id"]): str(row["physical_worker_id"]) for row in rows
+    } == {attempt_id: attempt_id for attempt_id in ids}
+
+
 def test_initial_single_and_batch_shape_preserves_root_order(repo):
     single = repo.register_initial_dispatch(_record())
     batch = repo.register_initial_dispatch(
