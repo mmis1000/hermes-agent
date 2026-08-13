@@ -17,7 +17,7 @@ profile = ExecutionProfile(
     backend="docker",
     image="registry.example/hermes-delegation@sha256:<approved-digest>",
     default_workdir="/workspace",
-    allowed_toolsets={"terminal", "file", "code", "vision"},
+    allowed_toolsets={"terminal", "file", "code_execution", "vision"},
     network="none",
     cpu=1.0,
     memory_mb=512,
@@ -67,7 +67,7 @@ delegation:
         backend: docker
         image: registry.example/hermes-delegation@sha256:<approved-digest>
         default_workdir: /workspace
-        allowed_toolsets: [delegation, terminal, file, code, vision]
+        allowed_toolsets: [delegation, terminal, file, code_execution, vision]
         qualified_mcp_servers: []
         network: none
         cpu: 1.0
