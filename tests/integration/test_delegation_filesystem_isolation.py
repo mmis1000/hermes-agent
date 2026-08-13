@@ -3,6 +3,7 @@
 import asyncio
 import base64
 import json
+import os
 import shutil
 import subprocess
 import tempfile
@@ -28,6 +29,8 @@ from tools.environments.docker import DockerEnvironment
 
 
 def _docker_available():
+    if os.environ.get("HERMES_RUN_OPTIONAL_DOCKER_PROFILE_TESTS") != "1":
+        return False
     if shutil.which("docker") is None:
         return False
     try:
@@ -41,7 +44,13 @@ def _docker_available():
 pytestmark = [
     pytest.mark.integration,
     pytest.mark.docker,
-    pytest.mark.skipif(not _docker_available(), reason="Docker daemon unavailable"),
+    pytest.mark.skipif(
+        not _docker_available(),
+        reason=(
+            "optional Docker profile tests disabled or Docker daemon unavailable; "
+            "set HERMES_RUN_OPTIONAL_DOCKER_PROFILE_TESTS=1 to opt in"
+        ),
+    ),
 ]
 
 
