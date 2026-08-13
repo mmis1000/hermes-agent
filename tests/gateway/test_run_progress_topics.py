@@ -2,6 +2,7 @@
 
 import asyncio
 import importlib
+import json
 import sys
 import time
 import types
@@ -21,6 +22,7 @@ class ProgressCaptureAdapter(BasePlatformAdapter):
         self.sent = []
         self.edits = []
         self.typing = []
+        self._rich_messages_enabled = False
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         return True
@@ -991,6 +993,58 @@ class VerboseAgent:
         }
 
 
+class MarkupVerboseAgent:
+    """Agent whose argument could terminate a rich details/code wrapper."""
+
+    ARG = "</details>```$$ &"
+
+    def __init__(self, **kwargs):
+        self.tool_progress_callback = kwargs.get("tool_progress_callback")
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        self.tool_progress_callback(
+            "tool.started", "execute_code", self.ARG,
+            {"code": self.ARG},
+        )
+        time.sleep(0.35)
+        return {
+            "final_response": "done",
+            "messages": [],
+            "api_calls": 1,
+        }
+
+
+class PreviewVerboseAgent:
+    """Agent with the same short preview used by compact progress labels."""
+
+    PREVIEW = "After every accepted inspection publish the evidence"
+
+    def __init__(self, **kwargs):
+        self.tool_progress_callback = kwargs.get("tool_progress_callback")
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        self.tool_progress_callback(
+            "tool.started",
+            "search_files",
+            self.PREVIEW,
+            {"pattern": self.PREVIEW, "path": "/tmp"},
+        )
+        time.sleep(0.35)
+        return {
+            "final_response": "done",
+            "messages": [],
+            "api_calls": 1,
+        }
+
+
+class MarkdownSummaryVerboseAgent(PreviewVerboseAgent):
+    """Agent whose friendly preview contains Rich Markdown punctuation."""
+
+    PREVIEW = "parse_reasoning_command_args *literal*"
+
+
 async def _run_with_agent(
     monkeypatch,
     tmp_path,
@@ -1006,6 +1060,7 @@ async def _run_with_agent(
     adapter_cls=ProgressCaptureAdapter,
     user_id=None,
     scope_id=None,
+    rich_messages=False,
 ):
     if config_data:
         import yaml
@@ -1021,6 +1076,7 @@ async def _run_with_agent(
     monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
 
     adapter = adapter_cls(platform=platform)
+    adapter._rich_messages_enabled = rich_messages
     runner = _make_runner(adapter)
     gateway_run = importlib.import_module("gateway.run")
     if config_data and "streaming" in config_data:
@@ -1667,6 +1723,168 @@ async def test_verbose_mode_does_not_truncate_args_by_default(monkeypatch, tmp_p
     assert VerboseAgent.LONG_CODE in all_content
 
 
+@pytest.mark.asyncio
+async def test_telegram_verbose_mode_folds_args_as_rich_details(monkeypatch, tmp_path):
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        VerboseAgent,
+        session_id="sess-verbose-telegram-details",
+        config_data={"display": {"tool_progress": "verbose", "tool_preview_length": 0}},
+        rich_messages=True,
+    )
+
+    assert result["final_response"] == "done"
+    all_content = "\n".join(call["content"] for call in adapter.sent)
+    all_content += "\n".join(call["content"] for call in adapter.edits)
+    assert "<details><summary>⚙️ Running code</summary>" in all_content
+    assert "<summary>Arguments</summary>" not in all_content
+    assert "```json\n{\n  \"code\":" in all_content
+    assert VerboseAgent.LONG_CODE in all_content
+    assert "```\n</details>" in all_content
+
+
+@pytest.mark.asyncio
+async def test_telegram_folded_summary_reuses_short_friendly_preview(monkeypatch, tmp_path):
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        PreviewVerboseAgent,
+        session_id="sess-verbose-telegram-summary-preview",
+        config_data={"display": {"tool_progress": "verbose", "tool_preview_length": 0}},
+        rich_messages=True,
+    )
+
+    assert result["final_response"] == "done"
+    all_content = "\n".join(call["content"] for call in adapter.sent)
+    all_content += "\n".join(call["content"] for call in adapter.edits)
+    assert "<summary>" in all_content
+    assert "Searching files for After every accepted" in all_content
+    assert "...</summary>" in all_content
+    assert "<summary>⚙️ search_files" not in all_content
+
+
+@pytest.mark.asyncio
+async def test_telegram_folded_summary_renders_markdown_punctuation_literally(monkeypatch, tmp_path):
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        MarkdownSummaryVerboseAgent,
+        session_id="sess-verbose-telegram-summary-markdown",
+        config_data={"display": {"tool_progress": "verbose", "tool_preview_length": 0}},
+        rich_messages=True,
+    )
+
+    assert result["final_response"] == "done"
+    all_content = "\n".join(call["content"] for call in adapter.sent)
+    all_content += "\n".join(call["content"] for call in adapter.edits)
+    summary = all_content.split("<summary>", 1)[1].split("</summary>", 1)[0]
+    assert "parse&#95;reasoning&#95;command&#95;args" in summary
+    assert "&#42;literal&#42;" in summary
+
+
+@pytest.mark.asyncio
+async def test_telegram_verbose_details_losslessly_escape_markup_like_args(monkeypatch, tmp_path):
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        MarkupVerboseAgent,
+        session_id="sess-verbose-telegram-details-escaping",
+        config_data={"display": {"tool_progress": "verbose", "tool_preview_length": 0}},
+        rich_messages=True,
+    )
+
+    assert result["final_response"] == "done"
+    all_content = "\n".join(call["content"] for call in adapter.sent)
+    all_content += "\n".join(call["content"] for call in adapter.edits)
+    assert MarkupVerboseAgent.ARG not in all_content
+    assert r"\u003c/details\u003e" in all_content
+    assert r"\u0060\u0060\u0060" in all_content
+    assert r"\u0024\u0024" in all_content
+    assert r"\u0026" in all_content
+    encoded_args = all_content.split("```json\n", 1)[1].split("\n```", 1)[0]
+    assert json.loads(encoded_args)["code"] == MarkupVerboseAgent.ARG
+
+
+@pytest.mark.asyncio
+async def test_non_telegram_verbose_mode_keeps_plain_arguments(monkeypatch, tmp_path):
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        VerboseAgent,
+        session_id="sess-verbose-discord-plain",
+        config_data={"display": {"tool_progress": "verbose", "tool_preview_length": 0}},
+        platform=Platform.DISCORD,
+    )
+
+    assert result["final_response"] == "done"
+    all_content = "\n".join(call["content"] for call in adapter.sent)
+    all_content += "\n".join(call["content"] for call in adapter.edits)
+    assert "<details>" not in all_content
+    assert "```json" not in all_content
+    assert VerboseAgent.LONG_CODE in all_content
+
+
+@pytest.mark.asyncio
+async def test_non_telegram_verbose_mode_respects_explicit_tool_preview_length(monkeypatch, tmp_path):
+    """Non-Telegram verbose output retains the configured preview cap."""
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        VerboseAgent,
+        session_id="sess-verbose-explicit-cap",
+        config_data={"display": {"tool_progress": "verbose", "tool_preview_length": 50}},
+        platform=Platform.DISCORD,
+    )
+
+    assert result["final_response"] == "done"
+    all_content = " ".join(call["content"] for call in adapter.sent)
+    all_content += " ".join(call["content"] for call in adapter.edits)
+    # Should be truncated — full 300-char string NOT present
+    assert VerboseAgent.LONG_CODE not in all_content
+    # But should still contain the truncated portion with "..."
+    assert "..." in all_content
+
+
+@pytest.mark.asyncio
+async def test_telegram_verbose_folded_json_ignores_preview_cap(monkeypatch, tmp_path):
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        VerboseAgent,
+        session_id="sess-verbose-telegram-uncapped",
+        config_data={"display": {"tool_progress": "verbose", "tool_preview_length": 50}},
+        rich_messages=True,
+    )
+
+    assert result["final_response"] == "done"
+    all_content = "\n".join(call["content"] for call in adapter.sent)
+    all_content += "\n".join(call["content"] for call in adapter.edits)
+    assert VerboseAgent.LONG_CODE in all_content
+    assert "```json\n{\n  \"code\":" in all_content
+
+
+@pytest.mark.asyncio
+async def test_telegram_verbose_mode_stays_plain_when_rich_messages_are_disabled(
+    monkeypatch, tmp_path
+):
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        VerboseAgent,
+        session_id="sess-verbose-telegram-rich-disabled",
+        config_data={"display": {"tool_progress": "verbose", "tool_preview_length": 0}},
+        rich_messages=False,
+    )
+
+    assert result["final_response"] == "done"
+    all_content = "\n".join(call["content"] for call in adapter.sent)
+    all_content += "\n".join(call["content"] for call in adapter.edits)
+    assert "<details>" not in all_content
+    assert "<summary>" not in all_content
+    assert VerboseAgent.LONG_CODE in all_content
+
+
 class CodeBlockProgressAdapter(ProgressCaptureAdapter):
     """A markdown-capable progress adapter (declares supports_code_blocks)."""
 
@@ -1688,7 +1906,10 @@ class TerminalCommandAgent:
 
     def run_conversation(self, message, conversation_history=None, task_id=None):
         self.tool_progress_callback(
-            "tool.started", "terminal", self.CMD, {"command": self.CMD}
+            "tool.started",
+            "terminal",
+            self.CMD,
+            {"command": self.CMD, "timeout": 30, "workdir": "/tmp"},
         )
         # Let the async progress task drain the queue and send before returning.
         time.sleep(0.35)
@@ -1751,10 +1972,13 @@ async def test_terminal_progress_renders_fenced_code_block(monkeypatch, tmp_path
 
 
 @pytest.mark.asyncio
-async def test_terminal_progress_verbose_shows_full_command(monkeypatch, tmp_path):
-    """Verbose mode on a markdown-capable gateway renders the FULL multi-line
-    command in a bare fenced block (no truncation, no 'bash' tag).  This is the
-    parity guarantee for #42634: verbose keeps full detail, non-verbose caps."""
+async def test_telegram_terminal_progress_verbose_folds_full_json_arguments(monkeypatch, tmp_path):
+    """Telegram verbose mode renders terminal arguments as folded JSON.
+
+    Other markdown-capable platforms retain the dedicated shell code-block
+    presentation; Telegram uses the rich details path consistently with other
+    tools so arguments are collapsed by default.
+    """
     monkeypatch.setenv("HERMES_TOOL_PROGRESS_MODE", "verbose")
 
     fake_dotenv = types.ModuleType("dotenv")
@@ -1767,6 +1991,7 @@ async def test_terminal_progress_verbose_shows_full_command(monkeypatch, tmp_pat
     import tools.terminal_tool  # noqa: F401 - register terminal emoji
 
     adapter = CodeBlockProgressAdapter(platform=Platform.TELEGRAM)
+    adapter._rich_messages_enabled = True
     runner = _make_runner(adapter)
     gateway_run = importlib.import_module("gateway.run")
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
@@ -1789,11 +2014,18 @@ async def test_terminal_progress_verbose_shows_full_command(monkeypatch, tmp_pat
     )
 
     assert result["final_response"] == "done"
-    all_content = " ".join(call["content"] for call in adapter.sent)
-    all_content += " ".join(call["content"] for call in adapter.edits)
-    assert "```" in all_content
+    all_content = "\n".join(call["content"] for call in adapter.sent)
+    all_content += "\n".join(call["content"] for call in adapter.edits)
+    assert "<details><summary>💻 Running set -euo pipefail" in all_content
+    assert "...</summary>" in all_content
+    assert "<summary>Arguments</summary>" not in all_content
+    assert "```json\n{" in all_content
+    encoded_args = all_content.split("```json\n", 1)[1].split("\n```", 1)[0]
+    assert json.loads(encoded_args) == {"timeout": 30, "workdir": "/tmp"}
+    assert '"command"' not in encoded_args
+    assert "```shell\nset -euo pipefail\nprintf 'node: '; node --version\nnpm install -g hyperframes@latest\n```" in all_content
     assert "```bash" not in all_content
-    # Full command body present — verbose is uncapped.
+    # Full command body remains present losslessly in the raw shell block.
     assert "npm install -g hyperframes@latest" in all_content
     assert "node --version" in all_content
 

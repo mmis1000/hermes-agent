@@ -111,3 +111,120 @@ async def test_explicit_media_tag_still_delivers_post_stream(tmp_path, monkeypat
     assert str(media_file) in images_kwargs["images"][0][0]
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("already_streamed", [False, True])
+async def test_queued_followup_preserves_markdown_attachment(
+    tmp_path, already_streamed
+):
+    """Queued follow-ups must not bypass MEDIA delivery for Markdown files."""
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner._deliver_media_from_response = AsyncMock()
+
+    markdown_path = tmp_path / "report.md"
+    markdown_path.write_text("# Report\n", encoding="utf-8")
+    response = f"Report ready.\n\nMEDIA:{markdown_path}"
+
+    adapter = SimpleNamespace(
+        send=AsyncMock(return_value=SendResult(success=True, message_id="text")),
+    )
+    source = SimpleNamespace(
+        chat_id="-100123",
+        thread_id="777",
+        platform=Platform.TELEGRAM,
+        chat_type="group",
+    )
+    metadata = {"message_thread_id": "777"}
+
+    await runner._deliver_queued_first_response(
+        response,
+        source,
+        adapter,
+        metadata=metadata,
+        event_message_id="456",
+        text_already_delivered=already_streamed,
+    )
+
+    if already_streamed:
+        adapter.send.assert_not_awaited()
+    else:
+        adapter.send.assert_awaited_once()
+
+    runner._deliver_media_from_response.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_queued_followup_delivers_media_when_text_send_raises(tmp_path):
+    """A text-send exception must not prevent queued attachment delivery."""
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner._deliver_media_from_response = AsyncMock()
+
+    markdown_path = tmp_path / "report.md"
+    markdown_path.write_text("# Report\n", encoding="utf-8")
+    response = f"Report ready.\n\nMEDIA:{markdown_path}"
+    adapter = SimpleNamespace(send=AsyncMock(side_effect=RuntimeError("text boom")))
+    source = SimpleNamespace(
+        chat_id="-100123",
+        thread_id="777",
+        platform=Platform.TELEGRAM,
+        chat_type="group",
+    )
+
+    await runner._deliver_queued_first_response(
+        response,
+        source,
+        adapter,
+        metadata={"message_thread_id": "777"},
+        event_message_id="456",
+        text_already_delivered=False,
+    )
+
+    runner._deliver_media_from_response.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_post_stream_markdown_routes_to_document_sender(tmp_path):
+    """The shared MEDIA delivery routine treats .md as a document."""
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner._thread_metadata_for_source = lambda source, anchor=None: {
+        "message_thread_id": source.thread_id,
+    }
+    runner._reply_anchor_for_event = lambda event: None
+
+    markdown_path = tmp_path / "report.md"
+    markdown_path.write_text("# Report\n", encoding="utf-8")
+    adapter = SimpleNamespace(
+        name="telegram",
+        extract_media=BasePlatformAdapter.extract_media,
+        extract_images=BasePlatformAdapter.extract_images,
+        extract_local_files=BasePlatformAdapter.extract_local_files,
+        send_voice=AsyncMock(return_value=SendResult(success=True, message_id="voice")),
+        send_video=AsyncMock(return_value=SendResult(success=True, message_id="video")),
+        send_document=AsyncMock(return_value=SendResult(success=True, message_id="doc")),
+        send_multiple_images=AsyncMock(return_value=SendResult(success=True, message_id="images")),
+    )
+    event = SimpleNamespace(
+        message_id="456",
+        reply_to_message_id=None,
+        source=SimpleNamespace(
+            chat_id="-100123",
+            thread_id="777",
+            platform=Platform.TELEGRAM,
+            chat_type="group",
+        ),
+    )
+
+    await runner._deliver_media_from_response(
+        f"Report ready.\n\nMEDIA:{markdown_path}",
+        event,
+        adapter,
+    )
+
+    adapter.send_document.assert_awaited_once_with(
+        chat_id="-100123",
+        file_path=str(markdown_path),
+        metadata={"message_thread_id": "777"},
+    )
+    adapter.send_voice.assert_not_awaited()
+    adapter.send_video.assert_not_awaited()
+    adapter.send_multiple_images.assert_not_awaited()
+
