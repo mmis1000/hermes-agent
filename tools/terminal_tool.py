@@ -1191,7 +1191,21 @@ def _acquire_env(plan: _ExecPlan, task_id: Optional[str]) -> Any:
     of each creating their own; the cache is re-checked under that lock.
     Raises :class:`_Rejected` with the ``"disabled"`` envelope when creation
     raises ImportError.
+
+    A protected delegation attempt's own commands use its hardened environment
+    (:func:`acquire_protected_environment`); host-local control-plane commands never do.
     """
+    if not plan.effective_task_id.startswith("host-local-"):
+        try:
+            protected = acquire_protected_environment(task_id, timeout=plan.effective_timeout)
+        except ImportError as e:
+            raise _Rejected(_error_json(
+                _redact_terminal_error_text(f"Terminal tool disabled: environment creation failed ({e})"),
+                status="disabled",
+            ))
+        if protected is not None:
+            env, plan.env_type, plan.effective_task_id = protected
+            return env
     _start_cleanup_thread()
     env_type, eff = plan.env_type, plan.effective_task_id
 

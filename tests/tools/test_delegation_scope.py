@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path, PurePosixPath
 import tempfile
 
@@ -22,6 +23,7 @@ from tools.delegation_scope import (
     delegation_authority_audit_view,
     deserialize_delegation_authority,
     execution_profile_hash,
+    format_effective_scope_context,
     parse_execution_profiles,
     resolve_invocation_scope,
     serialize_delegation_authority,
@@ -58,7 +60,9 @@ def _policy(*, required: bool = True, profiles=("isolated",), visible_objects=()
         allow_profile_none=not required,
         allowed_profiles=frozenset(profiles),
         profile_snapshots=snapshots,
-        visible_objects=tuple(visible_objects),
+        visible_objects=(
+            None if visible_objects is None else tuple(visible_objects)
+        ),
         protected_prefixes=("/protected",),
     )
 
@@ -81,6 +85,51 @@ def _record(grant: VisibleObjectGrant, **overrides):
     }
     values.update(overrides)
     return BackingObjectRecord(**values)
+
+
+def test_effective_scope_context_contains_only_agent_visible_filesystem_contract():
+    profile = _profile()
+    writable = _grant("/work/project", AccessMode.RW, object_id="project-object")
+    readonly = VisibleObjectGrant(
+        visible_path="/references/资料`line\nbreak.pdf",
+        mode=AccessMode.RO,
+        backing=BackingObjectRef(
+            "spec-object", "host_path", "/host/private/spec.pdf", "secret-revision"
+        ),
+        object_type="file",
+    )
+    scope = ResolvedInvocationScope(
+        profile_name=profile.name,
+        profile_hash=execution_profile_hash(profile),
+        profile=profile,
+        workdir=PurePosixPath("/work/project"),
+        reveal=(
+            RevealRequest(PurePosixPath("/work/project"), "rw"),
+            RevealRequest(PurePosixPath("/references/资料`line\nbreak.pdf"), "ro"),
+        ),
+        visible_objects=(writable, readonly),
+    )
+
+    context = format_effective_scope_context(scope)
+
+    assert context == (
+        "## Execution filesystem\n"
+        "- Working directory: \"/work/project\"\n"
+        "- Available paths:\n"
+        "  - \"/work/project\" — directory, read-write\n"
+        "  - \"/references/资料`line\\nbreak.pdf\" — file, read-only\n"
+        "- Other host paths are not available in this attempt."
+    )
+    for hidden in (
+        profile.name,
+        execution_profile_hash(profile),
+        profile.image,
+        "project-object",
+        "spec-object",
+        "/host/private/spec.pdf",
+        "secret-revision",
+    ):
+        assert hidden not in context
 
 
 def test_trusted_run_execution_admits_real_directory_as_root_scope(tmp_path):
@@ -709,6 +758,93 @@ def test_reveal_must_match_a_registered_object_in_parent_ceiling():
             None,
             [{"path": "/work/hidden", "mode": "ro"}],
         )
+
+
+def test_unbounded_parent_resolves_valid_host_path_as_bounded_child_scope(tmp_path):
+    selected = tmp_path / "selected"
+    selected.mkdir()
+    registry = BackingObjectRegistry()
+
+    scope = resolve_invocation_scope(
+        _policy(visible_objects=None),
+        "isolated",
+        None,
+        [{"path": str(selected), "mode": "ro"}],
+        backing_registry=registry,
+    )
+
+    assert scope is not None
+    assert scope.visible_objects == (
+        VisibleObjectGrant(
+            visible_path=str(selected),
+            mode=AccessMode.RO,
+            backing=scope.visible_objects[0].backing,
+            object_type="directory",
+        ),
+    )
+    record = registry.get(scope.visible_objects[0].backing.object_id)
+    assert record is not None
+    assert record.backing == scope.visible_objects[0].backing
+    assert record.trusted_host_path is True
+
+
+def test_unbounded_parent_resolves_valid_host_file_as_bounded_child_scope(tmp_path):
+    selected = tmp_path / "selected.txt"
+    selected.write_text("selected", encoding="utf-8")
+    registry = BackingObjectRegistry()
+
+    scope = resolve_invocation_scope(
+        _policy(visible_objects=None),
+        "isolated",
+        None,
+        [{"path": str(selected), "mode": "ro"}],
+        backing_registry=registry,
+    )
+
+    assert scope is not None
+    assert scope.visible_objects[0].object_type == "file"
+    assert registry.get(scope.visible_objects[0].backing.object_id) is not None
+
+
+def test_unbounded_parent_rejects_invalid_host_path(tmp_path):
+    missing = tmp_path / "missing"
+
+    with pytest.raises(ValueError, match="unavailable"):
+        resolve_invocation_scope(
+            _policy(visible_objects=None),
+            "isolated",
+            None,
+            [{"path": str(missing), "mode": "ro"}],
+            backing_registry=BackingObjectRegistry(),
+        )
+
+
+def test_rejected_unbounded_multi_reveal_does_not_publish_partial_backing(tmp_path):
+    selected = tmp_path / "selected"
+    selected.mkdir()
+    missing = tmp_path / "missing"
+    registry = BackingObjectRegistry()
+
+    with pytest.raises(ValueError, match="unavailable"):
+        resolve_invocation_scope(
+            _policy(visible_objects=None),
+            "isolated",
+            None,
+            [
+                {"path": str(selected), "mode": "ro"},
+                {"path": str(missing), "mode": "ro"},
+            ],
+            backing_registry=registry,
+        )
+
+    selected_stat = selected.stat()
+    selected_object_id = "unbounded_host_" + hashlib.sha256(
+        (
+            f"{selected}\0directory\0"
+            f"{selected_stat.st_dev}:{selected_stat.st_ino}"
+        ).encode("utf-8")
+    ).hexdigest()
+    assert registry.get(selected_object_id) is None
 
 
 def test_reveal_cannot_request_rw_over_parent_ro_ceiling():
