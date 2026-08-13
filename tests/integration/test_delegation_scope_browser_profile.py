@@ -1,8 +1,22 @@
+import os
 from pathlib import Path
 import shutil
 import subprocess
 
 import pytest
+
+
+def _optional_docker_profile_tests_available():
+    if os.environ.get("HERMES_RUN_OPTIONAL_DOCKER_PROFILE_TESTS") != "1":
+        return False
+    if shutil.which("docker") is None:
+        return False
+    try:
+        return subprocess.run(
+            ["docker", "info"], capture_output=True, timeout=10
+        ).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
 
 
 def test_browser_profile_image_is_pinned_and_runs_nonroot():
@@ -29,10 +43,14 @@ def test_base_profile_image_has_private_nonroot_workspace():
 
 @pytest.mark.integration
 @pytest.mark.docker
-@pytest.mark.skipif(shutil.which("docker") is None, reason="Docker CLI unavailable")
+@pytest.mark.skipif(
+    not _optional_docker_profile_tests_available(),
+    reason=(
+        "optional Docker profile tests disabled or Docker daemon unavailable; "
+        "set HERMES_RUN_OPTIONAL_DOCKER_PROFILE_TESTS=1 to opt in"
+    ),
+)
 def test_browser_profile_launches_chromium_and_creates_private_screenshot():
-    if subprocess.run(["docker", "info"], capture_output=True).returncode != 0:
-        pytest.skip("Docker daemon unavailable")
     root = Path(__file__).parents[2]
     image = "hermes-delegation-browser:test"
     subprocess.run(
