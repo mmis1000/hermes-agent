@@ -41,6 +41,7 @@ def _docker_available() -> bool:
 
 pytestmark = [
     pytest.mark.integration,
+    pytest.mark.docker,
     pytest.mark.timeout(180),
     pytest.mark.skipif(not _docker_available(), reason="Docker daemon not available"),
 ]

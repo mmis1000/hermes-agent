@@ -477,7 +477,9 @@ def convert_base64_images_to_links(text: str) -> str:
     return out
 
 
-def _store_full_text(url: str, content: str) -> Optional[str]:
+def _store_full_text(
+    url: str, content: str, task_id: Optional[str] = None
+) -> Optional[str]:
     """Write the full extracted page to cache/web and return its absolute path.
 
     The file is mounted read-only into remote backends (Docker/Modal/SSH) via
@@ -488,6 +490,33 @@ def _store_full_text(url: str, content: str) -> Optional[str]:
     try:
         import hashlib
         from urllib.parse import urlparse
+
+        if task_id:
+            from tools.delegation_scope import attempt_scope_registry
+
+            authority = attempt_scope_registry.get(task_id)
+            if authority is not None:
+                from tools.file_tools import _get_file_ops
+
+                host = (urlparse(url).hostname or "page").replace(":", "_")
+                slug = re.sub(r"[^A-Za-z0-9._-]", "-", host)[:60].strip("-") or "page"
+                digest = hashlib.sha256(url.encode("utf-8")).hexdigest()[:10]
+                visible_path = (
+                    authority.invocation_scope.workdir
+                    / ".hermes-web"
+                    / f"{slug}-{digest}.md"
+                )
+                bounded = content
+                if len(bounded) > MAX_STORED_TEXT_CHARS:
+                    bounded = bounded[:MAX_STORED_TEXT_CHARS] + (
+                        f"\n\n[... stored copy truncated at "
+                        f"{MAX_STORED_TEXT_CHARS:,} chars ...]"
+                    )
+                result = _get_file_ops(task_id).write_file(
+                    str(visible_path), bounded
+                )
+                return None if getattr(result, "error", None) else str(visible_path)
+
         from hermes_constants import get_hermes_dir
 
         cache_dir = get_hermes_dir("cache/web", "web_cache")
@@ -524,6 +553,7 @@ def _truncate_with_footer(
     content: str,
     url: str,
     char_limit: int,
+    task_id: Optional[str] = None,
 ) -> tuple[str, bool]:
     """Return (model_text, was_truncated) for one page's clean content.
 
@@ -552,6 +582,8 @@ def _truncate_with_footer(
 
     total = len(content)
     stored_path = _store_full_text(url, content)
+    stored_path = _store_full_text(url, content, task_id=task_id)
+    shown = len(head) + len(tail)
 
     footer_lines = [
         "",
@@ -750,6 +782,7 @@ async def web_extract_tool(
     urls: List[Any],
     format: str = None,
     char_limit: Optional[int] = None,
+    task_id: Optional[str] = None,
 ) -> str:
     """
     Extract content from specific web pages using available extraction API backend.
@@ -996,7 +1029,9 @@ async def web_extract_tool(
             if not raw_content:
                 continue
             clean = convert_base64_images_to_links(raw_content)
-            model_text, truncated = _truncate_with_footer(clean, url, effective_char_limit)
+            model_text, truncated = _truncate_with_footer(
+                clean, url, effective_char_limit, task_id=task_id
+            )
             result["content"] = model_text
             if truncated:
                 debug_call_data["pages_truncated"] += 1
@@ -1235,6 +1270,7 @@ registry.register(
         args.get("urls", [])[:5] if isinstance(args.get("urls"), list) else [],
         "markdown",
         char_limit=args.get("char_limit"),
+        task_id=kw.get("task_id"),
     ),
     check_fn=check_web_api_key,
     requires_env=_web_requires_env(),

@@ -4943,6 +4943,10 @@ _parallel_safe_servers: set = set()
 # name captured at registration time so policy and capability checks never rely
 # on parsing or re-sanitizing the generated name.
 _mcp_tool_server_names: Dict[str, str] = {}
+# Exact config keys captured at registration time. Unlike the sanitized map
+# above, this map is an operator-owned qualification identity and must not
+# collapse distinct server keys such as ``safe-server`` and ``safe_server``.
+_mcp_tool_server_qualifications: Dict[str, str] = {}
 
 # Dedicated event loop running in a background daemon thread.
 _mcp_loop: Optional[asyncio.AbstractEventLoop] = None
@@ -6607,12 +6611,27 @@ def _track_mcp_tool_server(tool_name: str, server_name: str) -> None:
     """Remember the exact raw MCP server that registered *tool_name*."""
     with _lock:
         _mcp_tool_server_names[tool_name] = server_name
+        _mcp_tool_server_names[tool_name] = safe_server_name
+        _mcp_tool_server_qualifications[tool_name] = server_name
+
+
+def get_mcp_tool_server_qualification(tool_name: str) -> Optional[str]:
+    """Return atomically published operator provenance for an MCP tool."""
+
+    from tools.registry import registry
+
+    entry = registry.get_entry(tool_name)
+    if entry is None or not entry.toolset.startswith("mcp-"):
+        return None
+    provenance = entry.operator_provenance
+    return provenance if isinstance(provenance, str) else None
 
 
 def _forget_mcp_tool_server(tool_name: str) -> None:
     """Forget MCP server provenance for a deregistered tool."""
     with _lock:
         _mcp_tool_server_names.pop(tool_name, None)
+        _mcp_tool_server_qualifications.pop(tool_name, None)
 
 
 def _select_utility_schemas(server_name: str, server: MCPServerTask, config: dict) -> List[dict]:
@@ -6712,7 +6731,7 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
     Returns:
         List of registered prefixed tool names.
     """
-    from tools.registry import registry
+    from tools.registry import ToolProvenanceCollisionError, registry
 
     registered_names: List[str] = []
     toolset_name = f"mcp-{name}"
@@ -6770,6 +6789,22 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
                 "check_fn": check_fn,
             }
         )
+        try:
+            registry.register(
+                name=tool_name_prefixed,
+                toolset=toolset_name,
+                schema=schema,
+                handler=_make_tool_handler(name, mcp_tool.name, server.tool_timeout),
+                check_fn=_make_check_fn(name),
+                is_async=False,
+                description=schema["description"],
+                operator_provenance=name,
+            )
+        except ToolProvenanceCollisionError as exc:
+            logger.error("MCP server '%s': %s; skipping tool", name, exc)
+            continue
+        _track_mcp_tool_server(tool_name_prefixed, name)
+        registered_names.append(tool_name_prefixed)
 
     # Generated resource/prompt utility tools share the same namespace as raw
     # MCP tools, so they must participate in the same collision preflight.
@@ -7757,6 +7792,42 @@ def refresh_agent_mcp_tools(
     # half-swap. ``staged_engine_names`` are the context-engine routing names
     # this rebuild actually appended (matching agent_init's dedup-aware add).
     staged_engine_names = _reinject_post_build_tools(agent, new_defs, new_names)
+
+    # Protected children carry an admission-time positive snapshot. Registry
+    # generations, MCP reconnects, plugins, and post-build injectors may narrow
+    # that surface but may never add names that were not classified and pinned
+    # at admission.
+    protected_snapshot = getattr(agent, "_protected_tool_snapshot", None)
+    if protected_snapshot is not None:
+        allowed_names = set(protected_snapshot)
+        qualified_servers = getattr(
+            agent, "_protected_qualified_mcp_servers", frozenset()
+        )
+        expected_mcp_provenance = getattr(
+            agent, "_protected_mcp_tool_provenance", {}
+        )
+
+        def _qualified(item: dict) -> bool:
+            name = item.get("function", {}).get("name")
+            if name not in allowed_names:
+                return False
+            server = get_mcp_tool_server_qualification(name)
+            expected_server = expected_mcp_provenance.get(name)
+            if expected_server is not None:
+                return server == expected_server and server in qualified_servers
+            toolset = registry.get_toolset_for_tool(name) if isinstance(name, str) else None
+            is_mcp = server is not None or bool(
+                isinstance(toolset, str) and toolset.startswith("mcp-")
+            )
+            return not is_mcp or server in qualified_servers
+
+        new_defs = [
+            item for item in new_defs if _qualified(item)
+        ]
+        new_names = {
+            item["function"]["name"] for item in new_defs
+        }
+        staged_engine_names.intersection_update(allowed_names)
 
     # Single atomic read-diff-publish so the returned ``added`` is consistent
     # with what was actually published, even under concurrent callers, and a

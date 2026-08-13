@@ -26,6 +26,7 @@ import re
 import asyncio
 from contextlib import contextmanager
 from contextvars import ContextVar
+import copy
 import logging
 import threading
 import time
@@ -320,11 +321,22 @@ def _clear_tool_defs_cache() -> None:
         _tool_defs_cache.clear()
 
 
+def _delegation_policy_fingerprint(policy: Any) -> tuple | None:
+    """Return only the immutable schema-shaping delegation policy state."""
+    if policy is None:
+        return None
+    return (
+        bool(policy.profile_required),
+        tuple(sorted(policy.allowed_profiles)),
+    )
+
+
 def get_tool_definitions(
     enabled_toolsets: Optional[List[str]] = None,
     disabled_toolsets: Optional[List[str]] = None,
     quiet_mode: bool = False,
     skip_tool_search_assembly: bool = False,
+    delegation_policy: Any = None,
 ) -> List[Dict[str, Any]]:
     """
     Get tool definitions for model API calls with toolset-based filtering.
@@ -353,7 +365,9 @@ def get_tool_definitions(
     # mode, discord action allowlist, etc.) without needing an explicit
     # invalidate hook on every config-writer.
     cache_key = None
-    if quiet_mode:
+    policy_fingerprint = _delegation_policy_fingerprint(delegation_policy)
+    cache_enabled = quiet_mode
+    if cache_enabled:
         try:
             from hermes_cli.config import get_config_path
             cfg_path = get_config_path()
@@ -377,6 +391,16 @@ def get_tool_definitions(
             )
         with _tool_defs_cache_lock:
             cached = _tool_defs_cache.get(cache_key) if cache_key is not None else None
+        cache_key = (
+            frozenset(enabled_toolsets) if enabled_toolsets is not None else None,
+            frozenset(disabled_toolsets) if disabled_toolsets else None,
+            registry._generation,
+            cfg_fp,
+            bool(os.environ.get("HERMES_KANBAN_TASK")),
+            bool(skip_tool_search_assembly),
+            policy_fingerprint,
+        )
+        cached = _tool_defs_cache.get(cache_key)
         if cached is not None:
             # Update _last_resolved_tool_names so downstream callers see
             # consistent state even on a cache hit.
@@ -384,11 +408,13 @@ def get_tool_definitions(
             _last_resolved_tool_names = [t["function"]["name"] for t in cached]
             # Return a shallow copy of the list but share the dict references —
             # schemas are treated as read-only by all known callers.
-            return list(cached)
+            return copy.deepcopy(cached) if delegation_policy is not None else list(cached)
 
     result = _compute_tool_definitions(enabled_toolsets, disabled_toolsets, quiet_mode,
                                        skip_tool_search_assembly=skip_tool_search_assembly)
-    if quiet_mode and cache_key is not None:
+    if delegation_policy is not None:
+        result = _apply_delegation_policy_schema(result, delegation_policy)
+    if cache_enabled:
         # Cache the freshly-computed list, but hand callers a shallow copy so
         # downstream mutations (e.g. run_agent appending memory/LCM tool
         # schemas to self.tools) don't poison the cache. Without this, a
@@ -411,6 +437,41 @@ def get_tool_definitions(
         return list(cached)
     if quiet_mode:
         return list(result)
+        if len(_tool_defs_cache) >= _TOOL_DEFS_CACHE_MAX:
+            _tool_defs_cache.pop(next(iter(_tool_defs_cache)))  # evict oldest
+        _tool_defs_cache[cache_key] = result
+        return copy.deepcopy(result) if delegation_policy is not None else list(result)
+    return result
+
+
+def _apply_delegation_policy_schema(
+    definitions: List[Dict[str, Any]], delegation_policy: Any
+) -> List[Dict[str, Any]]:
+    """Copy and constrain delegate_task without mutating the registry schema."""
+
+    result = list(definitions)
+    for index, definition in enumerate(result):
+        function = definition.get("function", {})
+        if function.get("name") != "delegate_task":
+            continue
+        owned = copy.deepcopy(definition)
+        parameters = owned["function"]["parameters"]
+        parameters["properties"]["profile"]["enum"] = sorted(
+            delegation_policy.allowed_profiles
+        )
+        required = list(parameters.get("required", []))
+        if delegation_policy.profile_required:
+            if "profile" not in required:
+                required.append("profile")
+        else:
+            required = [name for name in required if name != "profile"]
+        if required:
+            parameters["required"] = required
+        else:
+            parameters.pop("required", None)
+        result[index] = owned
+
+        break
     return result
 
 

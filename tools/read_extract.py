@@ -23,6 +23,7 @@ import tempfile
 import threading
 import time
 import zipfile
+from io import BytesIO
 from pathlib import Path
 from typing import Any, Optional
 from xml.etree import ElementTree as ET
@@ -33,6 +34,8 @@ __all__ = [
     "extract_document_bytes",
     "extract_document_text",
     "is_extractable_document",
+    "EXTRACTABLE_EXTENSIONS", "ExtractionError", "extract_document_bytes",
+    "extract_document_text", "is_extractable_document",
 ]
 
 EXTRACTABLE_EXTENSIONS = frozenset({".ipynb", ".docx", ".xlsx"})
@@ -508,6 +511,10 @@ def _extract_notebook(path: str) -> str:
             nb = json.load(fh)
     except (OSError, ValueError, json.JSONDecodeError) as exc:
         raise ExtractionError(f"Not a valid notebook: {exc}") from exc
+    return _render_notebook(nb)
+
+
+def _render_notebook(nb) -> str:
     if not isinstance(nb, dict):
         raise ExtractionError("Notebook root is not an object")
 
@@ -555,7 +562,7 @@ def _zip_xml(zf: zipfile.ZipFile, name: str) -> ET.Element:
         raise ExtractionError(f"Malformed XML in {name}: {exc}") from exc
 
 
-def _extract_docx(path: str) -> str:
+def _extract_docx(path) -> str:
     try:
         with zipfile.ZipFile(path) as zf:
             root = _zip_xml(zf, "word/document.xml")
@@ -581,7 +588,7 @@ def _extract_docx(path: str) -> str:
     return "\n".join(lines).rstrip("\n") + "\n"
 
 
-def _extract_xlsx(path: str) -> str:
+def _extract_xlsx(path) -> str:
     try:
         with zipfile.ZipFile(path) as zf:
             names = set(zf.namelist())

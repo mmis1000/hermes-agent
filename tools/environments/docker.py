@@ -877,16 +877,23 @@ class DockerEnvironment(BaseEnvironment):
         disk: int = 0,
         persistent_filesystem: bool = False,
         task_id: str = "default",
-        volumes: list = None,
+        volumes: list | None = None,
         forward_env: list[str] | None = None,
         env: dict | None = None,
         network: bool = True,
-        host_cwd: Optional[str] = None,
+        host_cwd: str | None = None,
         auto_mount_cwd: bool = False,
         run_as_host_user: bool = False,
-        extra_args: list = None,
+        extra_args: list | None = None,
         persist_across_processes: bool = True,
         shm_size: str = _DEFAULT_SHM_SIZE,
+        trusted_mounts: list[dict] | None = None,
+        suppress_implicit_mounts: bool = False,
+        shm_mb: int | None = None,
+        pids_limit: int | None = None,
+        delegation_scope_id: str | None = None,
+        delegation_attempt_id: str | None = None,
+        trusted_mounts_validator=None,
     ):
         if cwd == "~":
             cwd = "/root"
@@ -901,6 +908,11 @@ class DockerEnvironment(BaseEnvironment):
         self._forward_env = _normalize_forward_env_names(forward_env)
         self._env = _normalize_env_dict(env)
         self._init_unset_passthrough_names: tuple[str, ...] = ()
+        self._suppress_implicit_mounts = bool(suppress_implicit_mounts)
+        self._forward_env = _normalize_forward_env_names(
+            [] if suppress_implicit_mounts else forward_env
+        )
+        self._env = _normalize_env_dict({} if suppress_implicit_mounts else env)
         self._container_id: Optional[str] = None
         self._labels: dict[str, str] = {}
         self._image: str = ""
@@ -933,6 +945,14 @@ class DockerEnvironment(BaseEnvironment):
         shm = str(shm_size or "").strip()
         if shm and shm != "0" and not _extra_args_set_shm_size(extra_args):
             resource_args.extend(["--shm-size", shm])
+            effective_pids = _DEFAULT_PIDS_LIMIT if pids_limit is None else pids_limit
+            if not isinstance(effective_pids, (str, int)) or int(effective_pids) <= 0:
+                raise ValueError("Docker pids_limit must be a positive integer")
+            resource_args.extend(["--pids-limit", str(effective_pids)])
+        if shm_mb is not None:
+            if not isinstance(shm_mb, int) or isinstance(shm_mb, bool) or shm_mb <= 0:
+                raise ValueError("Docker shm_mb must be a positive integer")
+            resource_args.extend(["--shm-size", f"{shm_mb}m"])
         if disk > 0 and sys.platform != "darwin":
             if self._storage_opt_supported():
                 resource_args.extend(["--storage-opt", f"size={disk}m"])
@@ -952,7 +972,7 @@ class DockerEnvironment(BaseEnvironment):
         # User-configured volume mounts (from config.yaml docker_volumes)
         volume_args = []
         workspace_explicitly_mounted = False
-        for vol in (volumes or []):
+        for vol in (() if suppress_implicit_mounts else (volumes or [])):
             if not isinstance(vol, str):
                 logger.warning("Docker volume entry is not a string: %r", vol)
                 continue
@@ -966,9 +986,37 @@ class DockerEnvironment(BaseEnvironment):
             else:
                 logger.warning("Docker volume '%s' missing colon, skipping", vol)
 
+        for mount in trusted_mounts or []:
+            if not isinstance(mount, dict):
+                raise ValueError("trusted Docker mounts must be structured objects")
+            kind = mount.get("kind")
+            source = mount.get("source")
+            target = mount.get("target")
+            mode = mount.get("mode")
+            if kind not in {"host_path", "named_volume"}:
+                raise ValueError("trusted Docker mount kind must be host_path or named_volume")
+            if not isinstance(source, str) or not source or any(
+                marker in source for marker in (",", "\n", "\r")
+            ):
+                raise ValueError("trusted Docker mount source is invalid")
+            if not isinstance(target, str) or not target.startswith("/") or any(
+                marker in target for marker in (",", "\n", "\r")
+            ):
+                raise ValueError("trusted Docker mount target must be an absolute path")
+            if mode not in {"ro", "rw"}:
+                raise ValueError("trusted Docker mount mode must be ro or rw")
+            mount_type = "bind" if kind == "host_path" else "volume"
+            compiled = f"type={mount_type},src={source},dst={target}"
+            if mode == "ro":
+                compiled += ",readonly"
+            volume_args.extend(["--mount", compiled])
+            if target == "/workspace":
+                workspace_explicitly_mounted = True
+
         host_cwd_abs = os.path.abspath(os.path.expanduser(host_cwd)) if host_cwd else ""
         bind_host_cwd = (
-            auto_mount_cwd
+            not suppress_implicit_mounts
+            and auto_mount_cwd
             and bool(host_cwd_abs)
             and os.path.isdir(host_cwd_abs)
             and not workspace_explicitly_mounted
@@ -995,11 +1043,11 @@ class DockerEnvironment(BaseEnvironment):
         else:
             if not bind_host_cwd and not workspace_explicitly_mounted:
                 writable_args.extend([
-                    "--tmpfs", "/workspace:rw,exec,size=10g",
+                    "--tmpfs", "/workspace:rw,exec,nosuid,nodev,mode=1777,size=10g",
                 ])
             writable_args.extend([
-                "--tmpfs", "/home:rw,exec,size=1g",
-                "--tmpfs", "/root:rw,exec,size=1g",
+                "--tmpfs", "/home:rw,exec,nosuid,nodev,mode=1777,size=1g",
+                "--tmpfs", "/root:rw,exec,nosuid,nodev,mode=0700,size=1g",
             ])
 
         if bind_host_cwd:
@@ -1011,11 +1059,16 @@ class DockerEnvironment(BaseEnvironment):
         # Mount credential files (OAuth tokens, etc.) declared by skills.
         # Read-only so the container can authenticate but not modify host creds.
         try:
-            from tools.credential_files import (
-                get_credential_file_mounts,
-                get_skills_directory_mount,
-                get_cache_directory_mounts,
-            )
+            if suppress_implicit_mounts:
+                get_credential_file_mounts = lambda: ()
+                get_skills_directory_mount = lambda: ()
+                get_cache_directory_mounts = lambda: ()
+            else:
+                from tools.credential_files import (
+                    get_credential_file_mounts,
+                    get_skills_directory_mount,
+                    get_cache_directory_mounts,
+                )
 
             for mount_entry in get_credential_file_mounts():
                 src = Path(mount_entry["host_path"])
@@ -1323,7 +1376,7 @@ class DockerEnvironment(BaseEnvironment):
         # User-supplied extra docker run flags (docker_extra_args in config.yaml).
         # Appended last so they can override defaults if needed.
         validated_extra = []
-        for arg in (extra_args or []):
+        for arg in (() if suppress_implicit_mounts else (extra_args or [])):
             if not isinstance(arg, str):
                 logger.warning("Ignoring non-string docker_extra_args entry: %r", arg)
                 continue
@@ -1376,6 +1429,16 @@ class DockerEnvironment(BaseEnvironment):
             "--label", f"hermes-profile={profile_name}",
             "--label", f"{_EGRESS_LABEL_KEY}={egress_label}",
         ]
+        if delegation_scope_id is not None:
+            label_args.extend([
+                "--label",
+                f"hermes-delegation-scope-id={_sanitize_label_value(delegation_scope_id)}",
+            ])
+        if delegation_attempt_id is not None:
+            label_args.extend([
+                "--label",
+                f"hermes-delegation-attempt-id={_sanitize_label_value(delegation_attempt_id)}",
+            ])
         # Save args for container recreation on "No such container" recovery.
         self._image = image
         self._container_name = container_name
@@ -1487,6 +1550,9 @@ class DockerEnvironment(BaseEnvironment):
                 "sleep", "infinity",  # no fixed lifetime — idle reaper handles cleanup
             ]
             logger.debug("Starting container: %s", ' '.join(run_cmd))
+            logger.debug(f"Starting container: {' '.join(run_cmd)}")
+            if trusted_mounts_validator is not None:
+                trusted_mounts_validator()
             try:
                 result = subprocess.run(
                     run_cmd,
@@ -1564,6 +1630,12 @@ class DockerEnvironment(BaseEnvironment):
             passthrough_keys = set(get_all_passthrough())
         except Exception:
             pass
+        if not getattr(self, "_suppress_implicit_mounts", False):
+            try:
+                from tools.env_passthrough import get_all_passthrough
+                passthrough_keys = set(get_all_passthrough())
+            except Exception:
+                pass
         # Explicit docker_forward_env entries are an intentional opt-in and must
         # win over the generic Hermes secret blocklist. Only implicit passthrough
         # keys are filtered. Also strip Hermes-internal dynamic secrets
@@ -2006,24 +2078,51 @@ class DockerEnvironment(BaseEnvironment):
                     logger.warning("docker stop %s timed out / failed: %s", log_id, e)
             if should_remove:
                 try:
-                    subprocess.run(
+                    result = subprocess.run(
                         [docker_exe, "rm", "-f", container_id],
                         capture_output=True, timeout=30,
                         stdin=subprocess.DEVNULL,
                     )
+                    raw_stderr = result.stderr or ""
+                    stderr = (
+                        raw_stderr.decode(errors="replace")
+                        if isinstance(raw_stderr, bytes)
+                        else raw_stderr
+                    )
+                    if result.returncode != 0 and "No such container" not in stderr:
+                        raise RuntimeError(
+                            f"docker rm -f {log_id} failed: {stderr.strip()}"
+                        )
                 except (subprocess.TimeoutExpired, OSError) as e:
                     logger.warning("docker rm -f %s failed: %s", log_id, e)
+                    raise RuntimeError(f"docker rm -f {log_id} failed") from e
 
-        # Daemon thread: doesn't block interpreter exit (atexit returns
-        # promptly), but unlike the old ``Popen(... &)`` shell trick the
-        # Python-level join semantics let the thread actually run to
-        # completion if the interpreter is still alive. atexit registers
-        # ``_atexit_cleanup`` in terminal_tool.py which waits up to ~60s for
-        # outstanding cleanups, so most exits complete the work cleanly.
-        import threading
-        t = threading.Thread(target=_do_cleanup, daemon=True, name=f"hermes-cleanup-{log_id}")
-        t.start()
-        self._cleanup_thread = t
+        if force_remove:
+            # Protected attempt ledgers may only transition to cleaned after
+            # the external resource is concretely gone. docker rm is
+            # synchronous, so execute it inline and propagate failure.
+            _do_cleanup()
+            self._cleanup_thread = None
+        else:
+            def _do_cleanup_async() -> None:
+                try:
+                    _do_cleanup()
+                except Exception:
+                    logger.warning(
+                        "Asynchronous docker cleanup failed for %s",
+                        log_id,
+                        exc_info=True,
+                    )
+
+            # Ordinary cleanup retains its historical non-blocking behavior.
+            import threading
+            t = threading.Thread(
+                target=_do_cleanup_async,
+                daemon=True,
+                name=f"hermes-cleanup-{log_id}",
+            )
+            t.start()
+            self._cleanup_thread = t
         self._container_id = None
 
         # Bind-mount dir teardown only runs when we actually removed the
