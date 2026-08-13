@@ -237,6 +237,7 @@ class TestStartRun:
                     "/v1/runs",
                     json={
                         "input": "hello",
+                        "instructions": "Follow the operator workflow.  \n",
                         "session_id": "client-session",
                         "execution": {
                             "profile": profile.name,
@@ -253,6 +254,13 @@ class TestStartRun:
                     await asyncio.sleep(0.05)
 
         create.assert_called_once()
+        protected_prompt = create.call_args.kwargs["ephemeral_system_prompt"]
+        assert protected_prompt.startswith(
+            "Follow the operator workflow.  \n\n\n## Execution filesystem"
+        )
+        assert f'Working directory: "{repository}"' in protected_prompt
+        assert f'"{repository}" — directory, read-write' in protected_prompt
+        assert "Other host paths are not available in this attempt." in protected_prompt
         assert create.call_args.kwargs["delegation_policy"].visible_objects
         assert root_registry.reserve.call_args.args[0].profile.network == "none"
         mock_agent.run_conversation.assert_called_once()
@@ -264,6 +272,30 @@ class TestStartRun:
         assert {
             item["function"]["name"] for item in mock_agent.tools
         } == expected_tool_names
+
+    @pytest.mark.asyncio
+    async def test_ordinary_start_does_not_add_execution_filesystem_context(self, adapter):
+        mock_agent = MagicMock()
+        mock_agent.run_conversation.return_value = {"final_response": "done"}
+        mock_agent.session_prompt_tokens = 0
+        mock_agent.session_completion_tokens = 0
+        mock_agent.session_total_tokens = 0
+
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent", return_value=mock_agent) as create:
+                response = await cli.post(
+                    "/v1/runs",
+                    json={"input": "hello", "instructions": "Keep this exact"},
+                )
+                assert response.status == 202
+                run_id = (await response.json())["run_id"]
+                for _ in range(20):
+                    if run_id not in adapter._active_run_tasks:
+                        break
+                    await asyncio.sleep(0.05)
+
+        assert create.call_args.kwargs["ephemeral_system_prompt"] == "Keep this exact"
 
     @pytest.mark.asyncio
     async def test_explicit_null_execution_fails_closed_without_allocating_run(

@@ -16,7 +16,21 @@ import threading
 import time
 import types
 import unittest
+from pathlib import PurePosixPath
 from unittest.mock import MagicMock, patch
+
+from agent.delegation_policy import (
+    AccessMode,
+    BackingObjectRef,
+    DelegationSessionPolicy,
+    ExecutionProfile,
+    VisibleObjectGrant,
+)
+from tools.delegation_scope import (
+    RevealRequest,
+    ResolvedInvocationScope,
+    execution_profile_hash,
+)
 
 from tools.delegate_tool import (
     DELEGATE_BLOCKED_TOOLS,
@@ -183,15 +197,58 @@ class TestDelegateRequirements(unittest.TestCase):
         self.assertNotIn("max_spawn_depth", overrides["description"])
 
 class TestChildSystemPrompt(unittest.TestCase):
-    def test_resolved_scope_is_attached_to_constructed_child(self):
+    @staticmethod
+    def _protected_scope():
+        profile = ExecutionProfile(
+            name="isolated",
+            backend="docker",
+            image="example@sha256:abc",
+            default_workdir="/work/project",
+            allowed_toolsets={"terminal", "file"},
+        )
+        grant = VisibleObjectGrant(
+            visible_path="/work/project",
+            mode=AccessMode.RW,
+            backing=BackingObjectRef(
+                "project-object", "host_path", "host-secret", "rev-1"
+            ),
+            object_type="directory",
+        )
+        scope = ResolvedInvocationScope(
+            profile_name=profile.name,
+            profile_hash=execution_profile_hash(profile),
+            profile=profile,
+            workdir=PurePosixPath("/work/project"),
+            reveal=(RevealRequest(PurePosixPath("/work/project"), "rw"),),
+            visible_objects=(grant,),
+        )
+        policy = DelegationSessionPolicy(
+            profile_required=True,
+            allow_profile_none=False,
+            allowed_profiles={profile.name},
+            profile_snapshots={profile.name: profile},
+            visible_objects=(grant,),
+            protected_prefixes=(),
+        )
+        return scope, policy
+
+    def test_goal_only(self):
+        prompt = _build_child_system_prompt("Fix the tests")
+        self.assertIn("Fix the tests", prompt)
+        self.assertIn("YOUR TASK", prompt)
+        self.assertNotIn("CONTEXT", prompt)
+
+    def test_initial_protected_child_prompt_uses_effective_scope_not_parent_cwd(self):
         parent = _make_mock_parent()
-        scope = object()
+        parent.cwd = "/host/operator/repository"
+        scope, policy = self._protected_scope()
+        parent.delegation_policy = policy
+
         with patch("run_agent.AIAgent") as MockAgent:
-            child = MagicMock()
-            MockAgent.return_value = child
-            built = _build_child_agent(
+            MockAgent.return_value = MagicMock()
+            _build_child_agent(
                 task_index=0,
-                goal="Scoped work",
+                goal="Inspect the project",
                 context=None,
                 toolsets=None,
                 model=None,
@@ -200,14 +257,79 @@ class TestChildSystemPrompt(unittest.TestCase):
                 parent_agent=parent,
                 resolved_scope=scope,
             )
-        self.assertIs(built, child)
-        self.assertIs(child.resolved_invocation_scope, scope)
 
-    def test_goal_only(self):
-        prompt = _build_child_system_prompt("Fix the tests")
-        self.assertIn("Fix the tests", prompt)
-        self.assertIn("YOUR TASK", prompt)
-        self.assertNotIn("CONTEXT", prompt)
+        prompt = MockAgent.call_args.kwargs["ephemeral_system_prompt"]
+        self.assertIn("## Execution filesystem", prompt)
+        self.assertIn('Working directory: "/work/project"', prompt)
+        self.assertIn('"/work/project" — directory, read-write', prompt)
+        self.assertNotIn("/host/operator/repository", prompt)
+        self.assertNotIn("host-secret", prompt)
+
+    def test_ordinary_child_prompt_keeps_existing_workspace_behavior(self):
+        parent = _make_mock_parent()
+        with (
+            patch("run_agent.AIAgent") as MockAgent,
+            patch(
+                "tools.delegate_tool._resolve_workspace_hint",
+                return_value="/ordinary/workspace",
+            ),
+        ):
+            MockAgent.return_value = MagicMock()
+            _build_child_agent(
+                task_index=0,
+                goal="Inspect ordinarily",
+                context=None,
+                toolsets=None,
+                model=None,
+                max_iterations=10,
+                task_count=1,
+                parent_agent=parent,
+            )
+
+        prompt = MockAgent.call_args.kwargs["ephemeral_system_prompt"]
+        self.assertIn("WORKSPACE PATH:\n/ordinary/workspace", prompt)
+        self.assertNotIn("## Execution filesystem", prompt)
+
+    def test_nested_protected_child_context_excludes_omitted_parent_sibling(self):
+        parent = _make_mock_parent(depth=1)
+        parent._subagent_id = "parent-child"
+        scope, policy = self._protected_scope()
+        hidden = VisibleObjectGrant(
+            visible_path="/parent-only",
+            mode=AccessMode.RO,
+            backing=BackingObjectRef(
+                "parent-only", "host_path", "parent-secret", "rev-parent"
+            ),
+            object_type="directory",
+        )
+        parent.delegation_policy = DelegationSessionPolicy(
+            profile_required=True,
+            allow_profile_none=False,
+            allowed_profiles=policy.allowed_profiles,
+            profile_snapshots=policy.profile_snapshots,
+            visible_objects=policy.visible_objects + (hidden,),
+            protected_prefixes=(),
+        )
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            MockAgent.return_value = MagicMock()
+            _build_child_agent(
+                task_index=0,
+                goal="Use only the child grant",
+                context=None,
+                toolsets=None,
+                model=None,
+                max_iterations=10,
+                task_count=1,
+                parent_agent=parent,
+                resolved_scope=scope,
+            )
+
+        prompt = MockAgent.call_args.kwargs["ephemeral_system_prompt"]
+        self.assertIn('"/work/project" — directory, read-write', prompt)
+        self.assertNotIn("/parent-only", prompt)
+        self.assertNotIn("parent-secret", prompt)
+        self.assertNotIn("Delegated children receive", prompt)
 
 class TestStripBlockedTools(unittest.TestCase):
     def test_removes_blocked_toolsets(self):
@@ -551,6 +673,61 @@ class TestDelegateTask(unittest.TestCase):
         self.assertNotIn("api_key", encoded)
         self.assertNotIn("base_url", encoded)
         self.assertNotIn("acp_command", encoded)
+
+    def test_resumed_protected_child_prompt_uses_restored_effective_scope(self):
+        scope, policy = TestChildSystemPrompt._protected_scope()
+        parent = _make_mock_parent()
+        parent.delegation_policy = policy
+        metadata = {
+            "model": "test-model",
+            "provider": "openrouter",
+            "max_iterations": 10,
+            "role": "leaf",
+            "depth": 1,
+            "enabled_toolsets": ["terminal"],
+            "disabled_toolsets": [],
+        }
+        credentials = {
+            "model": "test-model",
+            "provider": "openrouter",
+            "base_url": "https://openrouter.ai/api/v1",
+            "api_key": "fresh-key",
+            "api_mode": "chat_completions",
+        }
+
+        with (
+            patch(
+                "tools.delegate_tool._resolve_delegation_credentials",
+                return_value=credentials,
+            ),
+            patch("run_agent.AIAgent") as MockAgent,
+        ):
+            child = MagicMock()
+            child.session_id = "resumed-session"
+            child._session_init_model_config = {}
+            MockAgent.return_value = child
+            build_resumed_child_agent(
+                bundle={"reconstruction_metadata": metadata},
+                logical_id="child-logical-id",
+                goal="continue verification",
+                parent_agent=parent,
+                continuation={
+                    "session_id": "resumed-session",
+                    "parent_session_id": "prior-session",
+                    "delegate_from": "parent-session",
+                },
+                resolved_scope=scope,
+                authority_tools={
+                    "enabled_toolsets": ["terminal"],
+                    "disabled_toolsets": [],
+                },
+            )
+
+        prompt = MockAgent.call_args.kwargs["ephemeral_system_prompt"]
+        self.assertIn('Working directory: "/work/project"', prompt)
+        self.assertIn('"/work/project" — directory, read-write', prompt)
+        self.assertNotIn("host-secret", prompt)
+        self.assertNotIn("Delegated children receive", prompt)
 
     def test_resume_reuses_effective_per_call_model_provider_and_reasoning(self):
         metadata = {

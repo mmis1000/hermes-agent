@@ -95,9 +95,9 @@ These are real gates in current Hermes, but the frozen design already states eac
 
 Exact design authority — **“## 5. `delegate_task` contract” (lines 179-230)**:
 
-> “The existing tool remains. Its protected-session extension is conceptually:” (lines 181-184)  
-> “When `profile` is omitted and the session does not require one, Hermes preserves the current shared parent/child delegation environment without behavioral change.” (lines 210-212)  
-> “`none`, `default`, an empty value, omission, and unknown profiles fail closed before child creation” (line 220)  
+> “The existing tool remains. Its protected-session extension is conceptually:” (lines 181-184)<br>
+> “When `profile` is omitted and the session does not require one, Hermes preserves the current shared parent/child delegation environment without behavioral change.” (lines 210-212)<br>
+> “`none`, `default`, an empty value, omission, and unknown profiles fail closed before child creation” (line 220)<br>
 > “The displayed schema is guidance; the runtime enforces the same rule independently.” (line 230)
 
 Current Hermes has no `profile`, `workdir`, or `mounts` fields in the callable or model schema (`tools/delegate_tool.py` lines 3065-3077 and 4208-4307), and its registry handler forwards only the existing fields (lines 4354-4369). The dynamic schema machinery already exists, but model-facing guidance cannot be the enforcement point. The implementation must carry immutable trusted session policy into both initial and nested/resumed dispatch paths, validate independently of schema display, and preserve the current no-profile behavior outside protected sessions.
@@ -110,9 +110,9 @@ This is not a design omission: lines 210-230 state the required compatibility an
 
 Exact design authority — **“### 5.4 Mount validation contract” (lines 232-246)** and **“### 6.1 `ui-isolated`” (lines 254-268)**:
 
-> “Before a child container exists, Hermes validates that…” (line 234), including canonical permitted roots, symlink containment, RO/RW ceilings, target conflicts, protected targets, forbidden source types, and no hidden mounts (lines 236-244).  
-> “fresh container per child attempt” (line 260)  
-> “no automatic Hermes credential, source, skill, cache, home, current-directory, persistent-workspace, or global-volume mounts” (line 262)  
+> “Before a child container exists, Hermes validates that…” (line 234), including canonical permitted roots, symlink containment, RO/RW ceilings, target conflicts, protected targets, forbidden source types, and no hidden mounts (lines 236-244).<br>
+> “fresh container per child attempt” (line 260)<br>
+> “no automatic Hermes credential, source, skill, cache, home, current-directory, persistent-workspace, or global-volume mounts” (line 262)<br>
 > “container-routed terminal, file, and code-execution paths” (line 264)
 
 Current terminal routing deliberately collapses ordinary child task IDs to `"default"` (`tools/terminal_tool.py` lines 1175-1207 and 2160-2164), and file operations use the same collapse (`tools/file_tools.py` lines 928-955). Current Docker configuration can inherit global volumes, forwarded environment values, persistent filesystems, and cross-process container reuse (`tools/terminal_tool.py` lines 1349-1472 and 1484-1541).
@@ -127,10 +127,10 @@ The design already states this boundary and its compatibility split correctly.
 
 Exact design authority — **“### 4.5 Protected host-backed data sources” (lines 166-177)** and **“### 7.5 Tool consistency” (lines 347-355)**:
 
-> “Container mounts do not constrain those tools, so protected profiles must classify them explicitly rather than treating them as ordinary container-routed tools.” (line 168)  
-> “unrestricted session-history search and host-side skill mutation are not part of the child filesystem lane” (line 172)  
-> “All governed local-path tools for a child must resolve the same effective environment, workdir, and mounts regardless of which tool creates the environment first.” (line 349)  
-> “Notebook, Word, and spreadsheet extraction must consume bytes obtained through the attempt's environment or an attempt-owned temporary copy” (line 351)  
+> “Container mounts do not constrain those tools, so protected profiles must classify them explicitly rather than treating them as ordinary container-routed tools.” (line 168)<br>
+> “unrestricted session-history search and host-side skill mutation are not part of the child filesystem lane” (line 172)<br>
+> “All governed local-path tools for a child must resolve the same effective environment, workdir, and mounts regardless of which tool creates the environment first.” (line 349)<br>
+> “Notebook, Word, and spreadsheet extraction must consume bytes obtained through the attempt's environment or an attempt-owned temporary copy” (line 351)<br>
 > “General membership in a shared Hermes media-cache directory is not authorization.” (line 355)
 
 Current child toolsets can include session search, skill read/mutation, browser/computer-use, web extraction, vision, and plugin/MCP tools (`toolsets.py` lines 29-81; child inheritance in `tools/delegate_tool.py` lines 1657-1723). Session resume/search and skills operate on server-local profile stores. Structured-document extraction currently calls the host parser on the resolved path before creating file operations (`tools/file_tools.py` lines 1128-1148). Vision currently permits broad host reads under shared media-cache roots on non-local backends (`tools/image_source.py` lines 210-259), although non-cache paths already use the active task environment and fail closed when none exists (lines 262-316).
@@ -145,10 +145,10 @@ The design already makes this whole-tool-surface gate explicit and does not mist
 
 Exact design authority — **“### 7.2 Persistence and resume” (lines 298-309)** and **“### 7.3 Attempt authorization state” (lines 311-321)**:
 
-> “The durable record stores the resolved declarative profile identity/hash, workdir, and validated mount specification—not an ephemeral container ID.” (line 300)  
-> A resumed child “retains the same profile and mount declaration,” “receives a fresh container,” and “cannot switch profile or add authority as part of resume.” (lines 302-307)  
-> “A protected physical attempt has an authorization state independent of whether its container routing entry currently exists” (line 313)  
-> “A revoked, cleaned, unknown-protected, or profile-missing attempt fails closed; it never falls back to the ordinary shared/default environment.” (line 319)  
+> “The durable record stores the resolved declarative profile identity/hash, workdir, and validated mount specification—not an ephemeral container ID.” (line 300)<br>
+> A resumed child “retains the same profile and mount declaration,” “receives a fresh container,” and “cannot switch profile or add authority as part of resume.” (lines 302-307)<br>
+> “A protected physical attempt has an authorization state independent of whether its container routing entry currently exists” (line 313)<br>
+> “A revoked, cleaned, unknown-protected, or profile-missing attempt fails closed; it never falls back to the ordinary shared/default environment.” (line 319)<br>
 > “the runtime retains a denial tombstone after cleanup for as long as a late call can still arrive.” (line 321)
 
 Current Hermes already distinguishes stable logical subagents from physical attempt IDs and reserves a new attempt on resume (`tools/delegation_repository.py` lines 180-302). However, current resume metadata does not contain profile or mount declarations (`tools/async_delegation.py` lines 340-414), and reconstruction currently restores model/tool/workdir metadata only (`tools/delegate_tool.py` lines 1398-1537). Current timeout handling can abandon a daemon worker without waiting for it to unwind (`tools/delegate_tool.py` lines 2611-2652 and 2746-2749), making the independent denial state essential.
@@ -163,9 +163,9 @@ The design states this correctly; implementation must now attach the declared bo
 
 Exact design authority — **“### 7.4 Cleanup and resource ownership” (lines 323-345)**:
 
-> “One physical attempt ID owns its complete resource ledger” (line 325), including environment routing, background processes, browser sessions, file cache/cwd, grants, and creation locks (lines 327-332).  
-> Cleanup applies on success, exception, cancellation/interruption, timeout, partial startup failure, and parent shutdown (lines 334-341).  
-> “Cleanup is idempotent, keyed by the physical attempt ID used for tool routing rather than the child's conversational/session identity” (line 343).  
+> “One physical attempt ID owns its complete resource ledger” (line 325), including environment routing, background processes, browser sessions, file cache/cwd, grants, and creation locks (lines 327-332).<br>
+> Cleanup applies on success, exception, cancellation/interruption, timeout, partial startup failure, and parent shutdown (lines 334-341).<br>
+> “Cleanup is idempotent, keyed by the physical attempt ID used for tool routing rather than the child's conversational/session identity” (line 343).<br>
 > Orphans carry attempt ownership labels for bounded recovery and are never reusable (line 345).
 
 Current cleanup is fragmented. Terminal per-turn cleanup deliberately preserves persistent environments (`agent/chat_completion_helpers.py` lines 2155-2180); `cleanup_vm` defaults to honoring persistent reuse, and its source notes that no current caller force-removes (`tools/terminal_tool.py` lines 1788-1853; `tools/environments/docker.py` lines 1355-1359). Background processes and browser resources have separate registries. Child construction and batch startup can also fail after partial allocations.
@@ -180,8 +180,8 @@ This is a direct implementation gate already spelled out by the design, not a re
 
 Exact design authority — **“### 4.3 Protected session base environment” (lines 131-146)**:
 
-> “The child-profile allowlist constrains delegation; it does not by itself constrain local-path tools used directly by the parent orchestrator.” (line 133)  
-> A whole-session claim therefore requires “a fixed base execution profile at admission” (lines 133-135).  
+> “The child-profile allowlist constrains delegation; it does not by itself constrain local-path tools used directly by the parent orchestrator.” (line 133)<br>
+> A whole-session claim therefore requires “a fixed base execution profile at admission” (lines 133-135).<br>
 > “If a deployment constrains only delegated children and does not assign a base environment to the parent, it may claim child-lane isolation only—not whole inspection-session host isolation.” (line 146)
 
 Current Hermes has no archive-server admission seam that pins this base and child attenuation policy. Implementers must bind the parent governed-tool environment before the protected session begins and ensure child mount authority intersects that admitted ceiling. A child-only deployment remains valid if it reports only the narrower child-lane claim.
@@ -194,10 +194,10 @@ The design is technically honest precisely because it does not infer whole-sessi
 
 Exact design authority — **“### 6.2 `ui-isolated-playwright`” (lines 270-284)** and **“## 9. MCP, browser, and external capability boundary” (lines 374-391)**:
 
-> “Playwright may run directly through the containerized terminal.” (line 284)  
-> “If an MCP-based Playwright service runs outside the container, its authority is reported separately and is not misrepresented as container-contained.” (line 284)  
-> The effective-access report distinguishes container filesystem authority, host/network MCP authority, browser authority and location, and network access (lines 378-383).  
-> “An MCP that exposes broad host filesystem reads is incompatible with a claim that the child can access only mounted files unless the MCP is independently constrained.” (line 385)  
+> “Playwright may run directly through the containerized terminal.” (line 284)<br>
+> “If an MCP-based Playwright service runs outside the container, its authority is reported separately and is not misrepresented as container-contained.” (line 284)<br>
+> The effective-access report distinguishes container filesystem authority, host/network MCP authority, browser authority and location, and network access (lines 378-383).<br>
+> “An MCP that exposes broad host filesystem reads is incompatible with a claim that the child can access only mounted files unless the MCP is independently constrained.” (line 385)<br>
 > “an existing host-global Playwright MCP remains usable if intentionally allowed, but its browser process is outside this filesystem boundary and must be labeled as such.” (line 391)
 
 Current vision resolution already accepts a task ID and reads non-cache local paths through the active environment (`tools/vision_tools.py` lines 932-1058 and 1063-1352; `tools/image_source.py` lines 89-145 and 262-316), which is a sound reuse seam. Current children may also inherit built-in browser automation and MCP toolsets. The protected implementation must ensure that any built-in browser/computer-use or MCP capability capable of `file:` navigation, host uploads/downloads, host browser-state inspection, or other local retrieval is either attempt-contained, independently constrained, excluded from the mounted-only claim, or explicitly reported as external authority.
@@ -214,8 +214,8 @@ These are non-blocking clarifications suitable for implementation planning or op
 
 Exact design authority — **“### 5.3 Protected-session behavior” (lines 214-230)** and **“## 11. Design acceptance conditions” (lines 417-437)**:
 
-> In a protected session, `profile` is mandatory and omission/default/unknown values fail closed before child creation (lines 216-220).  
-> “A protected session cannot use unprofiled/default delegation or a profile outside its pinned allowlist.” (line 422)  
+> In a protected session, `profile` is mandatory and omission/default/unknown values fail closed before child creation (lines 216-220).<br>
+> “A protected session cannot use unprofiled/default delegation or a profile outside its pinned allowlist.” (line 422)<br>
 > “The orchestrator retains ordinary goals, context, packet construction, steering, resume, and evidence-routing behavior.” (line 424)
 
 Current Hermes supports `role='orchestrator'` nested delegation. The acceptance language already applies to all delegation in a protected session, so a nested child must not escape by starting an unprofiled grandchild. An implementation plan should say explicitly how the immutable protected policy and admitted ceiling propagate into orchestrator-role children and how a nested invocation names host-side sources or derives mounts from already admitted roots. This is clarification of an existing acceptance condition, not a new contract and not a blocker.
@@ -226,8 +226,8 @@ Current Hermes supports `role='orchestrator'` nested delegation. The acceptance 
 
 Exact design authority — **“### 4.2 Session delegation policy” (lines 107-129)** and **“### 7.2 Persistence and resume” (lines 298-309)**:
 
-> “It is pinned for the admitted session so later profile-registry changes do not silently widen or alter that run.” (line 121)  
-> “The durable record stores the resolved declarative profile identity/hash, workdir, and validated mount specification” (line 300)  
+> “It is pinned for the admitted session so later profile-registry changes do not silently widen or alter that run.” (line 121)<br>
+> “The durable record stores the resolved declarative profile identity/hash, workdir, and validated mount specification” (line 300)<br>
 > Resume retains the same declaration and cannot add authority (lines 302-307).
 
 The contract is sufficient: registry drift may neither silently alter nor widen a resumed run. Implementation planning should choose and document whether the admitted resolved profile is durably snapshotted or resume rejects a hash mismatch until the original definition is available. Either satisfies the frozen contract if it fails closed; the exact serialization is intentionally deferred at lines 439-452.

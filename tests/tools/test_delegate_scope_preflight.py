@@ -5,7 +5,7 @@ from unittest.mock import patch
 from agent.delegation_policy import DelegationSessionPolicy, ExecutionProfile
 from tools.delegate_tool import delegate_task
 from tools.daemon_pool import DaemonThreadPoolExecutor
-from tools.delegation_scope import ResolvedInvocationScope
+from tools.delegation_scope import BackingObjectRegistry, ResolvedInvocationScope
 
 
 def _policy() -> DelegationSessionPolicy:
@@ -78,6 +78,57 @@ def test_invalid_batch_scope_preflight_starts_no_siblings_or_side_effects():
     build_child.assert_not_called()
     submit.assert_not_called()
     dispatch.assert_not_called()
+
+
+def test_unbounded_parent_accepts_concrete_host_limit_through_public_preflight(tmp_path):
+    profile = _policy().profile_snapshots["isolated"]
+    selected = tmp_path / "selected"
+    selected.mkdir()
+    parent = SimpleNamespace(
+        delegation_policy=DelegationSessionPolicy(
+            profile_required=True,
+            allow_profile_none=False,
+            allowed_profiles={"isolated"},
+            profile_snapshots={"isolated": profile},
+            visible_objects=None,
+            protected_prefixes=(),
+        ),
+        delegation_backing_registry=BackingObjectRegistry(),
+        _delegate_depth=0,
+    )
+
+    with patch(
+        "tools.delegate_tool._resolve_delegation_credentials",
+        side_effect=ValueError("credential sentinel after scope preflight"),
+    ) as credentials:
+        result = delegate_task(
+            goal="bounded child",
+            profile="isolated",
+            reveal=[{"path": str(selected), "mode": "ro"}],
+            parent_agent=parent,
+        )
+
+    assert "credential sentinel after scope preflight" in result
+    credentials.assert_called_once()
+
+
+def test_bounded_empty_parent_rejects_concrete_host_limit_through_public_preflight(
+    tmp_path,
+):
+    selected = tmp_path / "selected"
+    selected.mkdir()
+    parent = _parent()
+
+    with patch("tools.delegate_tool._resolve_delegation_credentials") as credentials:
+        result = delegate_task(
+            goal="forbidden child",
+            profile="isolated",
+            reveal=[{"path": str(selected), "mode": "ro"}],
+            parent_agent=parent,
+        )
+
+    assert "outside parent/session ceiling" in result
+    credentials.assert_not_called()
 
 
 def test_valid_batch_resolves_scope_once_and_passes_same_template_to_every_child():

@@ -329,7 +329,7 @@ def _admit_standard_delegation_policy(explicit_policy):
         allow_profile_none=False,
         allowed_profiles=frozenset(raw_allowed),
         profile_snapshots=snapshots,
-        visible_objects=(),
+        visible_objects=None,
         protected_prefixes=(),
     )
 
@@ -683,14 +683,18 @@ def init_agent(
     # Session-static, immutable authority snapshot. It must be installed before
     # tool schemas are built so delegate_task receives an invocation-owned view.
     agent.delegation_policy = _admit_standard_delegation_policy(delegation_policy)
-    # Runtime backing-object lookup used by protected nested delegation. The
-    # parent installs the concrete registry after construction; ordinary agents
-    # retain an explicit None so all construction paths have deterministic state.
-    agent.delegation_backing_registry = None
-    # Filled by delegate_task after pure invocation-scope preflight and before
-    # the child is exposed to routed tools/container setup.
-    agent.resolved_invocation_scope = None
-    agent._delegation_scope = None
+    # Runtime backing-object lookup used by protected nested delegation. An
+    # unbounded standard session owns an initially-empty registry so concrete
+    # child limits can be pinned during invocation-scope resolution.
+    if (
+        agent.delegation_policy is not None
+        and agent.delegation_policy.visible_objects is None
+    ):
+        from tools.delegation_scope import BackingObjectRegistry
+
+        agent.delegation_backing_registry = BackingObjectRegistry()
+    else:
+        agent.delegation_backing_registry = None
     agent.max_iterations = max_iterations
     # Shared iteration budget — parent creates, children inherit.
     # Consumed by every LLM turn across parent + all subagents.
