@@ -2290,23 +2290,7 @@ class TelegramAdapter(BasePlatformAdapter):
             payload["message_thread_id"] = int(thread_id)
         try:
             ok = await self._bot.do_api_request("sendRichMessageDraft", api_kwargs=payload)
-            if self._rich_response_format(ok) == "plain":
-                self._log_message_format_downgrade(
-                    downgrade_origin="telegram_api",
-                    trigger="rich_request_accepted_but_plain_response",
-                    requested_format="rich_markdown",
-                    selected_fallback_format=None,
-                    observed_api_format="plain_text",
-                    content=content,
-                    chat_id=chat_id,
-                    message_id=None,
-                    api_method="sendRichMessageDraft",
-                    fallback_api_method=None,
-                    reason="telegram_api_returned_plain_representation",
-                    reason_class=None,
-                    draft_id=draft_id,
-                )
-            if ok:
+            if ok is True:
                 return True
             explicit_false = ok is False
             self._log_message_format_downgrade(

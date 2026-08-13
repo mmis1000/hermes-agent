@@ -1,9 +1,9 @@
 # Review Reconciliation — Delegation Profile Filesystem Isolation
 
-Date: 2026-08-10  
-Design reviewed: `delegation-profile-filesystem-isolation-design.md`  
-Initial design SHA-256: `fa5875fbc349387687a5fde3566d4cbfa78bd165d5addb5ad758da9325a0b5f8`  
-Initial review SHA-256: `4391e6d7c98d4312eca19d9a135e464b4dc2a80ea3ccaceb5b82459f6b283ec2`  
+Date: 2026-08-10<br>
+Design reviewed: `delegation-profile-filesystem-isolation-design.md`<br>
+Initial design SHA-256: `fa5875fbc349387687a5fde3566d4cbfa78bd165d5addb5ad758da9325a0b5f8`<br>
+Initial review SHA-256: `4391e6d7c98d4312eca19d9a135e464b4dc2a80ea3ccaceb5b82459f6b283ec2`<br>
 Revised design SHA-256: `58d267ceefde68da9387146af14c86912baec1fa040df45ad82b98e3f08d001f`
 
 ## 1. Provenance discrepancy

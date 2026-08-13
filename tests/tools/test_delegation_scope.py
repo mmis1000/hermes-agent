@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path, PurePosixPath
 import tempfile
 
@@ -816,6 +817,34 @@ def test_unbounded_parent_rejects_invalid_host_path(tmp_path):
             [{"path": str(missing), "mode": "ro"}],
             backing_registry=BackingObjectRegistry(),
         )
+
+
+def test_rejected_unbounded_multi_reveal_does_not_publish_partial_backing(tmp_path):
+    selected = tmp_path / "selected"
+    selected.mkdir()
+    missing = tmp_path / "missing"
+    registry = BackingObjectRegistry()
+
+    with pytest.raises(ValueError, match="unavailable"):
+        resolve_invocation_scope(
+            _policy(visible_objects=None),
+            "isolated",
+            None,
+            [
+                {"path": str(selected), "mode": "ro"},
+                {"path": str(missing), "mode": "ro"},
+            ],
+            backing_registry=registry,
+        )
+
+    selected_stat = selected.stat()
+    selected_object_id = "unbounded_host_" + hashlib.sha256(
+        (
+            f"{selected}\0directory\0"
+            f"{selected_stat.st_dev}:{selected_stat.st_ino}"
+        ).encode("utf-8")
+    ).hexdigest()
+    assert registry.get(selected_object_id) is None
 
 
 def test_reveal_cannot_request_rw_over_parent_ro_ceiling():

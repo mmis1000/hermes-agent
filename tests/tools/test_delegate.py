@@ -228,26 +228,6 @@ class TestChildSystemPrompt(unittest.TestCase):
         )
         return scope, policy
 
-    def test_resolved_scope_is_attached_to_constructed_child(self):
-        parent = _make_mock_parent()
-        scope = object()
-        with patch("run_agent.AIAgent") as MockAgent:
-            child = MagicMock()
-            MockAgent.return_value = child
-            built = _build_child_agent(
-                task_index=0,
-                goal="Scoped work",
-                context=None,
-                toolsets=None,
-                model=None,
-                max_iterations=10,
-                task_count=1,
-                parent_agent=parent,
-                resolved_scope=scope,
-            )
-        self.assertIs(built, child)
-        self.assertIs(child.resolved_invocation_scope, scope)
-
     def test_goal_only(self):
         prompt = _build_child_system_prompt("Fix the tests")
         self.assertIn("Fix the tests", prompt)

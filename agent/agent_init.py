@@ -484,10 +484,6 @@ def init_agent(
         agent.delegation_backing_registry = BackingObjectRegistry()
     else:
         agent.delegation_backing_registry = None
-    # Filled by delegate_task after pure invocation-scope preflight and before
-    # the child is exposed to routed tools/container setup.
-    agent.resolved_invocation_scope = None
-    agent._delegation_scope = None
     agent.max_iterations = max_iterations
     # Shared iteration budget — parent creates, children inherit.
     # Consumed by every LLM turn across parent + all subagents.

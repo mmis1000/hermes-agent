@@ -1134,32 +1134,6 @@ async def test_rich_draft_api_rejection_logs_hermes_fallback_selection(caplog):
 
 
 @pytest.mark.asyncio
-async def test_rich_draft_plain_api_response_logs_api_downgrade(caplog):
-    adapter = _make_adapter(extra={"rich_drafts": True})
-    bot = adapter._bot
-    assert bot is not None
-    bot.do_api_request = AsyncMock(
-        return_value={"text": "plain server representation"}
-    )
-
-    with caplog.at_level(logging.WARNING):
-        result = await adapter.send_draft(
-            "12345", draft_id=10, content=RICH_CONTENT,
-        )
-
-    assert result.success is True
-    event = _downgrade_events(caplog)[0]
-    assert event["downgrade_origin"] == "telegram_api"
-    assert event["trigger"] == "rich_request_accepted_but_plain_response"
-    assert event["requested_format"] == "rich_markdown"
-    assert event["selected_fallback_format"] is None
-    assert event["observed_api_format"] == "plain_text"
-    assert event["api_method"] == "sendRichMessageDraft"
-    assert event["fallback_api_method"] is None
-    assert event["draft_id"] == 10
-
-
-@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("rich_response", "expected_trigger", "expected_reason"),
     [
@@ -1170,6 +1144,11 @@ async def test_rich_draft_plain_api_response_logs_api_downgrade(caplog):
         ),
         (
             {},
+            "rich_draft_response_outcome_unknown",
+            "rich_draft_response_representation_unknown",
+        ),
+        (
+            {"rich_message": {"blocks": []}},
             "rich_draft_response_outcome_unknown",
             "rich_draft_response_representation_unknown",
         ),
@@ -1201,15 +1180,11 @@ async def test_rich_draft_falsy_response_attribution(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "api_result",
-    [True, {"rich_message": {"blocks": []}}],
-)
-async def test_rich_draft_success_without_plain_evidence_is_silent(api_result, caplog):
+async def test_rich_draft_true_success_is_silent(caplog):
     adapter = _make_adapter(extra={"rich_drafts": True})
     bot = adapter._bot
     assert bot is not None
-    bot.do_api_request = AsyncMock(return_value=api_result)
+    bot.do_api_request = AsyncMock(return_value=True)
 
     with caplog.at_level(logging.WARNING):
         result = await adapter.send_draft(

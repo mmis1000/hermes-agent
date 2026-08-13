@@ -5012,9 +5012,6 @@ class APIServerAdapter(BasePlatformAdapter):
                     agent.delegation_backing_registry = (
                         protected_execution.backing_registry
                     )
-                    agent.resolved_invocation_scope = (
-                        protected_execution.invocation_scope
-                    )
                     configure_protected_agent_tools(
                         agent,
                         protected_execution.invocation_scope.profile,

@@ -143,13 +143,25 @@ class BackingObjectRegistry:
     def register_admitted(self, record: BackingObjectRecord) -> None:
         """Pin one host object already admitted by the authority resolver."""
 
+        self.register_admitted_many((record,))
+
+    def register_admitted_many(
+        self,
+        records: Sequence[BackingObjectRecord],
+    ) -> None:
+        """Atomically pin host objects admitted by one authority resolution."""
+
         with self._lock:
-            if record.backing.kind != "host_path" or not record.trusted_host_path:
-                raise ValueError("admitted backing must be a trusted host path")
-            existing = self._records.get(record.backing.object_id)
-            if existing is not None and existing != record:
-                raise ValueError("admitted backing identity changed")
-            self._records[record.backing.object_id] = record
+            staged: dict[str, BackingObjectRecord] = {}
+            for record in records:
+                if record.backing.kind != "host_path" or not record.trusted_host_path:
+                    raise ValueError("admitted backing must be a trusted host path")
+                object_id = record.backing.object_id
+                existing = staged.get(object_id, self._records.get(object_id))
+                if existing is not None and existing != record:
+                    raise ValueError("admitted backing identity changed")
+                staged[object_id] = record
+            self._records.update(staged)
 
 
 @dataclass(frozen=True)
@@ -1081,11 +1093,7 @@ def _derive_host_descendant_grant(
 
 def _admit_unbounded_host_grant(
     request: RevealRequest,
-    backing_registry: BackingObjectRegistry | None,
-) -> VisibleObjectGrant:
-    if backing_registry is None:
-        raise ValueError("delegate_task: unbounded filesystem backing registry is unavailable.")
-
+) -> tuple[VisibleObjectGrant, BackingObjectRecord]:
     host_path = Path(str(request.path))
     try:
         stat_result = host_path.lstat()
@@ -1122,12 +1130,14 @@ def _admit_unbounded_host_grant(
         object_type=object_type,
         trusted_host_path=True,
     )
-    backing_registry.register_admitted(record)
-    return VisibleObjectGrant(
-        visible_path=request.path,
-        mode=AccessMode(request.mode),
-        backing=backing,
-        object_type=object_type,
+    return (
+        VisibleObjectGrant(
+            visible_path=request.path,
+            mode=AccessMode(request.mode),
+            backing=backing,
+            object_type=object_type,
+        ),
+        record,
     )
 
 
@@ -1192,6 +1202,7 @@ def resolve_invocation_scope(
         grant.visible_path: grant for grant in policy.visible_objects or ()
     }
     resolved_grants: list[VisibleObjectGrant] = []
+    staged_admitted_records: dict[str, BackingObjectRecord] = {}
     for request in reveal_requests:
         _validate_reveal_destination(
             request.path,
@@ -1200,7 +1211,12 @@ def resolve_invocation_scope(
         grant = grants_by_path.get(request.path)
         if grant is None:
             if policy.visible_objects is None:
-                grant = _admit_unbounded_host_grant(request, backing_registry)
+                if backing_registry is None:
+                    raise ValueError(
+                        "delegate_task: unbounded filesystem backing registry is unavailable."
+                    )
+                grant, admitted_record = _admit_unbounded_host_grant(request)
+                staged_admitted_records[grant.backing.object_id] = admitted_record
             else:
                 grant = _derive_host_descendant_grant(
                     policy,
@@ -1209,9 +1225,12 @@ def resolve_invocation_scope(
                 )
         attenuate_mode(grant.mode, AccessMode(request.mode))
         record = (
-            backing_registry.get(grant.backing.object_id)
-            if backing_registry is not None
-            else None
+            staged_admitted_records.get(grant.backing.object_id)
+            or (
+                backing_registry.get(grant.backing.object_id)
+                if backing_registry is not None
+                else None
+            )
         )
         if backing_registry is not None:
             if record is None or not record.exists:
@@ -1258,6 +1277,9 @@ def resolve_invocation_scope(
         selected_profile,
         resolved_grants,
     )
+    if staged_admitted_records:
+        assert backing_registry is not None
+        backing_registry.register_admitted_many(tuple(staged_admitted_records.values()))
     return ResolvedInvocationScope(
         profile_name=selected,
         profile_hash=execution_profile_hash(selected_profile),
