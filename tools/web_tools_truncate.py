@@ -56,12 +56,18 @@ def convert_base64_images_to_links(text: str) -> str:
     return re.sub(r"data:image/[^;]+;base64,[A-Za-z0-9+/=]+", "[IMAGE]", out)
 
 
-def _store_full_text(url: str, content: str) -> Optional[str]:
+def _store_full_text(url: str, content: str, task_id: Optional[str] = None) -> Optional[str]:
     """Write the full page to cache/web; absolute path or None (best-effort: the truncated content is still
     returned). cache/web is mounted read-only into remote backends (credential_files _CACHE_DIRS) so
-    read_file can page the complete text on any backend."""
+    read_file can page the complete text on any backend. A protected delegation attempt (*task_id* with a
+    reserved scope) stores into its own workdir instead, where its file tools can read it."""
     try:
         import hashlib
+        if task_id:
+            from tools.delegation_scope import attempt_scope_registry
+            authority = attempt_scope_registry.get(task_id)
+            if authority is not None:
+                return _store_scoped_full_text(url, content, task_id, authority)
         from hermes_constants import get_hermes_dir
         from tools.web_result_cache import _host_slug
         cache_dir = get_hermes_dir("cache/web", "web_cache")
@@ -83,7 +89,25 @@ def _store_full_text(url: str, content: str) -> Optional[str]:
         return None
 
 
-def _truncate_with_footer(content: str, url: str, char_limit: int) -> tuple[str, bool]:
+def _store_scoped_full_text(url: str, content: str, task_id: str, authority: Any) -> Optional[str]:
+    """Write the full page under the attempt's workdir through its scoped file operations."""
+    import hashlib
+    from tools.file_tools import _get_file_ops
+    from tools.web_result_cache import _host_slug
+    digest = hashlib.sha256(url.encode('utf-8')).hexdigest()[:10]
+    path = authority.invocation_scope.workdir / ".hermes-web" / f"{_host_slug(url)}-{digest}.md"
+    if len(content) > MAX_STORED_TEXT_CHARS:
+        content = content[:MAX_STORED_TEXT_CHARS] + (
+            f"\n\n[... stored copy truncated at {MAX_STORED_TEXT_CHARS:,} chars "
+            f"of {len(content):,}; re-extract a more specific URL for the rest ...]"
+        )
+    result = _get_file_ops(task_id).write_file(str(path), content)
+    return None if getattr(result, "error", None) else str(path)
+
+
+def _truncate_with_footer(
+    content: str, url: str, char_limit: int, task_id: Optional[str] = None
+) -> tuple[str, bool]:
     """Return (model_text, was_truncated). Pages over ``char_limit`` become a ~75% head / ~25% tail window cut
     on line boundaries, plus a footer saying how much is shown, where the full text is stored, and the
     read_file call that pages the omitted middle. Deterministic."""
@@ -98,7 +122,7 @@ def _truncate_with_footer(content: str, url: str, char_limit: int) -> tuple[str,
     if 0 <= (nl := tail.find("\n")) < tail_budget * 0.5:
         tail = tail[nl + 1:]
 
-    stored_path = _store_full_text(url, content)
+    stored_path = _store_full_text(url, content, task_id=task_id)
     if stored_path:
         # The footer is read by the AGENT, whose read_file runs inside the active backend: render the
         # path where docker/modal/ssh/... see the mounted cache, not the host path (#72389, #81984).
@@ -150,7 +174,9 @@ def _binary_payload_kind(text: str) -> str:
     return ""
 
 
-def _truncate_results(results: List[dict], char_limit: int, debug_call_data: dict) -> None:
+def _truncate_results(
+    results: List[dict], char_limit: int, debug_call_data: dict, task_id: Optional[str] = None
+) -> None:
     """In place: replace each successful entry's content with its base64-cleaned, budgeted text;
     per-page truncation metrics go into ``debug_call_data``."""
     for result in results:
@@ -169,7 +195,7 @@ def _truncate_results(results: List[dict], char_limit: int, debug_call_data: dic
             logger.info("%s (binary payload: %s, %d chars dropped)", url, binary_kind, len(raw_content))
             continue
         clean = convert_base64_images_to_links(raw_content)
-        model_text, truncated = _truncate_with_footer(clean, url, char_limit)
+        model_text, truncated = _truncate_with_footer(clean, url, char_limit, task_id=task_id)
         result["content"] = model_text
         if truncated:
             debug_call_data["pages_truncated"] += 1

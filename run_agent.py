@@ -302,6 +302,7 @@ class AIAgent(
         capabilities: Dict[str, bool] | None = None, cwd: str | None = None,
         side_agent: bool = False, memory_manager=None,
         tool_result_metadata_callback: Optional[Callable[..., dict]] = None,
+        delegation_policy=None,
     ):
         """Forwarder — see ``agent.agent_init.init_agent`` (same keyword parameters, minus ``tool_delay``)."""
         init_kwargs = {k: v for k, v in locals().items() if k not in ("self", "tool_delay")}
@@ -1463,6 +1464,8 @@ class AIAgent(
             action=function_args.get("action"),
             **{key: function_args.get(key) for key in ("delegation_id", "attempt_id", "run_id", "timeout_seconds", "limit", "cascade", "reason")},
             subagent_id=function_args.get("subagent_id"), message=function_args.get("message"), parent_agent=self,
+            profile=function_args.get("profile"), workdir=function_args.get("workdir"), reveal=function_args.get("reveal"),
+            model=function_args.get("model"), provider=function_args.get("provider"), reasoning_effort=function_args.get("reasoning_effort"),
         )
 
     _invoke_tool = _forward("agent.agent_runtime_helpers", "invoke_tool")

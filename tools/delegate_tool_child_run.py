@@ -51,6 +51,12 @@ def _close_child(child: Any, log_message: str) -> None:
         close = getattr(child, "close", None)
         if callable(close):
             close()
+    attempt_id = getattr(child, "_delegation_attempt_id", None)
+    if isinstance(attempt_id, str):
+        from tools.delegation_scope import attempt_scope_registry
+        authority = attempt_scope_registry.get(attempt_id)
+        if authority is not None and authority.state != "revoked":
+            attempt_scope_registry.cleanup(attempt_id)
 
 def _with_children_lock(parent_agent: Any, op: str, child: Any) -> None:
     """``parent_agent._active_children.<op>(child)`` under the parent's lock when it has one."""
@@ -750,7 +756,8 @@ class _ChildRun:
         """Seed cwd/container aliases and optional worktree isolation for the child;
         ``goal`` is extended with the worktree contract note when isolation engaged."""
         import uuid as _uuid
-        self.child_task_id = self.subagent_id or f"subagent-{self.task_index}-{_uuid.uuid4().hex[:8]}"
+        physical_id = getattr(self.child, "_delegation_attempt_id", None)
+        self.child_task_id = physical_id if isinstance(physical_id, str) and physical_id else (self.subagent_id or f"subagent-{self.task_index}-{_uuid.uuid4().hex[:8]}")
         self.parent_task_id = getattr(self.parent_agent, "_current_task_id", None)
         # Seed the child's cwd record from the parent's: same starting directory,
         # but the child's later `cd`s stay in its own record. Per-session container

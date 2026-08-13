@@ -51,6 +51,63 @@ def test_cwd_only_override_collapses_to_default():
         terminal_tool.clear_task_env_overrides("acp-session-abc")
 
 
+def test_delegation_scope_override_keeps_physical_attempt_isolated():
+    terminal_tool.register_task_env_overrides(
+        "attempt-protected",
+        {"cwd": "/workspace", "delegation_scope_id": "scope-protected"},
+    )
+    try:
+        assert (
+            terminal_tool._resolve_container_task_id("attempt-protected")
+            == "attempt-protected"
+        )
+    finally:
+        terminal_tool.clear_task_env_overrides("attempt-protected")
+
+
+def test_acquire_task_environment_creates_and_returns_effective_environment(
+    monkeypatch,
+):
+    sentinel = object()
+    created = []
+    config = {
+        "env_type": "local",
+        "cwd": "/tmp",
+        "timeout": 180,
+        "host_cwd": None,
+        "local_persistent": False,
+    }
+    monkeypatch.setattr(terminal_tool, "_active_environments", {})
+    monkeypatch.setattr(terminal_tool, "_last_activity", {})
+    monkeypatch.setattr(terminal_tool, "_creation_locks", {})
+    monkeypatch.setattr(terminal_tool, "_get_env_config", lambda: config)
+    monkeypatch.setattr(terminal_tool, "_start_cleanup_thread", lambda: None)
+    monkeypatch.setattr(
+        terminal_tool,
+        "_create_environment",
+        lambda **kwargs: created.append(kwargs) or sentinel,
+    )
+
+    env, backend, effective_key = terminal_tool.acquire_task_environment(
+        "ordinary-child", timeout=45
+    )
+
+    assert (env, backend, effective_key) == (sentinel, "local", "default")
+    assert created == [
+        {
+            "env_type": "local",
+            "image": "",
+            "cwd": "/tmp",
+            "timeout": 45,
+            "ssh_config": None,
+            "container_config": None,
+            "local_config": {"persistent": False},
+            "task_id": "default",
+            "host_cwd": None,
+        }
+    ]
+
+
 def test_env_type_override_keeps_own_id():
     """env_type is an isolation key — must trigger per-task container."""
     terminal_tool.register_task_env_overrides(
