@@ -77,7 +77,7 @@ async def resolve_image_source(
         _guard_credential_read(host_target, s)
         data = await asyncio.to_thread(host_target.read_bytes)
         return _finalize(data, "", "file", s, permitted)
-    if _is_local_terminal_backend():
+    if _is_local_terminal_backend() and not _is_protected_task(ctx.task_id):
         # Any path was host-readable, so a miss means the file doesn't exist.
         raise SourceNotFound(f"media file not found: '{p}'", src=s, origin="file")
     return await _resolve_container_fallback(p, ctx, s, permitted)
@@ -170,7 +170,12 @@ def _permitted_host_read_target(p: Path, ctx: ResolveContext) -> Optional[Path]:
     Local backend: any path. Non-local: only paths inside a media cache root (a
     container-visible cache path is first translated back to its host mount).
     """
-    if _is_local_terminal_backend():
+    # Protected model-visible paths are interpreted only inside the physical
+    # attempt.  Global backend settings and broad cache exceptions cannot add
+    # host read authority.
+    if _is_protected_task(ctx.task_id):
+        return None
+    if _is_local_terminal_backend() and not _is_protected_task(ctx.task_id):
         try:
             return p.resolve()
         except Exception:  # noqa: BLE001 — unresolved path: let is_file() fail downstream
@@ -189,8 +194,11 @@ def _get_active_env(task_id: Optional[str]):
     if not task_id:
         return None
     try:
-        from tools.terminal_tool_lifecycle import get_active_env
-        return get_active_env(task_id)
+        from tools.terminal_tool import acquire_task_environment, get_active_env
+        env = get_active_env(task_id)
+        if env is None and _is_protected_task(task_id):
+            env, _env_type, _effective_task_id = acquire_task_environment(task_id)
+        return env
     except Exception:
         return None
 
@@ -320,3 +328,13 @@ async def resolve_local_source_to_data_url(
     encoded = base64.b64encode(resolved.data).decode("ascii")
     mime = resolved.mime or "application/octet-stream"
     return f"data:{mime};base64,{encoded}"
+
+def _is_protected_task(task_id: Optional[str]) -> bool:
+    if not task_id:
+        return False
+    try:
+        from tools.delegation_scope import attempt_scope_registry
+
+        return attempt_scope_registry.get(task_id) is not None
+    except Exception:
+        return False

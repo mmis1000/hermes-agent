@@ -289,6 +289,9 @@ def _children_for_record(
         activity = _safe_activity(child.get("activity"))
         if activity:
             item["activity"] = activity
+        authority_audit = child.get("authority_audit")
+        if isinstance(authority_audit, dict):
+            item["authority_audit"] = dict(authority_audit)
         steers = child.get("steers")
         if isinstance(steers, list) and steers:
             item["steers"] = [dict(steer) for steer in steers[-20:] if isinstance(steer, dict)]

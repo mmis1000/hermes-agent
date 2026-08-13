@@ -1868,3 +1868,8 @@ class AsyncSessionDB:
         async def _offloaded(*args, **kwargs):
             return await asyncio.to_thread(attr, *args, **kwargs)
         return _offloaded
+
+def ensure_state_schema(conn):
+    """Reconcile canonical state schema for auxiliary lifecycle writers."""
+    from hermes_state_schema import reconcile_state_schema
+    reconcile_state_schema(conn)

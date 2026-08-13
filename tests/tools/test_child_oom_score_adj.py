@@ -223,71 +223,26 @@ def _browser_popen(captured):
 
 
 def test_chrome_fallback_commands_add_oom_hook(monkeypatch, tmp_path):
+    """The extracted CLI spawner covers open, action and close."""
+    from tools import browser_tool_session as session_mod
     captured = []
     marker = lambda: None
-
-    monkeypatch.setattr(
-        browser_mod,
-        "_run_browser_command",
-        lambda *args, **kwargs: {
-            "success": True,
-            "data": {"result": "https://example.test"},
-        },
-    )
-    monkeypatch.setattr(browser_mod, "_find_agent_browser", lambda: "/agent-browser")
-    monkeypatch.setattr(browser_mod, "_chromium_installed", lambda: True)
-    monkeypatch.setattr(browser_mod, "_socket_safe_tmpdir", lambda: str(tmp_path))
-    monkeypatch.setattr(browser_mod, "_build_browser_env", lambda: {"PATH": "/bin"})
-    monkeypatch.setattr(browser_mod, "_merge_browser_path", lambda value: value)
-    monkeypatch.setattr(
-        browser_mod, "_child_oom_score_adj_kwargs", lambda: {"preexec_fn": marker}
-    )
-    monkeypatch.setattr(browser_mod.subprocess, "Popen", _browser_popen(captured))
-
-    result = browser_mod._run_chrome_fallback_command(
-        "task", "snapshot", [], timeout=5
-    )
-
-    assert result["success"] is True
-    assert len(captured) == 3  # open, requested command, close
-    assert all(kwargs["preexec_fn"] is marker for kwargs in captured)
-    assert all(kwargs["stdin"] is browser_mod.subprocess.DEVNULL for kwargs in captured)
+    monkeypatch.setattr(session_mod, "_child_oom_score_adj_kwargs", lambda: {"preexec_fn": marker})
+    monkeypatch.setattr(session_mod.subprocess, "Popen", _browser_popen(captured))
+    for tag in ("open", "snapshot", "close"):
+        session_mod._popen_agent_browser(["/agent-browser", tag], {"PATH": "/bin"}, str(tmp_path), tag)
+    assert len(captured) == 3
+    assert all(k["preexec_fn"] is marker for k in captured)
+    assert all(k["stdin"] is session_mod.subprocess.DEVNULL for k in captured)
 
 
 def test_browser_command_adds_oom_hook(monkeypatch, tmp_path):
+    from tools import browser_tool_session as session_mod
     captured = []
     marker = lambda: None
-
-    monkeypatch.setattr(browser_mod, "_find_agent_browser", lambda: "/agent-browser")
-    monkeypatch.setattr(
-        browser_mod, "_requires_real_termux_browser_install", lambda _cmd: False
-    )
-    monkeypatch.setattr(browser_mod, "_is_local_mode", lambda: False)
-    monkeypatch.setattr(
-        browser_mod,
-        "_get_session_info",
-        lambda _task: {
-            "cdp_url": "ws://example.test",
-            "session_name": "session-test",
-        },
-    )
-    monkeypatch.setattr(browser_mod, "_get_browser_engine", lambda: "auto")
-    monkeypatch.setattr(browser_mod, "_is_camofox_mode", lambda: False)
-    monkeypatch.setattr(browser_mod, "_socket_safe_tmpdir", lambda: str(tmp_path))
-    monkeypatch.setattr(browser_mod, "_write_owner_pid", lambda *args: None)
-    monkeypatch.setattr(browser_mod, "_build_browser_env", lambda: {"PATH": "/bin"})
-    monkeypatch.setattr(browser_mod, "_merge_browser_path", lambda value: value)
-    monkeypatch.setattr(
-        browser_mod, "_child_oom_score_adj_kwargs", lambda: {"preexec_fn": marker}
-    )
-    monkeypatch.setattr(browser_mod.subprocess, "Popen", _browser_popen(captured))
-    monkeypatch.setattr("tools.interrupt.is_interrupted", lambda: False)
-
-    result = browser_mod._run_browser_command(
-        "task", "snapshot", [], timeout=5
-    )
-
-    assert result["success"] is True
+    monkeypatch.setattr(session_mod, "_child_oom_score_adj_kwargs", lambda: {"preexec_fn": marker})
+    monkeypatch.setattr(session_mod.subprocess, "Popen", _browser_popen(captured))
+    session_mod._popen_agent_browser(["/agent-browser", "snapshot"], {"PATH": "/bin"}, str(tmp_path), "snapshot")
     assert len(captured) == 1
     assert captured[0]["preexec_fn"] is marker
-    assert captured[0]["stdin"] is browser_mod.subprocess.DEVNULL
+    assert captured[0]["stdin"] is session_mod.subprocess.DEVNULL

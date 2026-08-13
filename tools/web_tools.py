@@ -550,7 +550,10 @@ registry.register(
     handler=lambda args, **kw: web_extract_tool(
         args.get("urls", [])[:5] if isinstance(args.get("urls"), list) else [], "markdown",
         char_limit=args.get("char_limit"),
+        task_id=kw.get("task_id"),
     ),
     check_fn=check_web_api_key, requires_env=_web_requires_env(), is_async=True, emoji="📄",
     max_result_size_chars=100_000,
 )
+
+from tools.web_tools_truncate import _truncate_with_footer

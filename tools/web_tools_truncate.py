@@ -56,26 +56,71 @@ def convert_base64_images_to_links(text: str) -> str:
     return re.sub(r"data:image/[^;]+;base64,[A-Za-z0-9+/=]+", "[IMAGE]", out)
 
 
-def _store_full_text(url: str, content: str) -> Optional[str]:
-    """Write the full page to cache/web; absolute path or None (best-effort: the truncated content is still
-    returned). cache/web is mounted read-only into remote backends (credential_files _CACHE_DIRS) so
-    read_file can page the complete text on any backend."""
+def _store_full_text(
+    url: str, content: str, task_id: Optional[str] = None
+) -> Optional[str]:
+    """Write the full extracted page to cache/web and return its absolute path.
+
+    The file is mounted read-only into remote backends (Docker/Modal/SSH) via
+    credential_files._CACHE_DIRS, so the agent's terminal/read_file tools can
+    page through the complete text on any backend. Returns None on failure
+    (storage is best-effort; truncated content is still returned to the model).
+    """
     try:
         import hashlib
+        from urllib.parse import urlparse
+
+        if task_id:
+            from tools.delegation_scope import attempt_scope_registry
+
+            authority = attempt_scope_registry.get(task_id)
+            if authority is not None:
+                from tools.file_tools import _get_file_ops
+
+                host = (urlparse(url).hostname or "page").replace(":", "_")
+                slug = re.sub(r"[^A-Za-z0-9._-]", "-", host)[:60].strip("-") or "page"
+                digest = hashlib.sha256(url.encode("utf-8")).hexdigest()[:10]
+                visible_path = (
+                    authority.invocation_scope.workdir
+                    / ".hermes-web"
+                    / f"{slug}-{digest}.md"
+                )
+                bounded = content
+                if len(bounded) > MAX_STORED_TEXT_CHARS:
+                    bounded = bounded[:MAX_STORED_TEXT_CHARS] + (
+                        f"\n\n[... stored copy truncated at "
+                        f"{MAX_STORED_TEXT_CHARS:,} chars ...]"
+                    )
+                result = _get_file_ops(task_id).write_file(
+                    str(visible_path), bounded
+                )
+                return None if getattr(result, "error", None) else str(visible_path)
+
         from hermes_constants import get_hermes_dir
-        from tools.web_result_cache import _host_slug
+
         cache_dir = get_hermes_dir("cache/web", "web_cache")
         cache_dir.mkdir(parents=True, exist_ok=True)
-        path = cache_dir / f"{_host_slug(url)}-{hashlib.sha256(url.encode('utf-8')).hexdigest()[:10]}.md"
+
+        host = (urlparse(url).hostname or "page").replace(":", "_")
+        slug = re.sub(r"[^A-Za-z0-9._-]", "-", host)[:60].strip("-") or "page"
+        digest = hashlib.sha256(url.encode("utf-8")).hexdigest()[:10]
+        path = cache_dir / f"{slug}-{digest}.md"
+        # Bound the stored copy so a pathologically large page can't write
+        # unbounded bytes to disk. If capped, append a marker so a reader of
+        # the file knows it isn't the literal complete page.
         if len(content) > MAX_STORED_TEXT_CHARS:
-            content = content[:MAX_STORED_TEXT_CHARS] + (
-                f"\n\n[... stored copy truncated at {MAX_STORED_TEXT_CHARS:,} chars "
+            content = (
+                content[:MAX_STORED_TEXT_CHARS]
+                + f"\n\n[... stored copy truncated at {MAX_STORED_TEXT_CHARS:,} chars "
                 f"of {len(content):,}; re-extract a more specific URL for the rest ...]"
             )
         from tools.spill_safety import write_text_exclusive
-        # Deterministic name in a well-known dir: refuse symlinks (lstat-unlink + exclusive create);
-        # same-URL re-extraction legitimately overwrites. Not private: cache/web is bind-mounted
-        # into remote backends' container UID.
+
+        # Deterministic filename in a well-known dir: refuse symlinks via
+        # lstat-unlink + exclusive create. Re-extraction of the same URL
+        # legitimately overwrites (same slug-digest name). Not private:
+        # cache/web is bind-mounted into remote backends whose container UID
+        # must be able to read it, and content is fetched public text.
         write_text_exclusive(path, content, private=False, overwrite=True)
         return str(path)
     except Exception as exc:  # noqa: BLE001
@@ -83,49 +128,69 @@ def _store_full_text(url: str, content: str) -> Optional[str]:
         return None
 
 
-def _truncate_with_footer(content: str, url: str, char_limit: int) -> tuple[str, bool]:
-    """Return (model_text, was_truncated). Pages over ``char_limit`` become a ~75% head / ~25% tail window cut
-    on line boundaries, plus a footer saying how much is shown, where the full text is stored, and the
-    read_file call that pages the omitted middle. Deterministic."""
+def _truncate_with_footer(
+    content: str,
+    url: str,
+    char_limit: int,
+    task_id: Optional[str] = None,
+) -> tuple[str, bool]:
+    """Return (model_text, was_truncated) for one page's clean content.
+
+    Pages at or under ``char_limit`` are returned whole. Larger pages get a
+    head+tail window (~75% head / ~25% tail) cut on a markdown line boundary
+    where possible, plus an explicit footer telling the model exactly how much
+    it is seeing, where the full text is stored, and which read_file call pages
+    in the omitted middle. Deterministic — no model involvement.
+    """
     if len(content) <= char_limit:
         return content, False
+
     head_budget = int(char_limit * 0.75)
     tail_budget = char_limit - head_budget
-    head, tail = content[:head_budget], content[-tail_budget:]
-    # Snap both cuts to line boundaries (head back, tail forward) so we never slice mid-line.
-    if (nl := head.rfind("\n")) > head_budget * 0.5:
+
+    head = content[:head_budget]
+    tail = content[-tail_budget:]
+    # Snap the head cut back to the last newline so we don't slice mid-line.
+    nl = head.rfind("\n")
+    if nl > head_budget * 0.5:
         head = head[:nl]
-    if 0 <= (nl := tail.find("\n")) < tail_budget * 0.5:
+    # Snap the tail cut forward to the next newline for the same reason.
+    nl = tail.find("\n")
+    if 0 <= nl < tail_budget * 0.5:
         tail = tail[nl + 1:]
 
-    stored_path = _store_full_text(url, content)
-    if stored_path:
-        # The footer is read by the AGENT, whose read_file runs inside the active backend: render the
-        # path where docker/modal/ssh/... see the mounted cache, not the host path (#72389, #81984).
-        from tools.credential_files import to_agent_visible_cache_path
-        stored_path = to_agent_visible_cache_path(stored_path)
+    total = len(content)
+    stored_path = _store_full_text(url, content, task_id=task_id)
+    shown = len(head) + len(tail)
+
     footer_lines = [
-        "", "─" * 8 + " [TRUNCATED] " + "─" * 8,
+        "",
+        "─" * 8 + " [TRUNCATED] " + "─" * 8,
         f"Showing {len(head):,} chars (head) + {len(tail):,} chars (tail) "
-        f"of {len(content):,} total clean characters.",
+        f"of {total:,} total clean characters.",
     ]
     if stored_path:
-        # read_file is 1-indexed; +2 lands on the first line after the shown head.
+        # The omitted middle begins right after the head we're showing. Give
+        # the model a concrete starting line (head line count + 1) so its first
+        # read_file lands in the gap instead of guessing <line>. read_file is
+        # 1-indexed; +1 moves past the last head line we already showed.
         middle_start_line = head.count("\n") + 2
-        footer_lines += [
-            f"Full text saved to: {stored_path}",
+        footer_lines.append(f"Full text saved to: {stored_path}")
+        footer_lines.append(
             f'To read the omitted middle: read_file path="{stored_path}" '
             f"offset={middle_start_line} limit=200  (the file is the complete page; "
-            f"raise/lower offset to page through it).",
-        ]
+            f"raise/lower offset to page through it)."
+        )
     else:
         footer_lines.append(
             "Full text could not be stored; re-run web_extract on a more "
             "specific URL or use browser_navigate for the complete page."
         )
     footer_lines.append("─" * 29)
+
     model_text = head + "\n\n[... middle omitted — see footer ...]\n\n" + tail
-    return model_text + "\n" + "\n".join(footer_lines), True
+    model_text += "\n" + "\n".join(footer_lines)
+    return model_text, True
 
 
 def _effective_char_limit(char_limit: Optional[int]) -> int:

@@ -13,6 +13,7 @@ import asyncio
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from contextvars import ContextVar
+import copy
 import logging
 import threading
 import time
@@ -211,7 +212,7 @@ def _clear_tool_defs_cache() -> None:
         _tool_defs_cache.clear()
 
 
-def get_tool_definitions(enabled_toolsets: Optional[List[str]] = None, disabled_toolsets: Optional[List[str]] = None,
+def _unscoped_get_tool_definitions(enabled_toolsets: Optional[List[str]] = None, disabled_toolsets: Optional[List[str]] = None,
                          quiet_mode: bool = False, skip_tool_search_assembly: bool = False) -> List[Dict[str, Any]]:
     """Tool definitions for model API calls, filtered by toolset.
 
@@ -994,3 +995,49 @@ def check_toolset_requirements() -> Dict[str, bool]:
 def check_tool_availability(quiet: bool = False) -> Tuple[List[str], List[dict]]:
     """(available_toolsets, unavailable_info)."""
     return registry.check_tool_availability(quiet=quiet)
+
+import copy
+def _delegation_policy_fingerprint(policy: Any) -> tuple | None:
+    """Return only the immutable schema-shaping delegation policy state."""
+    if policy is None:
+        return None
+    return (
+        bool(policy.profile_required),
+        tuple(sorted(policy.allowed_profiles)),
+    )
+
+def _apply_delegation_policy_schema(
+    definitions: List[Dict[str, Any]], delegation_policy: Any
+) -> List[Dict[str, Any]]:
+    """Copy and constrain delegate_task without mutating the registry schema."""
+
+    result = list(definitions)
+    for index, definition in enumerate(result):
+        function = definition.get("function", {})
+        if function.get("name") != "delegate_task":
+            continue
+        owned = copy.deepcopy(definition)
+        parameters = owned["function"]["parameters"]
+        parameters["properties"]["profile"]["enum"] = sorted(
+            delegation_policy.allowed_profiles
+        )
+        required = list(parameters.get("required", []))
+        if delegation_policy.profile_required:
+            if "profile" not in required:
+                required.append("profile")
+        else:
+            required = [name for name in required if name != "profile"]
+        if required:
+            parameters["required"] = required
+        else:
+            parameters.pop("required", None)
+        result[index] = owned
+
+        break
+    return result
+
+def get_tool_definitions(enabled_toolsets=None, disabled_toolsets=None, quiet_mode=False, skip_tool_search_assembly=False, delegation_policy=None):
+    definitions = _unscoped_get_tool_definitions(enabled_toolsets, disabled_toolsets, quiet_mode, skip_tool_search_assembly)
+    if delegation_policy is not None:
+        return _apply_delegation_policy_schema(definitions, delegation_policy)
+    return definitions

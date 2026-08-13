@@ -658,9 +658,9 @@ class TestConfiguredSkillCommandPreloads:
             self._config({}),
         ):
             _make_skill(tmp_path, "brainstorming", body="BRAINSTORM BODY")
-            _make_skill(tmp_path, "plan", body="PLAN BODY")
+            _make_skill(tmp_path, "custom-plan", body="PLAN BODY")
             scan_skill_commands()
-            msg = build_skill_invocation_message("/plan", "design the feature")
+            msg = build_skill_invocation_message("/custom-plan", "design the feature")
 
         assert msg is not None
         assert "PLAN BODY" in msg
@@ -676,11 +676,11 @@ class TestConfiguredSkillCommandPreloads:
             ),
         ):
             _make_skill(tmp_path, "brainstorming", body="BRAINSTORM BODY")
-            _make_skill(tmp_path, "plan", body="PLAN BODY")
+            _make_skill(tmp_path, "custom-plan", body="PLAN BODY")
             scan_skill_commands()
-            before = build_skill_invocation_message("/plan", "before")
-            skills_config["command_preloads"] = {"plan": "brainstorming"}
-            after = build_skill_invocation_message("/plan", "after")
+            before = build_skill_invocation_message("/custom-plan", "before")
+            skills_config["command_preloads"] = {"custom-plan": "brainstorming"}
+            after = build_skill_invocation_message("/custom-plan", "after")
 
         assert before is not None and "BRAINSTORM BODY" not in before
         assert after is not None and after.index("BRAINSTORM BODY") < after.index(
@@ -690,13 +690,13 @@ class TestConfiguredSkillCommandPreloads:
     def test_simple_configured_preload_runs_before_target(self, tmp_path):
         with (
             patch("tools.skills_tool.SKILLS_DIR", tmp_path),
-            self._config({"plan": ["brainstorming"]}),
+            self._config({"custom-plan": ["brainstorming"]}),
         ):
             _make_skill(tmp_path, "brainstorming", body="BRAINSTORM BODY")
-            _make_skill(tmp_path, "plan", body="PLAN BODY")
+            _make_skill(tmp_path, "custom-plan", body="PLAN BODY")
             scan_skill_commands()
             msg = build_skill_invocation_message(
-                "/plan",
+                "/custom-plan",
                 "design the feature",
                 runtime_note="keep this note",
             )
@@ -706,7 +706,7 @@ class TestConfiguredSkillCommandPreloads:
         assert msg is not None
         assert msg.index("BRAINSTORM BODY") < msg.index("PLAN BODY")
         assert msg.count("BRAINSTORM BODY") == 1
-        assert 'invoked the "/plan" stacked skill bundle' in msg
+        assert 'invoked the "/custom-plan" stacked skill bundle' in msg
         assert "User instruction: design the feature" in msg
         assert "[Runtime note: keep this note]" in msg
         assert extract_user_instruction_from_skill_message(msg) == "design the feature"
@@ -727,20 +727,20 @@ class TestConfiguredSkillCommandPreloads:
     def test_stacked_invocation_preserves_explicit_order(self, tmp_path):
         with (
             patch("tools.skills_tool.SKILLS_DIR", tmp_path),
-            self._config({"plan": ["brainstorming"]}),
+            self._config({"custom-plan": ["brainstorming"]}),
         ):
             _make_skill(tmp_path, "skill-a", body="BODY A")
             _make_skill(tmp_path, "brainstorming", body="BRAINSTORM BODY")
-            _make_skill(tmp_path, "plan", body="PLAN BODY")
+            _make_skill(tmp_path, "custom-plan", body="PLAN BODY")
             _make_skill(tmp_path, "skill-b", body="BODY B")
             scan_skill_commands()
             result = build_stacked_skill_invocation_message(
-                ["/skill-a", "/plan", "/skill-b"], "design it"
+                ["/skill-a", "/custom-plan", "/skill-b"], "design it"
             )
 
         assert result is not None
         msg, loaded, missing = result
-        assert loaded == ["skill-a", "brainstorming", "plan", "skill-b"]
+        assert loaded == ["skill-a", "brainstorming", "custom-plan", "skill-b"]
         assert missing == []
         assert msg.index("BODY A") < msg.index("BRAINSTORM BODY")
         assert msg.index("BRAINSTORM BODY") < msg.index("PLAN BODY")
@@ -749,19 +749,19 @@ class TestConfiguredSkillCommandPreloads:
     def test_explicit_preload_is_not_duplicated_or_reordered(self, tmp_path):
         with (
             patch("tools.skills_tool.SKILLS_DIR", tmp_path),
-            self._config({"plan": ["brainstorming"]}),
+            self._config({"custom-plan": ["brainstorming"]}),
         ):
-            _make_skill(tmp_path, "plan", body="PLAN BODY")
+            _make_skill(tmp_path, "custom-plan", body="PLAN BODY")
             _make_skill(tmp_path, "brainstorming", body="BRAINSTORM BODY")
             _make_skill(tmp_path, "skill-b", body="BODY B")
             scan_skill_commands()
             result = build_stacked_skill_invocation_message(
-                ["/plan", "/brainstorming", "/skill-b"], "design it"
+                ["/custom-plan", "/brainstorming", "/skill-b"], "design it"
             )
 
         assert result is not None
         msg, loaded, missing = result
-        assert loaded == ["plan", "brainstorming", "skill-b"]
+        assert loaded == ["custom-plan", "brainstorming", "skill-b"]
         assert missing == []
         assert msg.count("BRAINSTORM BODY") == 1
         assert msg.index("PLAN BODY") < msg.index("BRAINSTORM BODY")
@@ -769,10 +769,10 @@ class TestConfiguredSkillCommandPreloads:
     def test_disabled_preload_is_ignored(self, tmp_path, monkeypatch):
         with (
             patch("tools.skills_tool.SKILLS_DIR", tmp_path),
-            self._config({"plan": ["brainstorming"]}),
+            self._config({"custom-plan": ["brainstorming"]}),
         ):
             _make_skill(tmp_path, "brainstorming", body="BRAINSTORM BODY")
-            _make_skill(tmp_path, "plan", body="PLAN BODY")
+            _make_skill(tmp_path, "custom-plan", body="PLAN BODY")
             scan_skill_commands()
             import agent.skill_utils as skill_utils
 
@@ -781,7 +781,7 @@ class TestConfiguredSkillCommandPreloads:
                 "get_disabled_skill_names",
                 lambda platform=None: {"brainstorming"},
             )
-            msg = build_skill_invocation_message("/plan", "design it")
+            msg = build_skill_invocation_message("/custom-plan", "design it")
 
         assert msg is not None
         assert "PLAN BODY" in msg
@@ -790,15 +790,15 @@ class TestConfiguredSkillCommandPreloads:
     def test_unavailable_preload_does_not_block_target(self, tmp_path):
         with (
             patch("tools.skills_tool.SKILLS_DIR", tmp_path),
-            self._config({"plan": ["not-installed"]}),
+            self._config({"custom-plan": ["not-installed"]}),
         ):
-            _make_skill(tmp_path, "plan", body="PLAN BODY")
+            _make_skill(tmp_path, "custom-plan", body="PLAN BODY")
             scan_skill_commands()
-            result = build_stacked_skill_invocation_message(["/plan"], "design it")
+            result = build_stacked_skill_invocation_message(["/custom-plan"], "design it")
 
         assert result is not None
         msg, loaded, missing = result
-        assert loaded == ["plan"]
+        assert loaded == ["custom-plan"]
         assert missing == []
         assert "PLAN BODY" in msg
 
@@ -823,17 +823,17 @@ class TestConfiguredSkillCommandPreloads:
         preload_names = [f"preload-{index}" for index in range(5)]
         with (
             patch("tools.skills_tool.SKILLS_DIR", tmp_path),
-            self._config({"plan": preload_names}),
+            self._config({"custom-plan": preload_names}),
         ):
             for name in preload_names:
                 _make_skill(tmp_path, name, body=f"BODY {name}")
-            _make_skill(tmp_path, "plan", body="PLAN BODY")
+            _make_skill(tmp_path, "custom-plan", body="PLAN BODY")
             scan_skill_commands()
-            result = build_stacked_skill_invocation_message(["/plan"], "go")
+            result = build_stacked_skill_invocation_message(["/custom-plan"], "go")
 
         assert result is not None
         _msg, loaded, missing = result
-        assert loaded == [*preload_names[:4], "plan"]
+        assert loaded == [*preload_names[:4], "custom-plan"]
         assert missing == []
 
 

@@ -92,6 +92,85 @@ def _interrupt_twice(monkeypatch, delegation_id, while_running=None):
         assert not thread.is_alive()
     return outcomes
 
+
+def test_status_projection_redacts_backing_identity_and_reports_cleanup_failure():
+    from tools.delegation_control import delegation_control
+
+    repository = ad._repository()
+    authority = {
+        "version": 1,
+        "profile": {
+            "name": "isolated",
+            "hash": "profile-hash",
+            "snapshot": {
+                "backend": "docker",
+                "image": "image@sha256:abc",
+                "network": "none",
+                "qualified_mcp_servers": [],
+            },
+        },
+        "visible_objects": [{
+            "path": "/workspace/input",
+            "mode": "ro",
+            "object_type": "directory",
+            "backing": {
+                "object_id": "input",
+                "kind": "host_path",
+                "identity": "/host/private/control-input",
+                "revision": "rev-1",
+            },
+        }],
+        "lineage": {
+            "scope_id": "scope-control",
+            "attempt_id": "attempt-control-authority",
+            "parent_attempt_id": None,
+        },
+        "state": {"revoked": False, "cleaned": False},
+    }
+    repository.register_initial_dispatch({
+        "delegation_id": "deleg-control-authority",
+        "session_key": "owner",
+        "origin_ui_session_id": "ui-owner",
+        "parent_session_id": "parent-owner",
+        "goal": "protected work",
+        "root_subagent_ids": ["sa-control-authority"],
+        "attempt_ids_by_logical_id": {
+            "sa-control-authority": "attempt-control-authority"
+        },
+        "authority_by_logical_id": {"sa-control-authority": authority},
+    })
+    repository.transition_attempt(
+        "attempt-control-authority",
+        {"starting"},
+        "error",
+        metadata={
+            "status": "error",
+            "exit_reason": "cleanup_error",
+            "error": "Protected cleanup failed",
+        },
+    )
+
+    raw = delegation_control(
+        action="status",
+        delegation_id="deleg-control-authority",
+        session_key="owner",
+    )
+    payload = json.loads(raw)
+    child = payload["subagents"][0]
+
+    assert "/host/private/control-input" not in raw
+    assert "authority" not in child
+    assert child["authority_audit"]["visible_objects"][0]["backing"][
+        "identity"
+    ] == "[REDACTED]"
+    assert child["authority_audit"]["outcome"]["execution"] == "error"
+    assert child["authority_audit"]["outcome"]["cleanup"] == "failed"
+    assert child["authority_audit"]["state"] == {
+        "revoked": True,
+        "cleaned": False,
+    }
+
+
 def test_tool_schema_and_runtime_validation_are_strict():
     import tools.delegation_control  # noqa: F401
     from tools.delegation_control import _handle_delegation_args, delegation_control

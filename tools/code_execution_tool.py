@@ -405,6 +405,11 @@ def _call(tool_name, args):
 def _get_or_create_env(task_id: str):
     """``(env, env_type)`` — the environment the terminal/file tools share for *task_id*, created on
     first use (same double-checked per-task lock pattern as file_tools._get_file_ops)."""
+    from tools.delegation_scope import attempt_scope_registry
+    if attempt_scope_registry.get(task_id or "") is not None:
+        from tools.terminal_tool import acquire_task_environment
+        env, kind, _effective = acquire_task_environment(task_id)
+        return env, kind
     from tools.terminal_tool_backends import _container_config_from_config, _create_environment, _ssh_config_from_config
     from tools.terminal_tool import (
         _active_environments, _env_lock, _get_env_config, _last_activity,

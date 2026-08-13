@@ -22,10 +22,20 @@ from unittest import mock
 
 from tools.read_extract import (
     ExtractionError,
+    extract_document_bytes,
     extract_document_text,
     is_extractable_document,
 )
 from tools.file_tools import read_file_tool
+
+
+def test_notebook_extraction_accepts_scoped_bytes_without_host_path():
+    payload = json.dumps({
+        "cells": [{"cell_type": "markdown", "source": ["scoped bytes"]}],
+        "metadata": {}, "nbformat": 4, "nbformat_minor": 5,
+    }).encode()
+
+    assert "scoped bytes" in extract_document_bytes(payload, "inside.ipynb")
 
 
 # ---------------------------------------------------------------------------
@@ -341,7 +351,6 @@ class TestNotebookExtraction(unittest.TestCase):
         # Order preserved: markdown before code.
         self.assertLess(text.index("Title"), text.index("print(x)"))
 
-
     def test_empty_cells_raises(self):
         p = os.path.join(self.tmp, "empty.ipynb")
         _write_notebook(p, [])
@@ -654,6 +663,7 @@ class TestReadFileToolIntegration(unittest.TestCase):
         res = json.loads(read_file_tool(p))
         self.assertTrue(res.get("extracted_document"))
         self.assertIn("Report body", res["content"])
+        self.assertEqual(res["file_size"], os.path.getsize(p))
 
     def test_backend_only_anydoc_path_uses_transferred_bytes(self):
         from tools import file_tools, read_extract

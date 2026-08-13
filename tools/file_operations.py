@@ -18,6 +18,8 @@ import json
 import logging
 import secrets
 import unicodedata
+import base64
+import shlex
 from abc import ABC, abstractmethod
 from typing import Optional, Dict
 from pathlib import Path
@@ -1651,3 +1653,20 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
                 f"an unattended privacy prompt: {skipped}. Search a protected "
                 "folder directly when access is intentional.")
         return result
+
+    def read_bytes(self, path: str) -> bytes:
+        """Read exact bytes through the governed execution environment."""
+        result = self._exec(f"base64 < {shlex.quote(path)}")
+        if result.exit_code != 0:
+            raise OSError(f"could not read scoped file: {path}")
+        try:
+            return base64.b64decode(result.stdout, validate=False)
+        except ValueError as exc:
+            raise OSError(f"invalid scoped byte stream for: {path}") from exc
+
+    def stat_size(self, path: str) -> int:
+        """Return byte size without consulting the host filesystem."""
+        result = self._exec(f"wc -c < {shlex.quote(path)}")
+        if result.exit_code != 0:
+            raise OSError(f"could not stat scoped file: {path}")
+        return int(result.stdout.strip())
