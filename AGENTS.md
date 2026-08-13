@@ -1085,6 +1085,49 @@ Durability rule: background `delegate_task` is detached from the current
 turn but still process-local. For work that must survive process restart, use
 `cronjob` or `terminal(background=True, notify_on_complete=True)` instead.
 
+### Protected execution-profile image contributions
+
+An execution profile's Hermes tool allowlist does not install binaries inside
+its container. A profile intended for coding or validation must therefore use
+an image that already contains the command-line/runtime dependencies its
+subagent will need, especially when `network: none` prevents task-time installs.
+
+When preparing or supplementing such an image:
+
+1. **Commit a reproducible text recipe, not an image blob.** The contribution
+   may contain Dockerfiles, package/version declarations, config examples,
+   documentation, and static text/schema checks. Never add `docker save`
+   archives, rootfs tarballs, OCI layouts/layers, generated container
+   filesystems, or registry credentials to Git.
+2. **Match the advertised workload.** A general source-tree worker should at
+   least be able to inspect Git and run the repository's normal Python and
+   JavaScript entrypoints. The maintained sample in
+   `containers/delegation/Dockerfile` includes Git, Python, pytest, PyYAML,
+   Node.js, and npm. Browser work uses the separately pinned
+   `containers/delegation-browser/Dockerfile`.
+3. **Stay non-root and self-contained.** Keep the image's fixed non-root user,
+   do not add Docker/socket/SSH credentials, and do not rely on an operator's
+   host virtualenv being runnable in the container. Install required packages
+   at image-build time.
+4. **Keep specialized dependencies specialized.** Put project-only compilers,
+   SDKs, or native libraries in a derived profile recipe rather than bloating
+   every protected worker image or changing the runtime authority contract.
+5. **Keep live Docker validation explicitly opt-in.** Docker CLI or daemon
+   execution for these profile recipes must not run in the default test suite
+   or a required CI check: execution profiles are optional and contributor
+   environments are not guaranteed to have Docker. Keep static Dockerfile/config
+   checks in the normal suite. Keep live build/materialization checks behind
+   `HERMES_RUN_OPTIONAL_DOCKER_PROFILE_TESTS=1`; only an agent or operator in an
+   intentionally Docker-equipped environment should enable them together with
+   pytest's `-m integration` selector. Without the exact environment opt-in,
+   test collection must not probe the Docker CLI or daemon; without the marker
+   selector, pytest does not execute the live tests.
+
+`containers/delegation/README.md` contains optional manual build/non-root probe
+commands, the opt-in live-test command, and a digest-pinned profile sample. A
+locally produced image ID or digest is validation/publish output, not a file to
+commit.
+
 ---
 
 ## Curator (skill lifecycle)
