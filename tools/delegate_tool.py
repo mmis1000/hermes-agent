@@ -208,6 +208,10 @@ def _build_child_agent(
         from agent.delegation_policy import derive_child_policy
         child_toolsets = [name for name in child_toolsets if name in resolved_scope.profile.allowed_toolsets]
         child_delegation_policy = derive_child_policy(delegation_policy_override or parent_agent.delegation_policy, resolved_scope.visible_objects, allowed_profiles={resolved_scope.profile_name})
+    scope_context = None
+    if resolved_scope is not None:
+        from tools.delegation_scope import format_effective_scope_context
+        scope_context = format_effective_scope_context(resolved_scope)
     child_prompt = _build_child_system_prompt(
         goal, context, workspace_path=_resolve_workspace_hint(parent_agent), role=effective_role,
         max_spawn_depth=max_spawn, child_depth=child_depth,
@@ -305,50 +309,8 @@ def _build_child_agent(
     if resolved_scope is not None:
         child.delegation_backing_registry = getattr(parent_agent, "delegation_backing_registry", None)
     if child_delegation_policy is not None:
-        setattr(
-            child,
-            "delegation_backing_registry",
-            getattr(parent_agent, "delegation_backing_registry", None),
-        )
-        # Final admission filter: retain only names classified into the
-        # operator-owned profile toolsets.  Pin exact names so later plugin/MCP
-        # registry growth cannot widen this protected session.
-        allowed_profile_toolsets = set(resolved_scope.profile.allowed_toolsets)
-        protected_names = _qualified_protected_tool_names(
-            set(getattr(child, "valid_tool_names", set())),
-            allowed_profile_toolsets,
-            resolved_scope.profile.qualified_mcp_servers,
-        )
-        if (
-            effective_role == "orchestrator"
-            and "delegation" in allowed_profile_toolsets
-        ):
-            protected_names.add("delegate_task")
-        protected_tools = [
-            item for item in (getattr(child, "tools", None) or [])
-            if item.get("function", {}).get("name") in protected_names
-        ]
-        setattr(child, "tools", protected_tools)
-        setattr(child, "valid_tool_names", protected_names)
-        setattr(child, "_protected_tool_snapshot", frozenset(protected_names))
-        setattr(
-            child,
-            "_protected_qualified_mcp_servers",
-            frozenset(resolved_scope.profile.qualified_mcp_servers),
-        )
-        from tools.mcp_tool import get_mcp_tool_server_qualification
-
-        setattr(
-            child,
-            "_protected_mcp_tool_provenance",
-            {
-                name: provenance
-                for name in protected_names
-                if (
-                    provenance := get_mcp_tool_server_qualification(name)
-                ) is not None
-            },
-        )
+        child.delegation_backing_registry = getattr(parent_agent, "delegation_backing_registry", None)
+        configure_protected_agent_tools(child, resolved_scope.profile)
     return child
 
 def _run_single_child(

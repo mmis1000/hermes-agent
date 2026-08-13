@@ -449,6 +449,70 @@ def test_protected_orchestrator_policy_and_toolsets_derive_only_from_effective_s
     assert child.delegation_backing_registry is parent.delegation_backing_registry
 
 
+def test_unbounded_parent_without_reveal_builds_unbounded_orchestrator_child():
+    profile = ExecutionProfile(
+        name="isolated",
+        backend="docker",
+        image="repo/isolated@sha256:deadbeef",
+        default_workdir="/work",
+        allowed_toolsets=frozenset({"terminal", "delegation"}),
+    )
+    parent_policy = DelegationSessionPolicy(
+        profile_required=True,
+        allow_profile_none=False,
+        allowed_profiles={"isolated"},
+        profile_snapshots={"isolated": profile},
+        visible_objects=None,
+        protected_prefixes=(),
+    )
+    scope = ResolvedInvocationScope(
+        profile_name="isolated",
+        profile_hash=execution_profile_hash(profile),
+        profile=profile,
+        workdir=PurePosixPath("/work"),
+        reveal=(),
+        visible_objects=(),
+    )
+    parent = MagicMock()
+    parent.delegation_policy = parent_policy
+    parent.delegation_backing_registry = None
+    parent.enabled_toolsets = ["terminal", "delegation"]
+    parent.disabled_toolsets = []
+    parent._delegate_depth = 0
+    parent._session_db = None
+    parent.providers_allowed = None
+    parent.providers_ignored = None
+    parent.providers_order = None
+    parent.provider_sort = None
+    parent.provider_require_parameters = False
+    parent.provider_data_collection = ""
+    parent.request_overrides = {}
+
+    with patch("tools.delegate_tool._get_max_spawn_depth", return_value=3), patch(
+        "run_agent.AIAgent"
+    ) as agent_cls:
+        child = MagicMock()
+        child.valid_tool_names = {"terminal", "delegate_task"}
+        child.tools = [{"function": {"name": name}} for name in child.valid_tool_names]
+        agent_cls.return_value = child
+        from tools.delegate_tool import _build_child_agent
+
+        _build_child_agent(
+            task_index=0,
+            goal="delegate again",
+            context=None,
+            toolsets=None,
+            model="test-model",
+            max_iterations=3,
+            task_count=1,
+            parent_agent=parent,
+            role="orchestrator",
+            resolved_scope=scope,
+        )
+
+    assert agent_cls.call_args.kwargs["delegation_policy"].visible_objects is None
+
+
 def test_synchronous_nested_child_uses_fresh_physical_identity_for_run_and_cleanup():
     profile = ExecutionProfile(
         name="isolated",

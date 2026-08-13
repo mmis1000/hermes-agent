@@ -212,7 +212,7 @@ def _admit_standard_delegation_policy(explicit_policy):
         allow_profile_none=False,
         allowed_profiles=frozenset(raw_allowed),
         profile_snapshots=snapshots,
-        visible_objects=(),
+        visible_objects=None,
         protected_prefixes=(),
     )
 
@@ -747,6 +747,8 @@ def _init_prompt_cache_config(agent):
 
 
 def _init_turn_state(agent, run_budget_seconds):
+    from tools.foreground_wait import ForegroundWaitRegistry
+    agent._foreground_waits = ForegroundWaitRegistry()
     _set_defaults(agent, _TURN_STATE)
     # Wall-clock run budget per turn: constructor arg wins, else agent.run_budget_seconds
     # (in _apply_agent_section). None = fully off (no clock reads, injection, or capping).
@@ -1186,7 +1188,7 @@ def _load_tools(agent, enabled_toolsets, disabled_toolsets):
     agent.tools = model_tools.get_tool_definitions(
         enabled_toolsets=enabled_toolsets, disabled_toolsets=disabled_toolsets,
         quiet_mode=agent.quiet_mode,
-        delegation_policy=agent.delegation_policy,
+        delegation_policy=getattr(agent, "delegation_policy", None),
     )
     # A finite -q run has no later session to learn for: no skill authoring tool (agent/oneshot_footprint.py).
     from agent.oneshot_footprint import prune_oneshot_tools
@@ -2474,7 +2476,11 @@ def init_agent(
     _install_safe_stdio()
 
     agent.delegation_policy = _admit_standard_delegation_policy(delegation_policy)
-    agent.delegation_backing_registry = None
+    if agent.delegation_policy is not None:
+        from tools.delegation_scope import BackingObjectRegistry
+        agent.delegation_backing_registry = BackingObjectRegistry()
+    else:
+        agent.delegation_backing_registry = None
     agent.resolved_invocation_scope = None
     agent._delegation_scope = None
     _params = locals()

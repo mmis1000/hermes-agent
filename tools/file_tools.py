@@ -311,78 +311,49 @@ def _create_terminal_env_for_file_ops(raw_task_id: str, task_id: str):
 
 
 def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
-    """Get or create ShellFileOperations for the task's terminal environment.
+    """Get or create ShellFileOperations for a terminal environment.
 
-    Uses terminal_tool's per-task creation locks (no duplicate sandboxes).
-    Subagent task_ids collapse to "default" (``_resolve_container_task_id``) so
-    delegate_task children share the parent's container; RL/benchmark task_ids
-    with a registered env override keep their isolation.
+    Respects the TERMINAL_ENV setting -- if the task_id doesn't have an
+    environment yet, creates one using the configured backend (local, docker,
+    modal, etc.) rather than always defaulting to local.
+
+    Thread-safe: uses the same per-task creation locks as terminal_tool to
+    prevent duplicate sandbox creation from concurrent tool calls.
+
+    Note: subagent task_ids are collapsed to "default" via
+    ``_resolve_container_task_id`` so delegate_task children share the
+    parent's container and its cached file_ops. RL/benchmark task_ids with
+    a registered env override keep their isolation.
     """
-    from tools.delegation_scope import attempt_scope_registry
-    if attempt_scope_registry.get(task_id or "") is not None:
-        from tools.terminal_tool import acquire_task_environment
-        env, _kind, effective = acquire_task_environment(task_id)
-        with _file_ops_lock:
-            ops = _file_ops_cache.get(effective)
-            if ops is None or getattr(ops, "env", None) is not env:
-                ops = ShellFileOperations(env)
-                _file_ops_cache[effective] = ops
-            return ops
     from tools.terminal_tool import (
-        _active_environments, _env_lock, _last_activity, _start_cleanup_thread,
-        _creation_locks, _creation_locks_lock, _resolve_container_task_id,
-        get_session_cwd, record_session_cwd)
+        acquire_task_environment,
+        _resolve_container_task_id,
+        record_session_cwd,
+    )
 
     raw_task_id = task_id or "default"
-    task_id = _resolve_container_task_id(raw_task_id)
-
-    # Fast path: cached AND the environment is still alive (cleanup thread may have killed it).
+    # Preserve ordinary-session cwd recovery before central acquisition drops a
+    # stale file-ops entry. Protected attempts never collapse to this ordinary
+    # cache key, but the compatibility path must keep the pre-centralization
+    # behavior.
+    prospective_id = _resolve_container_task_id(raw_task_id)
     with _file_ops_lock:
-        cached = _file_ops_cache.get(task_id)
-    if cached is not None:
-        with _env_lock:
-            if task_id in _active_environments:
-                _last_activity[task_id] = time.time()
-                return cached
-            # Env was cleaned up: rescue its cwd into the session record FILL-ONLY
-            # (``cached.cwd`` is the SHARED env's cwd, not this session's own).
-            # Environment was cleaned up -- preserve the old cwd in the session record before invalidating
-            # the stale cache entry (fixes #26211: silent file-creation failures in long-running
-            # conversations). Usually a no-op: every completed command already recorded its cwd. Fill-only:
-            # ``cached.cwd`` is a snapshot of the SHARED env's cwd at cache-build time, so it is not
-            # attributable to this session (same class as the interrupted-command bug, #85658). Rescue a
-            # session that has no record, but never overwrite a record the session wrote for itself.
-            old_cwd = getattr(cached, "cwd", None)
-            if old_cwd:
-                try:
-                    if get_session_cwd(raw_task_id) is None:
-                        record_session_cwd(raw_task_id, old_cwd)
-                except Exception:
-                    pass
-            with _file_ops_lock:
-                _file_ops_cache.pop(task_id, None)
+        stale = _file_ops_cache.get(prospective_id)
+    if stale is not None and getattr(stale, "env", None) is None:
+        stale_cwd = getattr(stale, "cwd", None)
+        if stale_cwd:
+            record_session_cwd(raw_task_id, stale_cwd)
 
-    with _creation_locks_lock:
-        task_lock = _creation_locks.setdefault(task_id, threading.Lock())
-
-    with task_lock:
-        # Double-check: another thread may have created it while we waited.
-        with _env_lock:
-            terminal_env = _active_environments.get(task_id)
-            if terminal_env is not None:
-                _last_activity[task_id] = time.time()
-        if terminal_env is None:
-            env_type, terminal_env = _create_terminal_env_for_file_ops(raw_task_id, task_id)
-            with _env_lock:
-                _active_environments[task_id] = terminal_env
-                _last_activity[task_id] = time.time()
-            _start_cleanup_thread()
-            logger.info("%s environment ready for task %s", env_type, task_id[:8])
-
-    file_ops = ShellFileOperations(terminal_env)
+    terminal_env, _env_type, effective_task_id = acquire_task_environment(
+        raw_task_id
+    )
     with _file_ops_lock:
-        _file_ops_cache[task_id] = file_ops
-    return file_ops
+        cached = _file_ops_cache.get(effective_task_id)
+        if cached is not None and getattr(cached, "env", None) is terminal_env:
+            return cached
+        file_ops = ShellFileOperations(terminal_env)
+        _file_ops_cache[effective_task_id] = file_ops
+        return file_ops
 
 
 def clear_file_ops_cache(task_id: str = None):
