@@ -241,8 +241,10 @@ class TestMCPParallelSafetyProvenance:
         second_tool = "mcp__foo_bar__second"
         with mcp_tool._lock:
             saved_map = dict(mcp_tool._mcp_tool_server_names)
+            saved_qualifications = dict(mcp_tool._mcp_tool_server_qualifications)
             saved_parallel = set(mcp_tool._parallel_safe_servers)
             mcp_tool._mcp_tool_server_names.clear()
+            mcp_tool._mcp_tool_server_qualifications.clear()
             mcp_tool._parallel_safe_servers.clear()
             mcp_tool._parallel_safe_servers.add("foo-bar")
 
@@ -256,10 +258,15 @@ class TestMCPParallelSafetyProvenance:
                 "foo-bar",
                 "foo_bar",
             }
+            with mcp_tool._lock:
+                assert mcp_tool._mcp_tool_server_qualifications[first_tool] == "foo-bar"
+                assert mcp_tool._mcp_tool_server_qualifications[second_tool] == "foo_bar"
         finally:
             with mcp_tool._lock:
                 mcp_tool._mcp_tool_server_names.clear()
                 mcp_tool._mcp_tool_server_names.update(saved_map)
+                mcp_tool._mcp_tool_server_qualifications.clear()
+                mcp_tool._mcp_tool_server_qualifications.update(saved_qualifications)
                 mcp_tool._parallel_safe_servers.clear()
                 mcp_tool._parallel_safe_servers.update(saved_parallel)
 
@@ -2784,6 +2791,51 @@ class TestMCPBuiltinCollisionGuard:
 
         _servers.pop("srv", None)
 
+    def test_mcp_tool_with_ambiguous_existing_mcp_owner_is_rejected(self):
+        """An MCP entry without exact owner metadata cannot be overwritten."""
+        from tools.registry import ToolRegistry
+        from tools.mcp_tool_discovery import _discover_and_register_server
+        from tools.mcp_tool import _servers, MCPServerTask
+
+        mock_registry = ToolRegistry()
+
+        # Pre-register an MCP tool from a different server.
+        mcp_schema = {
+            "name": "mcp__srv__do_thing",
+            "description": "From another MCP server",
+            "parameters": {"type": "object", "properties": {}},
+        }
+        mock_registry.register(
+            name="mcp__srv__do_thing", toolset="mcp-old",
+            schema=mcp_schema, handler=lambda a, **k: "{}",
+        )
+
+        mock_tools = [_make_mcp_tool("do_thing", "Do a thing")]
+        mock_session = MagicMock()
+
+        async def fake_connect(name, config):
+            server = MCPServerTask(name)
+            server.session = mock_session
+            server._tools = mock_tools
+            return server
+
+        with patch("tools.mcp_tool_discovery._connect_server", side_effect=fake_connect), \
+             patch("tools.registry.registry", mock_registry):
+            registered = asyncio.run(
+                _discover_and_register_server("srv", {"command": "test", "args": []})
+            )
+
+        # Cross-server MCP collisions fail closed: the existing owner stays active.
+        assert "mcp__srv__do_thing" not in registered
+        entry = mock_registry.get_entry("mcp__srv__do_thing")
+        assert entry is not None
+        assert entry.toolset == "mcp-old"
+        assert entry.schema["description"] == "From another MCP server"
+        assert "mcp__srv__do_thing" not in registered
+        assert mock_registry.get_toolset_for_tool("mcp__srv__do_thing") == "mcp-old"
+
+        _servers.pop("srv", None)
+
 
 # ---------------------------------------------------------------------------
 # sanitize_mcp_name_component
@@ -2931,7 +2983,38 @@ class TestRegisterMcpServers:
 class TestMcpParallelToolCalls:
     """Tests for the supports_parallel_tool_calls config option."""
 
+    def test_sanitized_server_collision_cannot_replace_handler_or_provenance(self):
+        from tools.mcp_tool import (
+            _forget_mcp_tool_server,
+            _register_server_tools,
+            get_mcp_tool_server_qualification,
+        )
+        from tools.registry import registry
 
+        first = _make_mock_server(
+            "validation-race-safe", tools=[_make_mcp_tool("probe")]
+        )
+        colliding = _make_mock_server(
+            "validation_race_safe", tools=[_make_mcp_tool("probe")]
+        )
+        tool_name = "mcp__validation_race_safe__probe"
+        registry.deregister(tool_name)
+        _forget_mcp_tool_server(tool_name)
+        try:
+            assert _register_server_tools("validation-race-safe", first, {}) == [
+                tool_name
+            ]
+            admitted_entry = registry.get_entry(tool_name)
+            assert admitted_entry is not None
+
+            assert _register_server_tools("validation_race_safe", colliding, {}) == []
+
+            current = registry.get_entry(tool_name)
+            assert current is admitted_entry
+            assert get_mcp_tool_server_qualification(tool_name) == "validation-race-safe"
+        finally:
+            registry.deregister(tool_name)
+            _forget_mcp_tool_server(tool_name)
 
     def test_register_mcp_servers_tracks_parallel_flag(self):
         """register_mcp_servers populates _parallel_safe_servers from config."""

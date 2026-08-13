@@ -51,6 +51,28 @@ def test_cwd_only_override_collapses_to_default():
         terminal_tool.clear_task_env_overrides("acp-session-abc")
 
 
+def test_delegation_scope_override_keeps_physical_attempt_isolated():
+    terminal_tool.register_task_env_overrides(
+        "attempt-protected",
+        {"cwd": "/workspace", "delegation_scope_id": "scope-protected"},
+    )
+    try:
+        assert (
+            terminal_tool._resolve_container_task_id("attempt-protected")
+            == "attempt-protected"
+        )
+    finally:
+        terminal_tool.clear_task_env_overrides("attempt-protected")
+
+
+def test_ordinary_task_is_not_a_protected_environment(monkeypatch):
+    created = []
+    monkeypatch.setattr(terminal_tool, "_create_environment", lambda **kwargs: created.append(kwargs))
+
+    assert terminal_tool.acquire_protected_environment("ordinary-child", timeout=45) is None
+    assert created == []
+
+
 def test_env_type_override_keeps_own_id():
     """env_type is an isolation key — must trigger per-task container."""
     terminal_tool.register_task_env_overrides(

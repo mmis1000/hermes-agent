@@ -1,3 +1,4 @@
+import queue
 """Tests for async (background) delegation — tools/async_delegation.py.
 
 Covers the dispatch handle, non-blocking behavior, completion-event delivery
@@ -552,6 +553,74 @@ assert ad.mark_completion_delivered({delegation_id!r})
     assert probe.stdout.strip().splitlines()[-1] == "0"
 
 
+def test_batch_persistence_failure_removes_partial_record_and_submits_no_runner(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    started = threading.Event()
+    monkeypatch.setattr(
+        ad,
+        "_persist_dispatch",
+        lambda _record: (_ for _ in ()).throw(RuntimeError("persistence failed")),
+    )
+
+    result = ad.dispatch_async_delegation_batch(
+        goals=["never ran"],
+        context=None,
+        toolsets=None,
+        role="leaf",
+        model="m",
+        session_key="owner",
+        runner=lambda: started.set() or {},
+        root_subagent_ids=["logical-a"],
+        attempt_ids_by_logical_id={"logical-a": "attempt-a"},
+        delegation_id="deleg-persist-failure",
+    )
+
+    assert result["status"] == "rejected"
+    assert result["reason"] == "dispatch_setup_failed"
+    assert not started.is_set()
+    assert "deleg-persist-failure" not in ad._records
+    assert ad.get_durable_delegation("deleg-persist-failure") is None
+
+
+
+
+
+
+
+
+
+
+def test_batch_bind_failure_removes_durable_record_and_submits_no_runner(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    started = threading.Event()
+
+    result = ad.dispatch_async_delegation_batch(
+        goals=["never ran"],
+        context=None,
+        toolsets=None,
+        role="leaf",
+        model="m",
+        session_key="owner",
+        runner=lambda: started.set() or {},
+        root_subagent_ids=["logical-a"],
+        attempt_ids_by_logical_id={"logical-a": "attempt-a"},
+        delegation_id="deleg-bind-failure",
+        _bind_attempts=lambda _run, _attempts: (_ for _ in ()).throw(
+            RuntimeError("bind failed")
+        ),
+    )
+
+    assert result["status"] == "rejected"
+    assert result["reason"] == "dispatch_setup_failed"
+    assert not started.is_set()
+    assert "deleg-bind-failure" not in ad._records
+    assert ad.get_durable_delegation("deleg-bind-failure") is None
+
+
 def test_recovery_completes_exact_old_run_without_mutating_live_new_run(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     record = {
@@ -573,6 +642,7 @@ def test_recovery_completes_exact_old_run_without_mutating_live_new_run(tmp_path
     assert ad.restore_undelivered_completions(restored) == 1
     event = restored.get_nowait()
     assert (event["run_id"], event["status"]) == (initial["run_id"], "unknown")
+    from tools.process_registry import prepare_notification_delivery, finish_notification_delivery
     assert prepare_notification_delivery(event) == "deliver"
     assert ad.inspect_async_delivery_claim(
         "deleg_abandoned",
@@ -598,11 +668,15 @@ def test_delegate_task_background_routes_async_and_does_not_block(monkeypatch):
     """delegate_task(background=True) returns a handle without running the
     child synchronously, and the child completes on the background thread.
     A single task is dispatched as a one-item background batch unit."""
-    from unittest.mock import MagicMock
+    from unittest.mock import MagicMock, patch
     import tools.delegate_tool as dt
 
     parent = MagicMock()
     parent._delegate_depth = 0
+    parent.model = "m"
+    parent.provider = "mock-provider"
+    parent.api_key = "test-key"
+    parent.base_url = None
     parent.session_id = "sess"
     parent._interrupt_requested = False
     parent._active_children = []
@@ -622,8 +696,10 @@ def test_delegate_task_background_routes_async_and_does_not_block(monkeypatch):
         }
 
     creds = {
-        "model": "m", "provider": None, "base_url": None, "api_key": None,
-        "api_mode": None, "command": None, "args": None,
+        "model": "m", "provider": "mock-provider",
+        "base_url": "https://mock-provider.invalid/v1",
+        "api_key": "mock-key", "api_mode": "chat_completions",
+        "command": None, "args": None,
     }
     # monkeypatch (not `with`) so patches outlive delegate_task's return and
     # remain active while the background worker runs.
@@ -687,8 +763,10 @@ def test_delegate_task_binds_exact_run_and_attempt_before_runner(tmp_path, monke
         }
 
     creds = {
-        "model": "m", "provider": None, "base_url": None, "api_key": None,
-        "api_mode": None, "command": None, "args": None,
+        "model": "m", "provider": "mock-provider",
+        "base_url": "https://mock-provider.invalid/v1",
+        "api_key": "mock-key", "api_mode": "chat_completions",
+        "command": None, "args": None,
     }
     monkeypatch.setattr(dt, "_build_child_agent", lambda **_kwargs: child)
     monkeypatch.setattr(dt, "_run_single_child", run_bound)
@@ -753,8 +831,10 @@ def test_background_child_persists_reconstruction_metadata_before_execution(
 
     child.run_conversation.side_effect = run_conversation
     creds = {
-        "model": "model-safe", "provider": None, "base_url": None,
-        "api_key": None, "api_mode": None, "command": None, "args": None,
+        "model": "model-safe", "provider": "provider-safe",
+        "base_url": "https://provider-safe.invalid/v1",
+        "api_key": "safe-key", "api_mode": "chat_completions",
+        "command": None, "args": None,
     }
     monkeypatch.setattr(dt, "_build_child_agent", lambda **_kwargs: child)
     monkeypatch.setattr(dt, "_resolve_delegation_credentials", lambda *_a, **_k: creds)
@@ -779,6 +859,7 @@ def test_background_child_persists_reconstruction_metadata_before_execution(
             "session_id": "child-session",
             "run_id": snapshot["run_id"],
             "attempt_id": durable_child["attempt_id"],
+            "delegation_id": payload["delegation_id"],
         }
     finally:
         release.set()
@@ -808,8 +889,10 @@ def test_delegate_task_background_uses_live_tui_agent_session_id(monkeypatch):
     fake_child._delegate_role = "leaf"
 
     creds = {
-        "model": "m", "provider": None, "base_url": None, "api_key": None,
-        "api_mode": None, "command": None, "args": None,
+        "model": "m", "provider": "mock-provider",
+        "base_url": "https://mock-provider.invalid/v1",
+        "api_key": "mock-key", "api_mode": "chat_completions",
+        "command": None, "args": None,
     }
     monkeypatch.setattr(dt, "_build_child_agent", lambda **kw: fake_child)
     monkeypatch.setattr(dt, "_resolve_delegation_credentials", lambda *a, **k: creds)
@@ -1097,6 +1180,10 @@ def _grouped_fanout(monkeypatch, tasks, gates):
 
     parent = MagicMock()
     parent._delegate_depth = 0
+    parent.model = "m"
+    parent.provider = "mock-provider"
+    parent.api_key = "test-key"
+    parent.base_url = None
     parent.session_id = "sess"
     parent._interrupt_requested = False
     parent._active_children = []
@@ -1113,7 +1200,7 @@ def _grouped_fanout(monkeypatch, tasks, gates):
         c._subagent_id = f"s{kw['task_index']}"
         return c
 
-    creds = {"model": "m", "provider": None, "base_url": None, "api_key": None, "api_mode": None, "command": None,
+    creds = {"model": "m", "provider": "mock-provider", "base_url": None, "api_key": None, "api_mode": None, "command": None,
              "args": None}
     monkeypatch.setattr(dt, "_build_child_agent", build)
     monkeypatch.setattr(dt, "_run_single_child", child)
@@ -1232,7 +1319,9 @@ def test_child_finished_before_crash_is_recovered_with_its_result(tmp_path):
 import os, sys, time
 from unittest.mock import MagicMock
 import tools.delegate_tool as dt
-parent = MagicMock(); parent._delegate_depth = 0; parent.session_id = "sess"; parent._interrupt_requested = False
+import hermes_cli.models as catalogs
+catalogs.cached_provider_model_ids = lambda provider, **kwargs: ["m"] if provider == "mock-provider" else []
+parent = MagicMock(); parent.model="m"; parent.provider="mock-provider"; parent.api_key="test-key"; parent.base_url=None; parent._delegate_depth = 0; parent.session_id = "sess"; parent._interrupt_requested = False
 parent._active_children = []; parent._active_children_lock = None
 def child(task_index, goal, child=None, parent_agent=None, **kw):
     if task_index == 1:
@@ -1241,7 +1330,7 @@ def child(task_index, goal, child=None, parent_agent=None, **kw):
             "duration_seconds": 0.1, "model": "m", "exit_reason": "completed"}
 def build(**kw):
     c = MagicMock(); c._delegate_role = "leaf"; c._subagent_id = f"s{kw['task_index']}"; return c
-creds = {"model": "m", "provider": None, "base_url": None, "api_key": None, "api_mode": None, "command": None, "args": None}
+creds = {"model": "m", "provider": "mock-provider", "base_url": None, "api_key": None, "api_mode": None, "command": None, "args": None}
 dt._build_child_agent = build; dt._run_single_child = child; dt._resolve_delegation_credentials = lambda *a, **k: creds
 dt.delegate_task(tasks=[{"goal": "fast member of the group task", "group": "g"},
                         {"goal": "slow member of the group task", "group": "g"}], background=True, parent_agent=parent)
@@ -1280,14 +1369,16 @@ import os, sys, time
 from unittest.mock import MagicMock
 import tools.delegate_tool as dt
 import tools.delegate_tool_dispatch as dtd
-parent = MagicMock(); parent._delegate_depth = 0; parent.session_id = "sess"; parent._interrupt_requested = False
+import hermes_cli.models as catalogs
+catalogs.cached_provider_model_ids = lambda provider, **kwargs: ["m"] if provider == "mock-provider" else []
+parent = MagicMock(); parent.model="m"; parent.provider="mock-provider"; parent.api_key="test-key"; parent.base_url=None; parent._delegate_depth = 0; parent.session_id = "sess"; parent._interrupt_requested = False
 parent._active_children = []; parent._active_children_lock = None
 def child(task_index, goal, child=None, parent_agent=None, **kw):
     return {"task_index": task_index, "status": "completed", "summary": f"done: {goal}", "api_calls": 1,
             "duration_seconds": 0.1, "model": "m", "exit_reason": "completed"}
 def build(**kw):
     c = MagicMock(); c._delegate_role = "leaf"; c._subagent_id = f"s{kw['task_index']}"; return c
-creds = {"model": "m", "provider": None, "base_url": None, "api_key": None, "api_mode": None, "command": None, "args": None}
+creds = {"model": "m", "provider": "mock-provider", "base_url": None, "api_key": None, "api_mode": None, "command": None, "args": None}
 dt._build_child_agent = build; dt._run_single_child = child; dt._resolve_delegation_credentials = lambda *a, **k: creds
 def held_finalize(*a, **k):
     # The child's result exists; the owner still has host-owned finalize + transcripts + manifest + the durable

@@ -8,7 +8,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-import yaml
+from ruamel.yaml import YAML
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 PLUGIN_DIR = REPO_ROOT / "plugins" / "observability" / "token_usage_report"
@@ -22,7 +22,7 @@ class TestManifest:
         assert (PLUGIN_DIR / "README.md").exists()
 
     def test_manifest_uses_current_request_hook(self):
-        data = yaml.safe_load((PLUGIN_DIR / "plugin.yaml").read_text(encoding="utf-8"))
+        data = YAML(typ="safe").load((PLUGIN_DIR / "plugin.yaml").read_text(encoding="utf-8"))
         assert data["name"] == "token_usage_report"
         assert data["version"]
         assert data["hooks"] == ["post_api_request"]
