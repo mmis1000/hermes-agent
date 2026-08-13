@@ -15057,6 +15057,71 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 except OSError:
                     pass
 
+    async def _deliver_queued_first_response(
+        self,
+        *,
+        response: str,
+        source,
+        adapter,
+        thread_metadata: Optional[Dict[str, Any]],
+        already_streamed: bool,
+        event_message_id: Optional[str] = None,
+    ) -> None:
+        """Deliver a completed response before processing a queued follow-up.
+
+        The queued-follow-up branch returns the recursively processed result to
+        its caller, so the ordinary completed-turn post-processing never sees
+        this first response.  Deliver its text here when streaming did not, and
+        always run the shared MEDIA handler so attachments are not lost.
+        """
+        from gateway.platforms.base import BasePlatformAdapter, MessageEvent
+
+        if response and not already_streamed:
+            display_response = BasePlatformAdapter.strip_media_directives_for_display(
+                response
+            ).strip()
+            if display_response:
+                try:
+                    result = await adapter.send(
+                        source.chat_id,
+                        display_response,
+                        metadata=thread_metadata,
+                    )
+                    if getattr(result, "success", None) is False:
+                        logger.warning(
+                            "[%s] Queued first-response text delivery failed "
+                            "(chat=%s thread=%s): %s",
+                            getattr(adapter, "name", "adapter"),
+                            source.chat_id,
+                            getattr(source, "thread_id", None),
+                            getattr(result, "error", None) or "unknown adapter error",
+                        )
+                except Exception as exc:
+                    # Text and attachment delivery are independent.  In
+                    # particular, a formatting/send failure must not discard a
+                    # valid document referenced by this completed response.
+                    logger.warning(
+                        "[%s] Queued first-response text delivery raised "
+                        "(chat=%s thread=%s): %s",
+                        getattr(adapter, "name", "adapter"),
+                        source.chat_id,
+                        getattr(source, "thread_id", None),
+                        exc,
+                    )
+
+        if response:
+            synthetic_event = MessageEvent(
+                text="",
+                source=source,
+                message_id=event_message_id,
+                internal=True,
+            )
+            await self._deliver_media_from_response(
+                response,
+                synthetic_event,
+                adapter,
+            )
+
     async def _deliver_media_from_response(
         self,
         response: str,
@@ -20041,7 +20106,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             # Verbose mode: show detailed arguments, respects tool_preview_length
             if progress_mode == "verbose":
-                if _code_block_full is not None:
+                if (
+                    _code_block_full is not None
+                    and source.platform != Platform.TELEGRAM
+                ):
                     last_was_terminal_block[0] = True
                     progress_queue.put(_code_block_full)
                     return
@@ -20049,13 +20117,124 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if args:
                     from agent.display import get_tool_preview_max_len
                     _pl = get_tool_preview_max_len()
-                    args_str = json.dumps(args, ensure_ascii=False, default=str)
-                    # When tool_preview_length is 0 (default), don't truncate
-                    # in verbose mode — the user explicitly asked for full
-                    # detail.  Platform message-length limits handle the rest.
-                    if _pl > 0 and len(args_str) > _pl:
+                    _telegram_rich_enabled = False
+                    if source.platform == Platform.TELEGRAM:
+                        _rich_gate = getattr(
+                            _progress_adapter,
+                            "_rich_delivery_enabled",
+                            None,
+                        )
+                        if callable(_rich_gate):
+                            try:
+                                _telegram_rich_enabled = bool(_rich_gate())
+                            except Exception:
+                                _telegram_rich_enabled = False
+                        else:
+                            _telegram_rich_enabled = bool(
+                                getattr(
+                                    _progress_adapter,
+                                    "_rich_messages_enabled",
+                                    False,
+                                )
+                            )
+                    _telegram_folded = (
+                        source.platform == Platform.TELEGRAM
+                        and _telegram_rich_enabled
+                    )
+                    _raw_terminal_command = (
+                        args.get("command")
+                        if _telegram_folded
+                        and tool_name == "terminal"
+                        and isinstance(args.get("command"), str)
+                        else None
+                    )
+                    _json_args = (
+                        {key: value for key, value in args.items() if key != "command"}
+                        if _raw_terminal_command is not None
+                        else args
+                    )
+                    args_str = json.dumps(
+                        _json_args,
+                        ensure_ascii=False,
+                        default=str,
+                        indent=2 if _telegram_folded else None,
+                    )
+                    # Rich Markdown must not let argument values terminate the
+                    # fence or disclosure element. These JSON unicode escapes
+                    # are lossless; '$' also avoids Telegram Desktop's known
+                    # details+math crash shape for LaTeX-like tool arguments.
+                    if _telegram_folded:
+                        args_str = args_str.translate(
+                            str.maketrans(
+                                {
+                                    "<": r"\u003c",
+                                    ">": r"\u003e",
+                                    "&": r"\u0026",
+                                    "`": r"\u0060",
+                                    "$": r"\u0024",
+                                }
+                            )
+                        )
+                    # Telegram's disclosure block is the full argument view, not
+                    # a preview, so never apply tool_preview_length to it. Other
+                    # platforms retain their existing configurable preview cap.
+                    if not _telegram_folded and _pl > 0 and len(args_str) > _pl:
                         args_str = args_str[:_pl - 3] + "..."
-                    msg = f"{emoji} {tool_name}({list(args.keys())})\n{args_str}"
+                    if _telegram_folded:
+                        from html import escape as _html_escape
+                        from agent.display import (
+                            get_tool_verb,
+                            tool_verb_connector,
+                            verb_drops_preview,
+                        )
+
+                        # Keep the disclosure title as useful as the former
+                        # compact progress line while the full, uncapped JSON
+                        # remains inside the fold.
+                        _summary_preview = " ".join(str(preview or "").split())
+                        _summary_cap = _pl if _pl > 0 else 40
+                        if len(_summary_preview) > _summary_cap:
+                            _summary_preview = _summary_preview[:_summary_cap - 3] + "..."
+                        _summary_verb = get_tool_verb(tool_name)
+                        if _summary_verb:
+                            if verb_drops_preview(tool_name) or not _summary_preview:
+                                _summary_text = _summary_verb
+                            else:
+                                _summary_text = (
+                                    f"{_summary_verb}"
+                                    f"{tool_verb_connector(tool_name)}"
+                                    f"{_summary_preview}"
+                                )
+                        elif _summary_preview:
+                            _summary_text = f'{tool_name}: "{_summary_preview}"'
+                        else:
+                            _summary_text = tool_name
+                        _summary_text = _html_escape(_summary_text, quote=False)
+                        _rich_markdown_punctuation = r"\`*_[]()~!|=$"
+                        _summary_text = _summary_text.translate(str.maketrans({
+                            char: f"&#{ord(char)};"
+                            for char in _rich_markdown_punctuation
+                        }))
+                        _body_blocks = []
+                        if _json_args:
+                            _body_blocks.append(f"```json\n{args_str}\n```")
+                        if _raw_terminal_command is not None:
+                            _command_fence = "```"
+                            while _command_fence in _raw_terminal_command:
+                                _command_fence += "`"
+                            _body_blocks.append(
+                                f"{_command_fence}shell\n"
+                                f"{_raw_terminal_command}\n"
+                                f"{_command_fence}"
+                            )
+                        _details_body = "\n\n".join(_body_blocks)
+                        msg = (
+                            f"<details><summary>{emoji} {_summary_text}</summary>\n\n"
+                            f"{_details_body}\n"
+                            "</details>"
+                        )
+                    else:
+                        msg = f"{emoji} {tool_name}({list(args.keys())})\n{args_str}"
                 elif preview:
                     msg = f"{emoji} {tool_name}: \"{preview}\""
                 else:
@@ -22595,24 +22774,31 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             "Queued follow-up for session %s: suppressing intentional silence marker before continuing.",
                             session_key or "?",
                         )
-                    elif first_response and not _already_streamed:
+                    elif first_response:
                         try:
-                            logger.info(
-                                "Queued follow-up for session %s: final stream delivery not confirmed; sending first response before continuing.",
-                                session_key or "?",
-                            )
-                            await adapter.send(
-                                source.chat_id,
-                                first_response,
-                                metadata=_status_thread_metadata,
+                            if _already_streamed:
+                                logger.info(
+                                    "Queued follow-up for session %s: skipping text resend because final streamed delivery was confirmed; delivering attachments before continuing.",
+                                    session_key or "?",
+                                )
+                            else:
+                                logger.info(
+                                    "Queued follow-up for session %s: final stream delivery not confirmed; sending first response and attachments before continuing.",
+                                    session_key or "?",
+                                )
+                            await self._deliver_queued_first_response(
+                                response=first_response,
+                                source=source,
+                                adapter=adapter,
+                                thread_metadata=_status_thread_metadata,
+                                already_streamed=_already_streamed,
+                                event_message_id=event_message_id,
                             )
                         except Exception as e:
-                            logger.warning("Failed to send first response before queued message: %s", e)
-                    elif first_response:
-                        logger.info(
-                            "Queued follow-up for session %s: skipping resend because final streamed delivery was confirmed.",
-                            session_key or "?",
-                        )
+                            logger.warning(
+                                "Failed to deliver first response before queued message: %s",
+                                e,
+                            )
                     # Release deferred bg-review notifications now that the
                     # first response has been delivered.  Pop from the
                     # adapter's callback dict (prevents double-fire in
