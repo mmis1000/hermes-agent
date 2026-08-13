@@ -1185,53 +1185,14 @@ def _with_promoted_note(result_json: str, requested_timeout: int) -> str:
 
 
 def _acquire_env(plan: _ExecPlan, task_id: Optional[str]) -> Any:
-    """Cached env for the task, else create it under the per-task creation lock.
-
-    Concurrent calls for the same task_id wait for the first sandbox instead
-    of each creating their own; the cache is re-checked under that lock.
-    Raises :class:`_Rejected` with the ``"disabled"`` envelope when creation
-    raises ImportError.
-    """
-    _start_cleanup_thread()
-    env_type, eff = plan.env_type, plan.effective_task_id
-
-    with _env_lock:
-        env: Any = _lookup_active_env(eff, task_id)
-    if env is not None:
+    """Use the same task/attempt acquisition seam as file and code tools."""
+    try:
+        env, env_type, effective_id = acquire_task_environment(task_id, timeout=plan.effective_timeout)
+        plan.env_type = env_type
+        plan.effective_task_id = effective_id
         return env
-
-    with _creation_locks_lock:
-        task_lock = _creation_locks.setdefault(eff, threading.Lock())
-
-    with task_lock:
-        with _env_lock:
-            env = _lookup_active_env(eff, task_id)
-        if env is not None:
-            return env
-
-        if env_type == "singularity":
-            _check_disk_usage_warning()
-        logger.info("Creating new %s environment for task %s...", env_type, eff[:8])
-        try:
-            new_env = _create_configured_env(
-                plan.config, env_type, image=plan.image, cwd=plan.cwd,
-                timeout=plan.effective_timeout, task_id=eff, host_cwd=plan.host_cwd,
-                local_config=(
-                    {"persistent": plan.config.get("local_persistent", False)}
-                    if env_type == "local" else None
-                ),
-            )
-        except ImportError as e:
-            raise _Rejected(_error_json(
-                _redact_terminal_error_text(f"Terminal tool disabled: environment creation failed ({e})"),
-                status="disabled",
-            ))
-
-        with _env_lock:
-            _active_environments[eff] = new_env
-            _last_activity[eff] = time.time()
-        logger.info("%s environment ready for task %s", env_type, eff[:8])
-        return new_env
+    except ImportError as exc:
+        raise _Rejected(_error_json(_redact_terminal_error_text(str(exc)), status="disabled"))
 
 
 def _yield_kwargs(command: str, **ctx) -> dict:
