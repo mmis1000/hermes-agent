@@ -2,6 +2,7 @@
 
 import json
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import tools.terminal_tool as terminal_tool
 
@@ -41,6 +42,34 @@ def test_foreground_command_uses_registered_task_cwd_for_existing_environment(mo
 
     assert result["exit_code"] == 0
     assert calls == [("pwd", {"timeout": 60, "cwd": "/workspace/acp", "bounded_capture": True})]
+
+
+def test_terminal_uses_central_task_environment_acquisition(monkeypatch):
+    class FakeEnv:
+        env = {}
+        cwd = "/default"
+
+        def execute(self, _command, **_kwargs):
+            return {"output": "ok", "returncode": 0}
+
+    env = FakeEnv()
+    acquired = MagicMock(return_value=(env, "local", "default"))
+    monkeypatch.setattr(terminal_tool, "acquire_task_environment", acquired)
+    monkeypatch.setattr(terminal_tool, "_active_environments", {"default": env})
+    monkeypatch.setattr(terminal_tool, "_last_activity", {})
+    monkeypatch.setattr(terminal_tool, "_get_env_config", lambda: _minimal_terminal_config())
+    monkeypatch.setattr(
+        terminal_tool,
+        "_check_all_guards",
+        lambda command, env_type, **kwargs: {"approved": True},
+    )
+
+    result = json.loads(
+        terminal_tool.terminal_tool(command="pwd", task_id="ordinary-child")
+    )
+
+    assert result["exit_code"] == 0
+    acquired.assert_called_once_with("ordinary-child", timeout=60)
 
 
 def test_explicit_workdir_still_wins_over_registered_task_cwd(monkeypatch):

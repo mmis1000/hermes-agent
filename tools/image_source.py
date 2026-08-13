@@ -135,7 +135,7 @@ async def resolve_image_source(src: str, ctx: ResolveContext) -> ResolvedImage:
                 raise SourceUnsafe(str(exc), src=s, origin="file")
         data = await asyncio.to_thread(host_target.read_bytes)
         return _finalize(data, "", "file", s)
-    if _is_local_terminal_backend():
+    if _is_local_terminal_backend() and not _is_protected_task(ctx.task_id):
         # Local backend: any path was host-readable, so a miss simply means
         # the file doesn't exist — no sandbox to fall back to.
         raise SourceNotFound(f"image file not found: '{p}'", src=s, origin="file")
@@ -237,6 +237,11 @@ def _permitted_host_read_target(p: Path, ctx: ResolveContext) -> Optional[Path]:
       is not under a cache returns ``None`` so the caller routes it to the
       in-sandbox exec-read instead of reading the host filesystem.
     """
+    # Protected model-visible paths are interpreted only inside the physical
+    # attempt.  Global backend settings and broad cache exceptions cannot add
+    # host read authority.
+    if _is_protected_task(ctx.task_id):
+        return None
     if _is_local_terminal_backend():
         try:
             return p.resolve()
@@ -263,11 +268,25 @@ def _get_active_env(task_id: Optional[str]):
     if not task_id:
         return None
     try:
-        from tools.terminal_tool import get_active_env
+        from tools.terminal_tool import acquire_task_environment, get_active_env
 
-        return get_active_env(task_id)
+        env = get_active_env(task_id)
+        if env is None and _is_protected_task(task_id):
+            env, _env_type, _effective_task_id = acquire_task_environment(task_id)
+        return env
     except Exception:
         return None
+
+
+def _is_protected_task(task_id: Optional[str]) -> bool:
+    if not task_id:
+        return False
+    try:
+        from tools.delegation_scope import attempt_scope_registry
+
+        return attempt_scope_registry.get(task_id) is not None
+    except Exception:
+        return False
 
 
 async def _resolve_container_fallback(p: Path, ctx: ResolveContext, src: str) -> ResolvedImage:

@@ -494,6 +494,7 @@ class AIAgent:
         checkpoint_max_total_size_mb: int = 500,
         checkpoint_max_file_size_mb: int = 10,
         pass_session_id: bool = False,
+        delegation_policy=None,
     ):
         """Forwarder — see ``agent.agent_init.init_agent``."""
         from agent.agent_init import init_agent
@@ -570,6 +571,7 @@ class AIAgent:
             checkpoint_max_total_size_mb=checkpoint_max_total_size_mb,
             checkpoint_max_file_size_mb=checkpoint_max_file_size_mb,
             pass_session_id=pass_session_id,
+            delegation_policy=delegation_policy,
         )
 
     def _get_session_db_for_recall(self):
@@ -6479,6 +6481,9 @@ class AIAgent:
             model=function_args.get("model"),
             provider=function_args.get("provider"),
             reasoning_effort=function_args.get("reasoning_effort"),
+            profile=function_args.get("profile"),
+            workdir=function_args.get("workdir"),
+            reveal=function_args.get("reveal"),
             background=(not _is_subagent),
             parent_agent=self,
         )

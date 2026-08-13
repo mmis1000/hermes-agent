@@ -1,6 +1,7 @@
 """Tests for docker container_config key propagation in file_tools."""
 
 from unittest.mock import patch, MagicMock
+from types import SimpleNamespace
 import tools.file_tools as file_tools
 
 
@@ -72,6 +73,24 @@ class TestFileToolsContainerConfig:
         del cfg["docker_forward_env"]
         cc = self._run(cfg, "t4").get("container_config", {})
         assert cc.get("docker_forward_env") == []
+
+    def test_file_first_uses_central_task_environment_acquisition(self, monkeypatch):
+        from tools import terminal_tool
+
+        env = SimpleNamespace(cwd="/workspace")
+        acquired = MagicMock(return_value=(env, "docker", "attempt-file-first"))
+        monkeypatch.setattr(terminal_tool, "acquire_task_environment", acquired)
+        monkeypatch.setattr(
+            terminal_tool,
+            "_get_env_config",
+            MagicMock(side_effect=AssertionError("duplicate acquisition path")),
+        )
+        monkeypatch.setattr(file_tools, "_file_ops_cache", {})
+
+        file_ops = file_tools._get_file_ops("attempt-file-first")
+
+        assert file_ops.env is env
+        acquired.assert_called_once_with("attempt-file-first")
 
     def test_cwd_only_raw_task_override_reaches_file_environment(self):
         """CWD-only task overrides collapse to default but must keep their cwd."""

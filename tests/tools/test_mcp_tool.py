@@ -4114,8 +4114,8 @@ class TestMCPBuiltinCollisionGuard:
 
         _servers.pop("minimax", None)
 
-    def test_mcp_tool_allowed_when_collision_is_another_mcp(self):
-        """Collision between two MCP toolsets is allowed (last wins)."""
+    def test_mcp_tool_with_ambiguous_existing_mcp_owner_is_rejected(self):
+        """An MCP entry without exact owner metadata cannot be overwritten."""
         from tools.registry import ToolRegistry
         from tools.mcp_tool import _discover_and_register_server, _servers, MCPServerTask
 
@@ -4147,9 +4147,8 @@ class TestMCPBuiltinCollisionGuard:
                 _discover_and_register_server("srv", {"command": "test", "args": []})
             )
 
-        # MCP-to-MCP collision is allowed — the new server wins.
-        assert "mcp__srv__do_thing" in registered
-        assert mock_registry.get_toolset_for_tool("mcp__srv__do_thing") == "mcp-srv"
+        assert "mcp__srv__do_thing" not in registered
+        assert mock_registry.get_toolset_for_tool("mcp__srv__do_thing") == "mcp-old"
 
         _servers.pop("srv", None)
 
@@ -4438,6 +4437,39 @@ class TestMcpParallelToolCalls:
                 _parallel_safe_servers.discard("a")
                 _parallel_safe_servers.discard("a_b")
                 _mcp_tool_server_names.pop("mcp__a_b__tool", None)
+
+    def test_sanitized_server_collision_cannot_replace_handler_or_provenance(self):
+        from tools.mcp_tool import (
+            _forget_mcp_tool_server,
+            _register_server_tools,
+            get_mcp_tool_server_qualification,
+        )
+        from tools.registry import registry
+
+        first = _make_mock_server(
+            "validation-race-safe", tools=[_make_mcp_tool("probe")]
+        )
+        colliding = _make_mock_server(
+            "validation_race_safe", tools=[_make_mcp_tool("probe")]
+        )
+        tool_name = "mcp__validation_race_safe__probe"
+        registry.deregister(tool_name)
+        _forget_mcp_tool_server(tool_name)
+        try:
+            assert _register_server_tools("validation-race-safe", first, {}) == [
+                tool_name
+            ]
+            admitted_entry = registry.get_entry(tool_name)
+            assert admitted_entry is not None
+
+            assert _register_server_tools("validation_race_safe", colliding, {}) == []
+
+            current = registry.get_entry(tool_name)
+            assert current is admitted_entry
+            assert get_mcp_tool_server_qualification(tool_name) == "validation-race-safe"
+        finally:
+            registry.deregister(tool_name)
+            _forget_mcp_tool_server(tool_name)
 
     def test_is_mcp_tool_parallel_safe_no_tool_suffix(self):
         """Tool name that is just 'mcp_{server}' without a tool part returns False."""

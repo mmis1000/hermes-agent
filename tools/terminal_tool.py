@@ -1198,7 +1198,7 @@ def _resolve_container_task_id(task_id: Optional[str]) -> str:
     """
     _ISOLATION_KEYS = frozenset({
         "docker_image", "modal_image", "singularity_image",
-        "daytona_image", "env_type",
+        "daytona_image", "env_type", "delegation_scope_id",
     })
     if task_id and task_id in _task_env_overrides:
         overrides = _task_env_overrides[task_id]
@@ -1225,6 +1225,216 @@ def resolve_task_overrides(task_id: Optional[str]) -> Dict[str, Any]:
         or _task_env_overrides.get(_resolve_container_task_id(raw))
         or {}
     )
+
+
+def acquire_task_environment(
+    raw_task_id: Optional[str], *, timeout: Optional[int] = None
+) -> tuple[Any, str, str]:
+    """Return the one cached environment shared by every task-aware tool.
+
+    ``raw_task_id`` is retained for per-session override/CWD lookup while the
+    returned effective key is the authority-bearing sandbox/cache key.
+    """
+    config = _get_env_config()
+    effective_task_id = _resolve_container_task_id(raw_task_id)
+    overrides = resolve_task_overrides(raw_task_id)
+    protected_authority = None
+    backing_validator = None
+    delegation_scope_id = overrides.get("delegation_scope_id")
+    from tools.delegation_scope import attempt_scope_registry
+
+    known_authority = attempt_scope_registry.get(raw_task_id or "default")
+    if known_authority is not None and known_authority.state not in {"starting", "active"}:
+        raise ValueError(
+            f"protected task environment authority is {known_authority.state}"
+        )
+    if known_authority is not None and delegation_scope_id is None:
+        raise ValueError("protected task environment scope marker is unavailable")
+    if delegation_scope_id is not None:
+        from tools.delegation_scope import execution_profile_hash
+
+        protected_authority = known_authority
+        if (
+            protected_authority is None
+            or protected_authority.scope_id != delegation_scope_id
+            or protected_authority.state not in {"starting", "active"}
+        ):
+            raise ValueError("protected task environment authority is unavailable")
+        scope = protected_authority.invocation_scope
+        if execution_profile_hash(scope.profile) != scope.profile_hash:
+            raise ValueError("protected execution profile snapshot changed")
+        if overrides.get("env_type") != scope.profile.backend:
+            raise ValueError("protected environment backend override changed")
+        if overrides.get("docker_image") != scope.profile.image:
+            raise ValueError("protected environment image override changed")
+        if overrides.get("cwd") != str(scope.workdir):
+            raise ValueError("protected environment workdir override changed")
+        def _validate_protected_backings() -> None:
+            for grant in scope.visible_objects:
+                registry = protected_authority.backing_registry
+                record = (
+                    registry.get(grant.backing.object_id)
+                    if registry is not None
+                    else None
+                )
+                if (
+                    record is None
+                    or not record.exists
+                    or record.root_symlink
+                    or record.object_type != grant.object_type
+                    or record.backing != grant.backing
+                ):
+                    raise ValueError(
+                        f"protected backing object changed: {grant.backing.object_id}"
+                    )
+
+        _validate_protected_backings()
+        backing_validator = _validate_protected_backings
+        env_type = scope.profile.backend
+    else:
+        env_type = overrides.get("env_type") or config["env_type"]
+
+    if env_type == "docker":
+        image = overrides.get("docker_image") or config["docker_image"]
+    elif env_type == "singularity":
+        image = overrides.get("singularity_image") or config["singularity_image"]
+    elif env_type == "modal":
+        image = overrides.get("modal_image") or config["modal_image"]
+    elif env_type == "daytona":
+        image = overrides.get("daytona_image") or config["daytona_image"]
+    else:
+        image = ""
+
+    cwd = overrides.get("cwd") or get_session_cwd(raw_task_id) or config["cwd"]
+    if env_type in _CONTAINER_BACKENDS and _is_unusable_container_cwd(cwd):
+        if cwd != config["cwd"]:
+            logger.info(
+                "Ignoring host/relative cwd override %r for %s backend "
+                "(won't exist in sandbox). Using %r instead.",
+                cwd,
+                env_type,
+                config["cwd"],
+            )
+        cwd = config["cwd"]
+
+    _start_cleanup_thread()
+    with _env_lock:
+        existing_key = (
+            effective_task_id
+            if effective_task_id in _active_environments
+            else (
+                raw_task_id
+                if raw_task_id and raw_task_id in _active_environments
+                else None
+            )
+        )
+        if existing_key is not None:
+            _last_activity[existing_key] = time.time()
+            return _active_environments[existing_key], env_type, existing_key
+
+    with _creation_locks_lock:
+        if effective_task_id not in _creation_locks:
+            _creation_locks[effective_task_id] = threading.Lock()
+        task_lock = _creation_locks[effective_task_id]
+
+    with task_lock:
+        with _env_lock:
+            existing_key = (
+                effective_task_id
+                if effective_task_id in _active_environments
+                else (
+                    raw_task_id
+                    if raw_task_id and raw_task_id in _active_environments
+                    else None
+                )
+            )
+            if existing_key is not None:
+                _last_activity[existing_key] = time.time()
+                return _active_environments[existing_key], env_type, existing_key
+
+        if env_type == "singularity":
+            _check_disk_usage_warning()
+        ssh_config = None
+        if env_type == "ssh":
+            ssh_config = {
+                "host": config.get("ssh_host", ""),
+                "user": config.get("ssh_user", ""),
+                "port": config.get("ssh_port", 22),
+                "key": config.get("ssh_key", ""),
+                "persistent": config.get("ssh_persistent", False),
+            }
+        container_config = None
+        if protected_authority is not None:
+            scope = protected_authority.invocation_scope
+            profile = scope.profile
+            if profile.network not in {"none", "full"}:
+                raise ValueError(
+                    "protected execution profile network inheritance was not frozen"
+                )
+            container_config = {
+                "container_cpu": profile.cpu or 0,
+                "container_memory": profile.memory_mb or 0,
+                "container_disk": 0,
+                "container_persistent": False,
+                "docker_network": profile.network == "full",
+                "docker_persist_across_processes": False,
+                "suppress_implicit_mounts": True,
+                "trusted_mounts": [
+                    {
+                        "kind": grant.backing.kind,
+                        "source": grant.backing.identity,
+                        "target": str(grant.visible_path),
+                        "mode": grant.mode.value,
+                    }
+                    for grant in scope.visible_objects
+                ],
+                "shm_mb": profile.shm_mb,
+                "pids_limit": profile.pids_limit,
+                "delegation_scope_id": protected_authority.scope_id,
+                "delegation_attempt_id": protected_authority.attempt_id,
+                "trusted_mounts_validator": backing_validator,
+            }
+        elif env_type in {"docker", "singularity", "modal", "daytona"}:
+            container_config = {
+                "container_cpu": config.get("container_cpu", 1),
+                "container_memory": config.get("container_memory", 5120),
+                "container_disk": config.get("container_disk", 51200),
+                "container_persistent": config.get("container_persistent", True),
+                "modal_mode": config.get("modal_mode", "auto"),
+                "docker_volumes": config.get("docker_volumes", []),
+                "docker_mount_cwd_to_workspace": config.get(
+                    "docker_mount_cwd_to_workspace", False
+                ),
+                "docker_forward_env": config.get("docker_forward_env", []),
+                "docker_env": config.get("docker_env", {}),
+                "docker_run_as_host_user": config.get(
+                    "docker_run_as_host_user", False
+                ),
+                "docker_extra_args": config.get("docker_extra_args", []),
+                "docker_network": config.get("docker_network", True),
+                "docker_persist_across_processes": config.get(
+                    "docker_persist_across_processes", True
+                ),
+                "docker_orphan_reaper": config.get("docker_orphan_reaper", True),
+            }
+        local_config = None
+        if env_type == "local":
+            local_config = {"persistent": config.get("local_persistent", False)}
+        env = _create_environment(
+            env_type=env_type,
+            image=image,
+            cwd=cwd,
+            timeout=timeout or config["timeout"],
+            ssh_config=ssh_config,
+            container_config=container_config,
+            local_config=local_config,
+            task_id=effective_task_id,
+            host_cwd=config.get("host_cwd"),
+        )
+        with _env_lock:
+            _active_environments[effective_task_id] = env
+            _last_activity[effective_task_id] = time.time()
+        return env, env_type, effective_task_id
 
 
 # Configuration from environment variables
@@ -1481,11 +1691,17 @@ def _get_modal_backend_state(modal_mode: object | None) -> Dict[str, Any]:
     )
 
 
-def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
-                        ssh_config: dict = None, container_config: dict = None,
-                        local_config: dict = None,
-                        task_id: str = "default",
-                        host_cwd: str = None):
+def _create_environment(
+    env_type: str,
+    image: str,
+    cwd: str,
+    timeout: int,
+    ssh_config: dict | None = None,
+    container_config: dict | None = None,
+    local_config: dict | None = None,
+    task_id: str = "default",
+    host_cwd: str | None = None,
+):
     """
     Create an execution environment for sandboxed command execution.
     
@@ -1538,6 +1754,13 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
             network=docker_network,
             extra_args=docker_extra_args,
             persist_across_processes=cc.get("docker_persist_across_processes", True),
+            trusted_mounts=cc.get("trusted_mounts"),
+            suppress_implicit_mounts=cc.get("suppress_implicit_mounts", False),
+            shm_mb=cc.get("shm_mb"),
+            pids_limit=cc.get("pids_limit"),
+            delegation_scope_id=cc.get("delegation_scope_id"),
+            delegation_attempt_id=cc.get("delegation_attempt_id"),
+            trusted_mounts_validator=cc.get("trusted_mounts_validator"),
         )
     
     elif env_type == "singularity":
@@ -1825,6 +2048,15 @@ def cleanup_vm(task_id: str, *, force_remove: bool = False):
     except ImportError:
         pass
 
+    # Background sessions are attempt-owned resources too.  Kill them even
+    # when environment construction never completed or the container record
+    # has already disappeared.
+    try:
+        from tools.process_registry import process_registry
+        process_registry.kill_all(task_id=task_id)
+    except Exception:
+        logger.warning("Error cleaning processes for task %s", task_id, exc_info=True)
+
     if env is None:
         return
 
@@ -1846,6 +2078,16 @@ def cleanup_vm(task_id: str, *, force_remove: bool = False):
         logger.info("Manually cleaned up environment for task: %s", task_id)
 
     except Exception as e:
+        if force_remove:
+            # Protected attempt cleanup is authoritative: the resource ledger
+            # must observe removal failure and must retain the environment so
+            # a later cleanup pass can retry the same concrete container.
+            with _env_lock:
+                _active_environments.setdefault(task_id, env)
+            logger.warning(
+                "Force-removal failed for task %s: %s", task_id, e, exc_info=True
+            )
+            raise
         error_str = str(e)
         if "404" in error_str or "not found" in error_str.lower():
             logger.info("Environment for task %s already cleaned up", task_id)
@@ -2228,6 +2470,27 @@ def terminal_tool(
                     "error": guidance,
                     "status": "error",
                 }, ensure_ascii=False)
+
+        # All task-aware tools acquire the same environment through this path.
+        # The legacy cache block below remains temporarily as a parity check;
+        # central acquisition has already populated that cache.
+        try:
+            env, env_type, effective_task_id = acquire_task_environment(
+                task_id, timeout=effective_timeout
+            )
+        except ImportError as e:
+            return json.dumps(
+                {
+                    "output": "",
+                    "exit_code": -1,
+                    "error": (
+                        "Terminal tool disabled: environment creation failed "
+                        f"({e})"
+                    ),
+                    "status": "disabled",
+                },
+                ensure_ascii=False,
+            )
 
         # Start cleanup thread
         _start_cleanup_thread()
