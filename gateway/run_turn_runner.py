@@ -272,18 +272,114 @@ class TurnRunner:
             adapter = None
         code_full, code_short = self._progress_terminal_blocks(adapter, tool_name, args, emoji)
         verbose = ctx.progress_mode == "verbose"
+        _telegram_rich_enabled = False
+        if ctx.source.platform == Platform.TELEGRAM and adapter is not None:
+            _rich_gate = getattr(adapter, "_rich_delivery_enabled", None)
+            try:
+                _telegram_rich_enabled = bool(
+                    _rich_gate() if callable(_rich_gate)
+                    else getattr(adapter, "_rich_messages_enabled", False)
+                )
+            except Exception:
+                pass
         code = code_full if verbose else code_short
+        if verbose and _telegram_rich_enabled:
+            code = None
         ctx.last_was_terminal_block[0] = code is not None
         if verbose:
             if code is None and args:
                 from agent.display import get_tool_preview_max_len
                 pl = get_tool_preview_max_len()
-                args_str = json.dumps(args, ensure_ascii=False, default=str)
-                # tool_preview_length 0 (default) = no truncation in verbose mode; the user asked
-                # for full detail and platform message-length limits handle the rest.
-                if pl > 0 and len(args_str) > pl:
+                _telegram_folded = (
+                    ctx.source.platform == Platform.TELEGRAM
+                    and _telegram_rich_enabled
+                )
+                _raw_terminal_command = (
+                    args.get("command")
+                    if _telegram_folded
+                    and tool_name == "terminal"
+                    and isinstance(args.get("command"), str)
+                    else None
+                )
+                _json_args = (
+                    {key: value for key, value in args.items() if key != "command"}
+                    if _raw_terminal_command is not None
+                    else args
+                )
+                args_str = json.dumps(
+                    _json_args,
+                    ensure_ascii=False,
+                    default=str,
+                    indent=2 if _telegram_folded else None,
+                )
+                # Rich Markdown must not let argument values terminate the
+                # fence or disclosure element.
+                if _telegram_folded:
+                    args_str = args_str.translate(
+                        str.maketrans(
+                            {
+                                "<": r"\u003c",
+                                ">": r"\u003e",
+                                "&": r"\u0026",
+                                "`": r"\u0060",
+                                "$": r"\u0024",
+                            }
+                        )
+                    )
+                if not _telegram_folded and pl > 0 and len(args_str) > pl:
                     args_str = args_str[:pl - 3] + "..."
-                code = t("gateway.progress.tool_verbose", emoji=emoji, tool=tool_name, keys=list(args.keys()), args=args_str)
+                if _telegram_folded:
+                    from html import escape as _html_escape
+                    from agent.display import (
+                        get_tool_verb,
+                        tool_verb_connector,
+                        verb_drops_preview,
+                    )
+
+                    _summary_preview = " ".join(str(preview or "").split())
+                    _summary_cap = pl if pl > 0 else 40
+                    if len(_summary_preview) > _summary_cap:
+                        _summary_preview = _summary_preview[:_summary_cap - 3] + "..."
+                    _summary_verb = get_tool_verb(tool_name)
+                    if _summary_verb:
+                        if verb_drops_preview(tool_name) or not _summary_preview:
+                            _summary_text = _summary_verb
+                        else:
+                            _summary_text = (
+                                f"{_summary_verb}"
+                                f"{tool_verb_connector(tool_name)}"
+                                f"{_summary_preview}"
+                            )
+                    elif _summary_preview:
+                        _summary_text = f'{tool_name}: "{_summary_preview}"'
+                    else:
+                        _summary_text = tool_name
+                    _summary_text = _html_escape(_summary_text, quote=False)
+                    _rich_markdown_punctuation = r"\`*_[]()~!|=$"
+                    _summary_text = _summary_text.translate(str.maketrans({
+                        char: f"&#{ord(char)};"
+                        for char in _rich_markdown_punctuation
+                    }))
+                    _body_blocks = []
+                    if _json_args:
+                        _body_blocks.append(f"```json\n{args_str}\n```")
+                    if _raw_terminal_command is not None:
+                        _command_fence = "```"
+                        while _command_fence in _raw_terminal_command:
+                            _command_fence += "`"
+                        _body_blocks.append(
+                            f"{_command_fence}shell\n"
+                            f"{_raw_terminal_command}\n"
+                            f"{_command_fence}"
+                        )
+                    _details_body = "\n\n".join(_body_blocks)
+                    code = (
+                        f"<details><summary>{emoji} {_summary_text}</summary>\n\n"
+                        f"{_details_body}\n"
+                        "</details>"
+                    )
+                else:
+                    code = t("gateway.progress.tool_verbose", emoji=emoji, tool=tool_name, keys=list(args.keys()), args=args_str)
             elif code is None:
                 code = (t("gateway.progress.tool_preview", emoji=emoji, tool=tool_name, preview=preview) if preview
                         else t("gateway.progress.tool_pending", emoji=emoji, tool=tool_name))
