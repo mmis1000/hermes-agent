@@ -1009,6 +1009,7 @@ def _build_child_system_prompt(
     context: Optional[str] = None,
     *,
     workspace_path: Optional[str] = None,
+    effective_scope_context: Optional[str] = None,
     role: str = "leaf",
     max_spawn_depth: int = 2,
     child_depth: int = 1,
@@ -1028,7 +1029,9 @@ def _build_child_system_prompt(
     ]
     if context and context.strip():
         parts.append(f"\nCONTEXT:\n{context}")
-    if workspace_path and str(workspace_path).strip():
+    if effective_scope_context and effective_scope_context.strip():
+        parts.append(f"\n{effective_scope_context}")
+    elif workspace_path and str(workspace_path).strip():
         parts.append(
             "\nWORKSPACE PATH:\n"
             f"{workspace_path}\n"
@@ -1823,9 +1826,18 @@ def _build_child_agent(
                 .intersection(protected_profile_tools)
             )
         ]
+        child_visible_objects = (
+            None
+            if (
+                parent_policy.visible_objects is None
+                and not resolved_scope.reveal
+                and not resolved_scope.visible_objects
+            )
+            else resolved_scope.visible_objects
+        )
         child_delegation_policy = derive_child_policy(
             parent_policy,
-            resolved_scope.visible_objects,
+            child_visible_objects,
             allowed_profiles={resolved_scope.profile_name},
         )
 
@@ -1870,11 +1882,21 @@ def _build_child_agent(
     ):
         child_toolsets.append("delegation")
 
-    workspace_hint = workspace_override or _resolve_workspace_hint(parent_agent)
+    protected_scope_context = None
+    if isinstance(resolved_scope, ResolvedInvocationScope):
+        from tools.delegation_scope import format_effective_scope_context
+
+        protected_scope_context = format_effective_scope_context(resolved_scope)
+    workspace_hint = (
+        None
+        if protected_scope_context is not None
+        else workspace_override or _resolve_workspace_hint(parent_agent)
+    )
     child_prompt = _build_child_system_prompt(
         goal,
         context,
         workspace_path=workspace_hint,
+        effective_scope_context=protected_scope_context,
         role=effective_role,
         max_spawn_depth=max_spawn,
         child_depth=child_depth,
@@ -2125,52 +2147,13 @@ def _build_child_agent(
         delegation_policy=child_delegation_policy,
         **child_optional_kwargs,
     )
-    # Trusted invocation-wide authority template. Later container and routed
-    # tool construction consume this object directly; model-authored text is
-    # never reparsed into authority.
-    setattr(child, "resolved_invocation_scope", resolved_scope)
-    setattr(child, "_delegation_scope", resolved_scope)
     if child_delegation_policy is not None:
         setattr(
             child,
             "delegation_backing_registry",
             getattr(parent_agent, "delegation_backing_registry", None),
         )
-        # Final admission filter: retain only names classified into the
-        # operator-owned profile toolsets.  Pin exact names so later plugin/MCP
-        # registry growth cannot widen this protected session.
-        allowed_profile_toolsets = protected_profile_toolsets or set()
-        protected_names = _qualified_protected_tool_names(
-            set(getattr(child, "valid_tool_names", set())),
-            allowed_profile_toolsets,
-            resolved_scope.profile.qualified_mcp_servers,
-            resolved_scope.profile.allowed_tools,
-        )
-        protected_tools = [
-            item for item in (getattr(child, "tools", None) or [])
-            if item.get("function", {}).get("name") in protected_names
-        ]
-        setattr(child, "tools", protected_tools)
-        setattr(child, "valid_tool_names", protected_names)
-        setattr(child, "_protected_tool_snapshot", frozenset(protected_names))
-        setattr(
-            child,
-            "_protected_qualified_mcp_servers",
-            frozenset(resolved_scope.profile.qualified_mcp_servers),
-        )
-        from tools.mcp_tool import get_mcp_tool_server_qualification
-
-        setattr(
-            child,
-            "_protected_mcp_tool_provenance",
-            {
-                name: provenance
-                for name in protected_names
-                if (
-                    provenance := get_mcp_tool_server_qualification(name)
-                ) is not None
-            },
-        )
+        configure_protected_agent_tools(child, resolved_scope.profile)
     child._print_fn = getattr(parent_agent, "_print_fn", None)
     # Now the child exists, its session id can ride on every relayed event
     # (including the spawn_requested below — first emit happens after this).

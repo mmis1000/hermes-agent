@@ -1,7 +1,7 @@
 # Delegation Profile Filesystem Isolation — Design Plan
 
-Date: 2026-08-10  
-Status: Revised for path-preserving reveal scopes; pending strict re-review  
+Date: 2026-08-10<br>
+Status: Revised for path-preserving reveal scopes; pending strict re-review<br>
 Scope: Product and runtime contract; not an implementation plan
 
 ## 1. Decision summary
