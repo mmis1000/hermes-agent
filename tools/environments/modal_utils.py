@@ -14,6 +14,7 @@ trust-boundary decisions in their own modules.
 from __future__ import annotations
 
 import shlex
+import threading
 import time
 import uuid
 from abc import abstractmethod
@@ -81,6 +82,7 @@ class BaseModalExecutionEnvironment(BaseEnvironment):
         stdin_data: str | None = None,
         rewrite_compound_background: bool = True,
         bounded_capture: bool = False,
+        foreground_handoff: dict | None = None,
     ) -> dict:
         # Managed/remote modal transports execute commands via explicit transport
         # and do not rely on shell background rewriters. Keep parameter for
@@ -121,6 +123,7 @@ class BaseModalExecutionEnvironment(BaseEnvironment):
             "last_touch": _now,
             "start": _now,
         }
+        handoff_failed = False
 
         while True:
             if is_interrupted():
@@ -137,6 +140,106 @@ class BaseModalExecutionEnvironment(BaseEnvironment):
 
             if result is not None:
                 return result
+
+            from tools.foreground_wait import current_foreground_wait, process_handoff
+
+            wait_slot = current_foreground_wait()
+            if (
+                not handoff_failed
+                and wait_slot is not None
+                and wait_slot.kind == "terminal"
+                and wait_slot.background_requested.is_set()
+            ):
+                metadata = foreground_handoff or {}
+                original_command = metadata.get("command")
+                if not isinstance(original_command, str) or not original_command:
+                    handoff_failed = True
+                    wait_slot.fail_background(
+                        "foreground terminal handoff metadata is unavailable"
+                    )
+                else:
+                    from tools.process_registry import process_registry
+
+                    try:
+                        session = process_registry.adopt_foreground_process(
+                            start.handle,
+                            command=original_command,
+                            task_id=str(metadata.get("task_id") or ""),
+                            session_key=str(metadata.get("session_key") or ""),
+                            cwd=str(metadata.get("cwd") or self.cwd or ""),
+                            env_ref=self,
+                            kill_callback=lambda: self._cancel_modal_exec(start.handle),
+                            notify_on_complete=True,
+                        )
+                    except Exception as exc:
+                        handoff_failed = True
+                        wait_slot.fail_background(
+                            f"Could not adopt the foreground process: {exc}"
+                        )
+                        continue
+                    on_adopted = metadata.get("on_adopted")
+                    if callable(on_adopted):
+                        try:
+                            on_adopted(session)
+                        except Exception:
+                            pass
+
+                    def _finish_adopted_modal() -> None:
+                        final_result = None
+                        timed_out = False
+                        while final_result is None:
+                            try:
+                                final_result = self._poll_modal_exec(start.handle)
+                            except Exception as exc:
+                                final_result = self._error_result(
+                                    f"{self._unexpected_error_prefix}: {exc}"
+                                )
+                            if final_result is not None:
+                                break
+                            if deadline is not None and time.monotonic() >= deadline:
+                                timed_out = True
+                                try:
+                                    self._cancel_modal_exec(start.handle)
+                                except Exception:
+                                    pass
+                                final_result = self._timeout_result_for_modal(
+                                    prepared.timeout
+                                )
+                                break
+                            time.sleep(self._poll_interval_seconds)
+                        on_complete = metadata.get("on_complete")
+                        if callable(on_complete):
+                            try:
+                                on_complete(self.cwd)
+                            except Exception:
+                                pass
+                        process_registry.finish_adopted_process(
+                            session,
+                            output=str(final_result.get("output") or ""),
+                            exit_code=final_result.get("returncode"),
+                            completion_reason=(
+                                "timed_out" if timed_out else "exited"
+                            ),
+                            termination_source=(
+                                "foreground_timeout" if timed_out else ""
+                            ),
+                        )
+
+                    finalizer = threading.Thread(
+                        target=_finish_adopted_modal,
+                        daemon=True,
+                        name=f"proc-adopted-{session.id}",
+                    )
+                    session._reader_thread = finalizer
+                    finalizer.start()
+                    handoff = process_handoff(session.id)
+                    wait_slot.complete_background(handoff)
+                    return {
+                        "status": "backgrounded",
+                        "output": "",
+                        "returncode": None,
+                        "foreground_handoff": handoff,
+                    }
 
             if deadline is not None and time.monotonic() >= deadline:
                 try:
