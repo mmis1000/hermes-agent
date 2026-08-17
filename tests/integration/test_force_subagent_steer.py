@@ -117,6 +117,13 @@ def test_public_force_steer_handoffs_worker_before_existing_parent_marker():
         original = process_registry.get(session_id)
         assert original is not None
         assert not original.exited
+        output_deadline = time.monotonic() + 1
+        while (
+            "BEFORE:" not in original.output_buffer
+            and not original.exited
+            and time.monotonic() < output_deadline
+        ):
+            time.sleep(0.01)
         assert "BEFORE:" in original.output_buffer
         waited = process_registry.wait(session_id, timeout=3)
         assert waited["status"] == "exited"
