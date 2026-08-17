@@ -747,6 +747,8 @@ def _init_prompt_cache_config(agent):
 
 
 def _init_turn_state(agent, run_budget_seconds):
+    from tools.foreground_wait import ForegroundWaitRegistry
+    agent._foreground_waits = ForegroundWaitRegistry()
     _set_defaults(agent, _TURN_STATE)
     # Wall-clock run budget per turn: constructor arg wins, else agent.run_budget_seconds
     # (in _apply_agent_section). None = fully off (no clock reads, injection, or capping).
