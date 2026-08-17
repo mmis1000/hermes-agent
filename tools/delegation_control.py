@@ -24,13 +24,14 @@ _TOOL_FIELDS = {
     "cascade",
     "reason",
     "message",
+    "force",
 }
 _ACTION_FIELDS = {
     "list": set(),
     "status": {"delegation_id", "subagent_id"},
     "tail": {"delegation_id", "subagent_id", "attempt_id", "limit"},
     "wait": {"delegation_id", "run_id", "timeout_seconds"},
-    "steer": {"delegation_id", "subagent_id", "message"},
+    "steer": {"delegation_id", "subagent_id", "message", "force"},
     "resume": {"delegation_id", "subagent_id", "message"},
     "interrupt": {"delegation_id", "subagent_id", "cascade", "reason"},
     "abandon": {"delegation_id", "cascade", "reason"},
@@ -89,6 +90,7 @@ def _validate(
     cascade: Optional[bool],
     reason: Optional[str],
     message: Optional[str],
+    force: Optional[bool],
 ) -> Optional[str]:
     if action not in _ACTIONS:
         return f"Unknown action {action!r}; expected one of {sorted(_ACTIONS)}."
@@ -104,6 +106,7 @@ def _validate(
             "cascade": cascade,
             "reason": reason,
             "message": message,
+            "force": force,
         }.items()
         if value is not None
     }
@@ -155,6 +158,8 @@ def _validate(
             return f"limit must not exceed {_MAX_TAIL_EVENTS}."
     if cascade is not None and not isinstance(cascade, bool):
         return "cascade must be a boolean."
+    if force is not None and not isinstance(force, bool):
+        return "force must be a boolean."
     if reason is not None and not isinstance(reason, str):
         return "reason must be a string."
     if reason is not None and len(reason) > _MAX_REASON_CHARS:
@@ -332,6 +337,7 @@ def delegation_control(
     cascade: Optional[bool] = None,
     reason: Optional[str] = None,
     message: Optional[str] = None,
+    force: Optional[bool] = None,
     session_key: Optional[str] = None,
     parent_agent=None,
 ) -> str:
@@ -350,6 +356,7 @@ def delegation_control(
         cascade=cascade,
         reason=reason,
         message=message,
+        force=force,
     )
     if error:
         return _invalid(action, error)
@@ -468,6 +475,8 @@ def delegation_control(
                 waited, session_key=origin, include_tail=True, limit=20
             ),
         }
+        if isinstance(waited.get("foreground_handoff"), dict):
+            payload["foreground_handoff"] = waited["foreground_handoff"]
         return json.dumps(payload, ensure_ascii=False)
 
     if action == "steer":
@@ -476,6 +485,7 @@ def delegation_control(
             str(child_target),
             session_key=origin,
             message=str(message).strip(),
+            force=bool(force),
         )
         if queued.get("status") != "accepted":
             payload = {
@@ -488,8 +498,11 @@ def delegation_control(
                 payload["terminal_status"] = queued.get("terminal_status")
             return json.dumps(payload, ensure_ascii=False)
 
+        steer_outcomes: Dict[str, Any] = {}
         _delegate.forward_pending_subagent_steers(
-            str(child_target), str(queued["attempt_id"])
+            str(child_target),
+            str(queued["attempt_id"]),
+            outcome_sink=steer_outcomes,
         )
         mailbox = _async.inspect_subagent_steer(str(queued["mailbox_id"]))
         mailbox_status = str(mailbox.get("status") or "pending")
@@ -498,21 +511,32 @@ def delegation_control(
             if mailbox_status in {
                 "superseded_by_interrupt",
                 "too_late_after_completion",
+                "foreground_wait",
+                "force_background_failed",
             }
             else "accepted"
         )
-        return json.dumps(
-            {
-                "action": action,
-                "status": honest_status,
-                "delegation_id": target,
-                "subagent_id": child_target,
-                "attempt_id": queued.get("attempt_id"),
-                "mailbox_id": queued.get("mailbox_id"),
-                "steer_status": mailbox_status,
-            },
-            ensure_ascii=False,
-        )
+        payload = {
+            "action": action,
+            "status": honest_status,
+            "delegation_id": target,
+            "subagent_id": child_target,
+            "attempt_id": queued.get("attempt_id"),
+            "mailbox_id": queued.get("mailbox_id"),
+            "steer_status": mailbox_status,
+            "force": bool(force),
+        }
+        exact_outcome = steer_outcomes.get(str(queued["mailbox_id"])) or {}
+        if exact_outcome.get("wait_kinds"):
+            payload["wait_kinds"] = exact_outcome["wait_kinds"]
+        if exact_outcome.get("errors"):
+            payload["errors"] = exact_outcome["errors"]
+        if mailbox_status == "foreground_wait":
+            payload["hint"] = (
+                "Retry this steer with force=true to move the foreground wait "
+                "to background."
+            )
+        return json.dumps(payload, ensure_ascii=False)
 
     if action == "resume":
         resumed = _async.dispatch_resumed_subagent(
@@ -622,6 +646,7 @@ def _handle_delegation_args(args: Dict[str, Any], *, parent_agent=None) -> str:
         cascade=args.get("cascade"),
         reason=args.get("reason"),
         message=args.get("message"),
+        force=args.get("force"),
         parent_agent=parent_agent,
     )
 
@@ -695,6 +720,13 @@ DELEGATION_CONTROL_SCHEMA = {
                 "type": "string",
                 "maxLength": _MAX_STEER_CHARS,
                 "description": "Guidance for steer, or the next user instruction for resume.",
+            },
+            "force": {
+                "type": "boolean",
+                "description": (
+                    "For steer only: move supported foreground waits to background "
+                    "before delivering the guidance. Defaults false."
+                ),
             },
         },
         "required": ["action"],

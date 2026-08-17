@@ -182,6 +182,7 @@ def test_tool_schema_and_runtime_validation_are_strict():
 
     cases = [
         _handle_delegation_args({"action": "list", "unexpected": True}),
+        _handle_delegation_args({"action": "status", "delegation_id": "d", "force": True}),
         _handle_delegation_args(
             {"action": "interrupt", "delegation_id": "d", "cascade": "false"}
         ),
@@ -193,11 +194,13 @@ def test_tool_schema_and_runtime_validation_are_strict():
         ),
         delegation_control(action="tail", delegation_id="d", limit=65),
     ]
-    for raw in cases:
-        payload = json.loads(raw)
+    for output in cases:
+        payload = json.loads(output)
         assert payload["status"] == "invalid_arguments"
-        assert payload["action"]
         assert payload["error"]
+
+    force_schema = control["function"]["parameters"]["properties"]["force"]
+    assert force_schema["type"] == "boolean"
 
 
 def test_resume_control_is_strict_and_forwards_live_parent(monkeypatch):
@@ -541,6 +544,123 @@ def test_steer_queues_while_starting_then_forwards_in_order_and_acks_injection()
     assert all("message" not in item for item in observed)
 
 
+def test_live_foreground_wait_rejects_normal_steer_with_force_hint():
+    from tools.delegation_control import delegation_control
+
+    repository, initial, attempt = _starting_steer_attempt(
+        "deleg-steer-foreground", "sa-foreground"
+    )
+
+    class WaitingAgent:
+        def request_durable_steer(
+            self, _text, *, outcome_callback, force, **_kwargs
+        ):
+            assert force is False
+            outcome_callback("foreground_wait")
+            return {"status": "foreground_wait", "wait_kinds": ["terminal"]}
+
+    dt._register_subagent(
+        {
+            "subagent_id": "sa-foreground",
+            "delegation_attempt_id": attempt["attempt_id"],
+            "delegation_run_id": initial["run_id"],
+            "status": "running",
+            "events": [],
+            "assistant_text_tail": "",
+            "agent": WaitingAgent(),
+        }
+    )
+
+    result = json.loads(
+        delegation_control(
+            action="steer",
+            delegation_id="deleg-steer-foreground",
+            subagent_id="sa-foreground",
+            message="change direction",
+            force=False,
+            session_key="owner",
+        )
+    )
+
+    assert result["status"] == "foreground_wait"
+    assert result["steer_status"] == "foreground_wait"
+    assert result["wait_kinds"] == ["terminal"]
+    assert "force=true" in result["hint"]
+    assert repository.inspect_steer(result["mailbox_id"])["status"] == "foreground_wait"
+
+
+def test_forced_public_steer_handoffs_wait_then_uses_normal_ack_path():
+    import threading
+
+    from run_agent import AIAgent
+    from tools.delegation_control import delegation_control
+    from tools.foreground_wait import ForegroundWaitRegistry
+
+    class LiveAgent:
+        steer = AIAgent.steer
+        request_durable_steer = AIAgent.request_durable_steer
+        _steer_queue_unlocked = AIAgent._steer_queue_unlocked
+        _sync_pending_steer_text_unlocked = AIAgent._sync_pending_steer_text_unlocked
+        _remove_pending_steer_envelope = AIAgent._remove_pending_steer_envelope
+        _drain_pending_steer_envelopes = AIAgent._drain_pending_steer_envelopes
+        _ack_steer_envelopes = AIAgent._ack_steer_envelopes
+
+        def __init__(self):
+            self._pending_steer = None
+            self._pending_steer_envelopes = []
+            self._pending_steer_lock = threading.Lock()
+            self._foreground_waits = ForegroundWaitRegistry()
+            self.interrupt_event = threading.Event()
+
+    repository, initial, attempt = _starting_steer_attempt(
+        "deleg-steer-force", "sa-force"
+    )
+    agent = LiveAgent()
+    slot = agent._foreground_waits.register("call-1", "terminal")
+    dt._register_subagent(
+        {
+            "subagent_id": "sa-force",
+            "delegation_attempt_id": attempt["attempt_id"],
+            "delegation_run_id": initial["run_id"],
+            "status": "running",
+            "events": [],
+            "assistant_text_tail": "",
+            "agent": agent,
+        }
+    )
+
+    def complete_handoff():
+        assert slot.background_requested.wait(1)
+        slot.complete_background({"kind": "process", "session_id": "proc_force"})
+
+    responder = threading.Thread(target=complete_handoff)
+    responder.start()
+    try:
+        result = json.loads(
+            delegation_control(
+                action="steer",
+                delegation_id="deleg-steer-force",
+                subagent_id="sa-force",
+                message="force me",
+                force=True,
+                session_key="owner",
+            )
+        )
+        responder.join(1)
+        assert result["status"] == "accepted"
+        assert result["force"] is True
+        envelopes = agent._drain_pending_steer_envelopes()
+        assert len(envelopes) == 1
+        envelope = envelopes[0]
+        assert envelope["text"] == "force me"
+        assert envelope["mailbox_id"] == result["mailbox_id"]
+        AIAgent._ack_steer_envelopes(envelopes, "injected")
+        assert repository.inspect_steer(result["mailbox_id"])["status"] == "injected"
+    finally:
+        dt._unregister_subagent("sa-force", str(attempt["attempt_id"]))
+        agent._foreground_waits.unregister(slot)
+
+
 def test_steer_rejects_foreign_terminal_and_interrupt_wins_startup_race():
     from tools.delegation_control import delegation_control
 
@@ -833,6 +953,57 @@ def test_tail_filters_reasoning_and_redacts_split_stream_secret():
     finally:
         release.set()
         dt._unregister_subagent("sa-tail")
+
+
+def test_force_flag_survives_starting_mailbox_until_live_forwarding():
+    from tools.delegation_control import delegation_control
+
+    repository, initial, attempt = _starting_steer_attempt(
+        "deleg-steer-force-starting", "sa-force-starting"
+    )
+    queued = json.loads(
+        delegation_control(
+            action="steer",
+            delegation_id="deleg-steer-force-starting",
+            subagent_id="sa-force-starting",
+            message="persist force",
+            force=True,
+            session_key="owner",
+        )
+    )
+    assert queued["status"] == "accepted"
+    assert repository.inspect_steer(queued["mailbox_id"])["force"] == 1
+
+    class RecordingAgent:
+        def __init__(self):
+            self.interrupt_event = threading.Event()
+            self.calls = []
+
+        def request_durable_steer(
+            self, text, *, mailbox_id, outcome_callback, force=False
+        ):
+            self.calls.append((text, mailbox_id, force))
+            return {"status": "accepted", "wait_kinds": []}
+
+    agent = RecordingAgent()
+    dt._register_subagent(
+        {
+            "subagent_id": "sa-force-starting",
+            "delegation_attempt_id": attempt["attempt_id"],
+            "delegation_run_id": initial["run_id"],
+            "status": "running",
+            "events": [],
+            "assistant_text_tail": "",
+            "agent": agent,
+        }
+    )
+    try:
+        assert agent.calls == [("persist force", queued["mailbox_id"], True)]
+        assert repository.inspect_steer(queued["mailbox_id"])["status"] == "forwarded"
+    finally:
+        dt._unregister_subagent(
+            "sa-force-starting", str(attempt["attempt_id"])
+        )
 
 def test_starting_child_interrupt_is_queued_then_applied_once():
     runner_started = threading.Event()

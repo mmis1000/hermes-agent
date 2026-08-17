@@ -139,6 +139,8 @@ class InterruptControlMixin:
         )
 
         def _publish_interrupt_state() -> None:
+            if hard_cancel and hasattr(self, "_clear_pending_steer"):
+                self._clear_pending_steer("superseded_by_interrupt")
             self._interrupt_requested = True
             self._interrupt_message = message
             self._tool_interrupt_reason = tool_interrupt_reason
@@ -243,8 +245,11 @@ class InterruptControlMixin:
             # Hard stop only (see docstring). The comment that used to run unconditionally here
             # claimed a hard interrupt supersedes the steer — but nothing gated this wipe on
             # hard_cancel, so a soft clear dropped a live user message with no trace.
-            with _ic_lock(self, "_pending_steer_lock"):
-                self._pending_steer = None
+            if hasattr(self, "_clear_pending_steer"):
+                self._clear_pending_steer("superseded_by_interrupt")
+            else:
+                with _ic_lock(self, "_pending_steer_lock"):
+                    self._pending_steer = None
         return True
 
     def steer(self, text: str) -> bool:
