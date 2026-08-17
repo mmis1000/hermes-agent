@@ -512,6 +512,7 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
             available_toolsets=avail_toolsets,
             compact_categories=_compact_cats or None,
             skills_dir_override=_agent_skills_dir(agent),
+            task_id=getattr(agent, "skill_scope_task_id", None),
         )
     else:
         skills_prompt = ""

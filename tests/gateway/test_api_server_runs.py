@@ -10,6 +10,7 @@ Covers:
 """
 
 import asyncio
+import json
 import threading
 import time
 from unittest.mock import MagicMock, patch
@@ -225,6 +226,14 @@ class TestStartRun:
                     root_registry,
                 ),
                 patch(
+                    "tools.skills_tool._find_all_skills",
+                    return_value=[{"name": "selected"}],
+                ),
+                patch(
+                    "tools.skills_tool.skill_view",
+                    return_value=json.dumps({"success": True}),
+                ),
+                patch(
                     "tools.delegation_scope.configure_protected_attempt_environment"
                 ) as configure_environment,
                 patch(
@@ -243,6 +252,7 @@ class TestStartRun:
                             "profile": profile.name,
                             "workdir": str(repository),
                             "reveal": [{"path": str(repository), "mode": "rw"}],
+                            "skills": ["selected"],
                         },
                     },
                 )
@@ -263,6 +273,10 @@ class TestStartRun:
         assert "Other host paths are not available in this attempt." in protected_prompt
         assert create.call_args.kwargs["delegation_policy"].visible_objects
         assert root_registry.reserve.call_args.args[0].profile.network == "none"
+        assert root_registry.reserve.call_args.args[0].skill_names == frozenset(
+            {"selected"}
+        )
+        assert mock_agent.skill_scope_task_id == "runs-root-attempt"
         mock_agent.run_conversation.assert_called_once()
         assert mock_agent.run_conversation.call_args.kwargs["task_id"] == "runs-root-attempt"
         root_registry.prepare_idmapped_reveals.assert_called_once_with("runs-root-attempt")

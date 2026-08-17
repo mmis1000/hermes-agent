@@ -62,6 +62,21 @@ class TestContextFileCwd:
         assert _captured_context_cwd(_make_agent()) == tmp_path
 
 
+def test_protected_skill_scope_is_forwarded_to_prompt_builder():
+    agent = _make_agent(
+        valid_tool_names=["skill_view"],
+        skill_scope_task_id="protected-attempt",
+    )
+    with patch(
+        "run_agent.build_skills_system_prompt",
+        return_value="bounded skills",
+    ) as build_skills:
+        stable = _stable_prompt(agent)
+
+    assert "bounded skills" in stable
+    assert build_skills.call_args.kwargs["task_id"] == "protected-attempt"
+
+
 def _stable_prompt(agent):
     with (
         patch("run_agent.load_soul_md", return_value=""),

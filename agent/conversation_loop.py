@@ -1025,6 +1025,13 @@ def _stored_prompt_matches_runtime(agent, prompt: str) -> bool:
     current_platform = str(getattr(agent, "platform", "") or "").strip()
     if stored_platform and current_platform and stored_platform != current_platform:
         return False
+    stored_skill_scope = line_value("Skill scope")
+    raw_skill_scope = getattr(agent, "skill_scope_task_id", None)
+    current_skill_scope = (
+        raw_skill_scope.strip() if isinstance(raw_skill_scope, str) else ""
+    )
+    if stored_skill_scope != current_skill_scope:
+        return False
 
     return True
 

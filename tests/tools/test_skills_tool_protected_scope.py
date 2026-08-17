@@ -3,10 +3,12 @@ from __future__ import annotations
 import json
 from pathlib import Path, PurePosixPath
 from types import SimpleNamespace
+from typing import Literal
 
 import pytest
 
 from agent.delegation_policy import AccessMode, BackingObjectRef, VisibleObjectGrant
+from agent.prompt_builder import build_skills_system_prompt
 import tools.skills_tool as skills_tool
 from tools.delegation_scope import BackingObjectRecord, BackingObjectRegistry
 
@@ -21,7 +23,14 @@ def _write_skill(root, name, description):
     return skill_dir
 
 
-def _protected_authority(repository: Path, *, state: str = "active"):
+def _protected_authority(
+    repository: Path,
+    *,
+    state: str = "active",
+    skill_names=(),
+    all_skills: bool = False,
+    object_type: Literal["file", "directory"] = "directory",
+):
     stat_result = repository.lstat()
     backing = BackingObjectRef(
         object_id="repo",
@@ -33,22 +42,272 @@ def _protected_authority(repository: Path, *, state: str = "active"):
         visible_path=PurePosixPath(str(repository)),
         mode=AccessMode.RW,
         backing=backing,
-        object_type="directory",
+        object_type=object_type,
     )
     registry = BackingObjectRegistry(
         {
             backing.object_id: BackingObjectRecord(
                 backing=backing,
-                object_type="directory",
+                object_type=object_type,
                 trusted_host_path=True,
             )
         }
     )
     return SimpleNamespace(
         state=state,
-        invocation_scope=SimpleNamespace(visible_objects=(grant,)),
+        invocation_scope=SimpleNamespace(
+            visible_objects=(grant,),
+            skill_names=frozenset(skill_names),
+            all_skills=all_skills,
+        ),
         backing_registry=registry,
     )
+
+
+def test_specific_skill_grant_adds_only_named_skill(tmp_path, monkeypatch):
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    global_skills = tmp_path / "global-skills"
+    selected_dir = _write_skill(global_skills, "selected", "selected skill")
+    _write_skill(global_skills, "unselected", "unselected skill")
+    (selected_dir / "references").mkdir()
+    (selected_dir / "references" / "note.md").write_text(
+        "selected note",
+        encoding="utf-8",
+    )
+
+    authority = _protected_authority(repository, skill_names={"selected"})
+    monkeypatch.setattr(
+        "tools.delegation_scope.attempt_scope_registry.get",
+        lambda task_id: authority if task_id == "protected-attempt" else None,
+    )
+    monkeypatch.setattr(skills_tool, "_skills_dir", lambda: global_skills)
+    monkeypatch.setattr("agent.skill_utils.get_external_skills_dirs", lambda: [])
+    skills_tool._SKILLS_CACHE.clear()
+
+    listed = json.loads(skills_tool.skills_list(task_id="protected-attempt"))
+    selected = json.loads(
+        skills_tool.skill_view(
+            "selected",
+            file_path="references/note.md",
+            task_id="protected-attempt",
+            preprocess=False,
+        )
+    )
+    unselected = json.loads(
+        skills_tool.skill_view(
+            "unselected",
+            task_id="protected-attempt",
+            preprocess=False,
+        )
+    )
+
+    assert [skill["name"] for skill in listed["skills"]] == ["selected"]
+    assert selected["success"] is True
+    assert selected["content"] == "selected note"
+    assert unselected["success"] is False
+
+
+def test_protected_skill_view_never_runs_skill_preprocessing(tmp_path, monkeypatch):
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    global_skills = tmp_path / "global-skills"
+    skill_dir = global_skills / "selected"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        "---\nname: selected\ndescription: selected skill\n---\n"
+        "raw {{ shell: printf escaped }}",
+        encoding="utf-8",
+    )
+    authority = _protected_authority(repository, skill_names={"selected"})
+    monkeypatch.setattr(
+        "tools.delegation_scope.attempt_scope_registry.get",
+        lambda task_id: authority if task_id == "protected-attempt" else None,
+    )
+    monkeypatch.setattr(skills_tool, "_skills_dir", lambda: global_skills)
+    monkeypatch.setattr("agent.skill_utils.get_external_skills_dirs", lambda: [])
+    preprocess_calls = []
+
+    def _record_preprocess(content, *_args, **_kwargs):
+        preprocess_calls.append(content)
+        return "PREPROCESSED"
+
+    monkeypatch.setattr(
+        "agent.skill_preprocessing.preprocess_skill_content",
+        _record_preprocess,
+    )
+
+    viewed = json.loads(
+        skills_tool.skill_view("selected", task_id="protected-attempt")
+    )
+
+    assert viewed["success"] is True
+    assert "{{ shell: printf escaped }}" in viewed["content"]
+    assert preprocess_calls == []
+
+
+def test_disabled_skill_is_absent_from_protected_catalog(tmp_path, monkeypatch):
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    global_skills = tmp_path / "global-skills"
+    _write_skill(global_skills, "disabled", "disabled skill")
+    authority = _protected_authority(repository, all_skills=True)
+    monkeypatch.setattr(
+        "tools.delegation_scope.attempt_scope_registry.get",
+        lambda task_id: authority if task_id == "protected-attempt" else None,
+    )
+    monkeypatch.setattr(skills_tool, "_skills_dir", lambda: global_skills)
+    monkeypatch.setattr("agent.skill_utils.get_external_skills_dirs", lambda: [])
+    monkeypatch.setattr(skills_tool, "_get_disabled_skill_names", lambda: {"disabled"})
+    skills_tool._SKILLS_CACHE.clear()
+
+    listed = json.loads(skills_tool.skills_list(task_id="protected-attempt"))
+    prompt = build_skills_system_prompt(
+        available_tools={"skill_view"},
+        task_id="protected-attempt",
+    )
+
+    assert listed["skills"] == []
+    assert "disabled skill" not in prompt
+
+
+def test_duplicate_name_is_not_exposed_by_protected_catalog(tmp_path, monkeypatch):
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    first_root = tmp_path / "first-skills"
+    second_root = tmp_path / "second-skills"
+    _write_skill(first_root, "duplicate", "first duplicate")
+    _write_skill(second_root, "duplicate", "second duplicate")
+    authority = _protected_authority(repository, all_skills=True)
+    monkeypatch.setattr(
+        "tools.delegation_scope.attempt_scope_registry.get",
+        lambda task_id: authority if task_id == "protected-attempt" else None,
+    )
+    monkeypatch.setattr(skills_tool, "_skills_dir", lambda: first_root)
+    monkeypatch.setattr(
+        "agent.skill_utils.get_external_skills_dirs",
+        lambda: [second_root],
+    )
+    skills_tool._SKILLS_CACHE.clear()
+
+    listed = json.loads(skills_tool.skills_list(task_id="protected-attempt"))
+
+    assert listed["skills"] == []
+
+
+def test_directory_alias_collision_is_not_exposed_by_protected_catalog(
+    tmp_path,
+    monkeypatch,
+):
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    global_skills = tmp_path / "global-skills"
+    alias_dir = global_skills / "foo"
+    alias_dir.mkdir(parents=True)
+    (alias_dir / "SKILL.md").write_text(
+        "---\nname: bar\ndescription: alias owner\n---\n",
+        encoding="utf-8",
+    )
+    frontmatter_dir = global_skills / "other"
+    frontmatter_dir.mkdir()
+    (frontmatter_dir / "SKILL.md").write_text(
+        "---\nname: foo\ndescription: frontmatter owner\n---\n",
+        encoding="utf-8",
+    )
+    authority = _protected_authority(repository, all_skills=True)
+    monkeypatch.setattr(
+        "tools.delegation_scope.attempt_scope_registry.get",
+        lambda task_id: authority if task_id == "protected-attempt" else None,
+    )
+    monkeypatch.setattr(skills_tool, "_skills_dir", lambda: global_skills)
+    monkeypatch.setattr("agent.skill_utils.get_external_skills_dirs", lambda: [])
+    skills_tool._SKILLS_CACHE.clear()
+
+    listed = json.loads(skills_tool.skills_list(task_id="protected-attempt"))
+
+    assert [skill["name"] for skill in listed["skills"]] == ["bar"]
+
+
+def test_all_skills_grant_makes_each_listed_skill_viewable(tmp_path, monkeypatch):
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    global_skills = tmp_path / "global-skills"
+    _write_skill(global_skills, "first", "first skill")
+    _write_skill(global_skills, "second", "second skill")
+
+    authority = _protected_authority(repository, all_skills=True)
+    monkeypatch.setattr(
+        "tools.delegation_scope.attempt_scope_registry.get",
+        lambda task_id: authority if task_id == "protected-attempt" else None,
+    )
+    monkeypatch.setattr(skills_tool, "_skills_dir", lambda: global_skills)
+    monkeypatch.setattr("agent.skill_utils.get_external_skills_dirs", lambda: [])
+    skills_tool._SKILLS_CACHE.clear()
+
+    listed = json.loads(skills_tool.skills_list(task_id="protected-attempt"))
+
+    assert {skill["name"] for skill in listed["skills"]} == {"first", "second"}
+    for skill in listed["skills"]:
+        viewed = json.loads(
+            skills_tool.skill_view(
+                skill["name"],
+                task_id="protected-attempt",
+                preprocess=False,
+            )
+        )
+        assert viewed["success"] is True
+
+
+def test_protected_prompt_uses_same_specific_skill_catalog(tmp_path, monkeypatch):
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    global_skills = tmp_path / "global-skills"
+    _write_skill(global_skills, "selected", "selected skill")
+    _write_skill(global_skills, "unselected", "unselected skill")
+    authority = _protected_authority(repository, skill_names={"selected"})
+    monkeypatch.setattr(
+        "tools.delegation_scope.attempt_scope_registry.get",
+        lambda task_id: authority if task_id == "protected-attempt" else None,
+    )
+    monkeypatch.setattr(skills_tool, "_skills_dir", lambda: global_skills)
+    monkeypatch.setattr("agent.skill_utils.get_external_skills_dirs", lambda: [])
+    skills_tool._SKILLS_CACHE.clear()
+
+    listed = json.loads(skills_tool.skills_list(task_id="protected-attempt"))
+    prompt = build_skills_system_prompt(
+        available_tools={"skill_view"},
+        task_id="protected-attempt",
+    )
+
+    assert [skill["name"] for skill in listed["skills"]] == ["selected"]
+    assert "selected skill" in prompt
+    assert "unselected skill" not in prompt
+
+
+def test_visible_skill_file_is_automatically_listed_and_viewable(tmp_path, monkeypatch):
+    global_skills = tmp_path / "global-skills"
+    skill_dir = _write_skill(global_skills, "file-visible", "visible file")
+    skill_md = skill_dir / "SKILL.md"
+    authority = _protected_authority(skill_md, object_type="file")
+    monkeypatch.setattr(
+        "tools.delegation_scope.attempt_scope_registry.get",
+        lambda task_id: authority if task_id == "protected-attempt" else None,
+    )
+    monkeypatch.setattr(skills_tool, "_skills_dir", lambda: global_skills)
+    monkeypatch.setattr("agent.skill_utils.get_external_skills_dirs", lambda: [])
+    skills_tool._SKILLS_CACHE.clear()
+
+    listed = json.loads(skills_tool.skills_list(task_id="protected-attempt"))
+    viewed = json.loads(
+        skills_tool.skill_view(
+            "file-visible",
+            task_id="protected-attempt",
+            preprocess=False,
+        )
+    )
+
+    assert [skill["name"] for skill in listed["skills"]] == ["file-visible"]
+    assert viewed["success"] is True, viewed
 
 
 def test_protected_skill_tools_only_search_roots_inside_attempt_grants(
