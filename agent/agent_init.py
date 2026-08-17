@@ -682,6 +682,9 @@ def init_agent(
     agent._pending_steer: Optional[str] = None
     agent._pending_steer_envelopes: list = []
     agent._pending_steer_lock = threading.Lock()
+    from tools.foreground_wait import ForegroundWaitRegistry
+
+    agent._foreground_waits = ForegroundWaitRegistry()
 
     # Concurrent-tool worker thread tracking.  `_execute_tool_calls_concurrent`
     # runs each tool on its own ThreadPoolExecutor worker — those worker

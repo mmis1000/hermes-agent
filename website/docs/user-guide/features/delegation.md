@@ -207,6 +207,17 @@ A positive value enforces a hard wall-clock limit on each child; `0` or a negati
 With a hard cap configured, if a subagent times out having made **zero** API calls (usually: provider unreachable, auth failure, or tool-schema rejection), `delegate_task` writes a structured diagnostic to `~/.hermes/logs/subagent-timeout-<session>-<timestamp>.log` containing the subagent's config snapshot, credential-resolution trace, and any early error messages. Much easier to root-cause than the previous silent-timeout behavior.
 :::
 
+## Steering a Subagent During a Foreground Wait
+
+`delegation(action="steer", ...)` normally queues guidance for the child without interrupting its current tool. If the child is blocked in a foreground `terminal(...)` command or `delegation(action="wait", ...)`, ordinary steering instead returns `status="foreground_wait"` and does not queue the message. Retry explicitly with `force=true` to move only that wait into the background and deliver the guidance through the normal steer queue.
+
+The underlying work is not restarted or cancelled:
+
+- A terminal command is adopted by the process registry. The interrupted tool result includes its `session_id` and exact `process(action="wait"|"log"|"kill", ...)` recovery calls.
+- A delegation wait releases its delivery hold while leaving the child running. The result includes its `delegation_id`, `run_id`, and exact `delegation(action="wait"|"status"|"interrupt", ...)` recovery calls.
+
+The recovery result is added before the parent's out-of-band steer message, so the child receives both the new direction and the handle for work it may resume, inspect, or stop later. `force=true` applies only to these two supported foreground waits; it is not a general cancellation mode.
+
 ## Monitoring Running Subagents (`/agents`)
 
 The TUI ships a `/agents` overlay (alias `/tasks`) that turns recursive `delegate_task` fan-out into a first-class audit surface:

@@ -127,6 +127,62 @@ def test_wait_timeout_releases_hold_without_consuming_late_completion():
     assert ad.release_completion_delivery(dispatched["delegation_id"], "auto")
 
 
+def test_forced_delegation_wait_returns_recoverable_running_handoff():
+    from tools.foreground_wait import ForegroundWaitSlot, set_current_foreground_wait
+
+    release = threading.Event()
+    dispatched = _dispatch(
+        lambda: release.wait(2) or {"status": "completed", "summary": "later"}
+    )
+    slot = ForegroundWaitSlot("call-wait", "delegation")
+    outcome = {}
+
+    def wait():
+        set_current_foreground_wait(slot)
+        try:
+            outcome.update(
+                ad.wait_for_delegation(
+                    dispatched["delegation_id"],
+                    session_key="owner",
+                    timeout_seconds=1,
+                )
+            )
+        finally:
+            set_current_foreground_wait(None)
+
+    thread = threading.Thread(target=wait)
+    thread.start()
+    deadline = time.monotonic() + 1
+    while time.monotonic() < deadline:
+        row = ad.get_durable_delegation(dispatched["delegation_id"])
+        if row and row["delivery_state"] == "held_by_wait":
+            break
+        time.sleep(0.002)
+    else:
+        raise AssertionError("wait never registered its durable hold")
+
+    slot.background_requested.set()
+    thread.join(1)
+
+    assert not thread.is_alive()
+    assert outcome["status"] == "backgrounded"
+    assert outcome["claimed_delivery"] is False
+    handoff = outcome["foreground_handoff"]
+    assert handoff["kind"] == "delegation"
+    assert handoff["delegation_id"] == dispatched["delegation_id"]
+    durable = ad.get_durable_delegation(dispatched["delegation_id"])
+    assert handoff["run_id"] == durable["active_run_id"]
+    assert 'action="wait"' in handoff["continue"]
+    assert 'action="interrupt"' in handoff["stop"]
+    assert ad.get_durable_delegation(dispatched["delegation_id"])["delivery_state"] == "pending"
+    assert slot.wait_for_resolution(0)["handoff"] == handoff
+
+    release.set()
+    _wait_terminal(dispatched["delegation_id"])
+    assert ad.claim_completion_delivery(dispatched["delegation_id"], "auto")
+    assert ad.release_completion_delivery(dispatched["delegation_id"], "auto")
+
+
 def test_completion_while_wait_hold_is_registered_is_consumed_by_waiter():
     release = threading.Event()
     dispatched = _dispatch(

@@ -218,8 +218,9 @@ class ProcessSession:
     task_id: str = ""                           # Task/sandbox isolation key
     session_key: str = ""                       # Gateway session key (for reset protection)
     pid: Optional[int] = None                   # OS process ID
-    process: Optional[subprocess.Popen] = None  # Popen handle (local only)
+    process: Any = None                         # Live process handle
     env_ref: Any = None                         # Reference to the environment object
+    kill_callback: Any = field(default=None, repr=False)  # Backend-aware termination
     cwd: Optional[str] = None                   # Working directory
     started_at: float = 0.0                     # time.time() of spawn (wall clock)
     host_start_time: Optional[int] = None       # kernel start ticks (/proc/<pid>/stat f22) — PID-reuse guard
@@ -795,6 +796,74 @@ class ProcessRegistry:
                 pass
 
     # ----- Spawn -----
+
+    def adopt_foreground_process(
+        self,
+        process: Any,
+        *,
+        command: str,
+        task_id: str = "",
+        session_key: str = "",
+        cwd: Optional[str] = None,
+        env_ref: Any = None,
+        initial_output: str = "",
+        kill_callback: Any = None,
+        notify_on_complete: bool = True,
+    ) -> ProcessSession:
+        """Take ownership of an already-running foreground process handle."""
+        pid = getattr(process, "pid", None)
+        session = ProcessSession(
+            id=f"proc_{uuid.uuid4().hex[:12]}",
+            command=command,
+            task_id=task_id,
+            session_key=session_key,
+            pid=pid if isinstance(pid, int) else None,
+            process=process,
+            env_ref=env_ref,
+            kill_callback=kill_callback,
+            cwd=cwd,
+            started_at=time.time(),
+            host_start_time=(
+                self._safe_host_start_time(pid) if isinstance(pid, int) else None
+            ),
+            output_buffer=str(initial_output or "")[-MAX_OUTPUT_CHARS:],
+            notify_on_complete=bool(notify_on_complete),
+        )
+        with self._lock:
+            self._prune_if_needed()
+            self._running[session.id] = session
+        self._write_checkpoint()
+        return session
+
+    def update_adopted_output(
+        self, session: ProcessSession, output: str, chunk: str = ""
+    ) -> None:
+        with session._lock:
+            if session.exited:
+                return
+            session.output_buffer = str(output or "")[-session.max_output_chars :]
+        if chunk:
+            self._check_watch_patterns(session, chunk)
+            self._emit_output(session, chunk)
+
+    def finish_adopted_process(
+        self,
+        session: ProcessSession,
+        *,
+        output: str,
+        exit_code: Optional[int],
+        completion_reason: str = "exited",
+        termination_source: str = "",
+    ) -> None:
+        with session._lock:
+            if session.exited:
+                return
+            session.output_buffer = str(output or "")[-session.max_output_chars :]
+            session.exit_code = exit_code
+            session.completion_reason = completion_reason
+            session.termination_source = termination_source
+            session.exited = True
+        self._move_to_finished(session)
 
     @staticmethod
     def _env_temp_dir(env: Any) -> str:
@@ -1692,6 +1761,8 @@ class ProcessRegistry:
                 except Exception:
                     if session.pid:
                         os.kill(session.pid, signal.SIGTERM)
+            elif callable(session.kill_callback):
+                session.kill_callback()
             elif session.process:
                 # Local process -- kill the process tree. On Windows this
                 # must be taskkill /T /F; Popen.terminate() only kills the

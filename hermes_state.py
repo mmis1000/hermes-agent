@@ -1038,6 +1038,7 @@ CREATE TABLE IF NOT EXISTS delegation_steer_mailbox (
     attempt_id TEXT NOT NULL REFERENCES delegation_attempts(attempt_id) ON DELETE CASCADE,
     sequence_number INTEGER NOT NULL,
     message TEXT NOT NULL,
+    force INTEGER NOT NULL DEFAULT 0,
     status TEXT NOT NULL DEFAULT 'pending',
     created_at REAL NOT NULL,
     forwarded_at REAL,

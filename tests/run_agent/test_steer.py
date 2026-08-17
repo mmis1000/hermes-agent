@@ -7,6 +7,7 @@ and prompt-cache integrity.
 """
 from __future__ import annotations
 
+import json
 import threading
 
 import pytest
@@ -27,6 +28,205 @@ def _bare_agent() -> AIAgent:
 
 
 class TestSteerAcceptance:
+    def test_tool_wait_context_registers_only_supported_foreground_calls(self):
+        from tools.foreground_wait import (
+            ForegroundWaitRegistry,
+            current_foreground_wait,
+            track_foreground_wait,
+        )
+
+        class Agent:
+            _foreground_waits = ForegroundWaitRegistry()
+
+        agent = Agent()
+        with track_foreground_wait(
+            agent, "call-terminal", "terminal", {"background": False}
+        ) as slot:
+            assert slot is current_foreground_wait()
+            assert [item.kind for item in agent._foreground_waits.snapshot()] == [
+                "terminal"
+            ]
+        assert agent._foreground_waits.snapshot() == []
+
+        with track_foreground_wait(
+            agent, "call-background", "terminal", {"background": True}
+        ) as slot:
+            assert slot is None
+        with track_foreground_wait(
+            agent, "call-wait", "delegation", {"action": "wait"}
+        ) as slot:
+            assert slot is not None
+            assert slot.kind == "delegation"
+
+    def test_concurrent_terminal_worker_is_visible_to_ordinary_durable_steer(self):
+        from types import SimpleNamespace
+        from unittest.mock import MagicMock
+
+        from tests.run_agent.test_tool_call_guardrail_runtime import (
+            _make_agent,
+            _mock_tool_call,
+        )
+        from tools.foreground_wait import ForegroundWaitRegistry
+
+        agent = _make_agent("terminal")
+        agent._foreground_waits = ForegroundWaitRegistry()
+        started = threading.Event()
+        release = threading.Event()
+
+        def blocking_invoke(*args, **kwargs):
+            del args, kwargs
+            started.set()
+            assert release.wait(2)
+            return json.dumps({"output": "done", "exit_code": 0})
+
+        agent._invoke_tool = MagicMock(side_effect=blocking_invoke)
+        assistant_message = SimpleNamespace(
+            content="",
+            tool_calls=[
+                _mock_tool_call(
+                    "terminal",
+                    json.dumps({"command": "sleep 30", "background": False}),
+                    "call-concurrent-terminal",
+                )
+            ],
+        )
+        errors = []
+
+        def execute():
+            try:
+                agent._execute_tool_calls_concurrent(
+                    assistant_message, [], "task-concurrent"
+                )
+            except BaseException as exc:
+                errors.append(exc)
+
+        thread = threading.Thread(target=execute)
+        thread.start()
+        try:
+            assert started.wait(2)
+            outcomes = []
+            result = agent.request_durable_steer(
+                "ordinary guidance",
+                mailbox_id="mail-concurrent",
+                outcome_callback=outcomes.append,
+            )
+
+            assert result == {
+                "status": "foreground_wait",
+                "wait_kinds": ["terminal"],
+            }
+            assert outcomes == ["foreground_wait"]
+            assert agent._drain_pending_steer_envelopes() == []
+        finally:
+            release.set()
+            thread.join(3)
+        assert not thread.is_alive()
+        assert errors == []
+
+    def test_durable_steer_refuses_active_foreground_wait_without_queueing(self):
+        from tools.foreground_wait import ForegroundWaitRegistry
+
+        agent = _bare_agent()
+        agent._foreground_waits = ForegroundWaitRegistry()
+        slot = agent._foreground_waits.register("call-terminal", "terminal")
+        outcomes = []
+
+        result = agent.request_durable_steer(
+            "change direction",
+            mailbox_id="mail-blocked",
+            outcome_callback=outcomes.append,
+            force=False,
+        )
+
+        assert result == {
+            "status": "foreground_wait",
+            "wait_kinds": ["terminal"],
+        }
+        assert outcomes == ["foreground_wait"]
+        assert agent._pending_steer is None
+        agent._foreground_waits.unregister(slot)
+
+    def test_forced_durable_steer_waits_for_handoff_then_queues_exact_envelope(self):
+        from tools.foreground_wait import ForegroundWaitRegistry
+
+        agent = _bare_agent()
+        agent._foreground_waits = ForegroundWaitRegistry()
+        slot = agent._foreground_waits.register("call-terminal", "terminal")
+        outcomes = []
+        result = {}
+
+        def request():
+            result.update(
+                agent.request_durable_steer(
+                    "change direction",
+                    mailbox_id="mail-forced",
+                    outcome_callback=outcomes.append,
+                    force=True,
+                )
+            )
+
+        thread = threading.Thread(target=request)
+        thread.start()
+        assert slot.background_requested.wait(1)
+        slot.complete_background(
+            {
+                "kind": "process",
+                "session_id": "proc_original",
+            }
+        )
+        thread.join(1)
+
+        assert not thread.is_alive()
+        assert result == {"status": "accepted", "wait_kinds": ["terminal"]}
+        assert outcomes == []
+        assert agent._pending_steer == "change direction"
+        envelopes = agent._drain_pending_steer_envelopes()
+        assert envelopes[0]["mailbox_id"] == "mail-forced"
+        agent._foreground_waits.unregister(slot)
+
+    def test_force_handoff_failure_retracts_envelope_and_reports_terminal_outcome(self):
+        from tools.foreground_wait import ForegroundWaitRegistry
+
+        agent = _bare_agent()
+        agent._foreground_waits = ForegroundWaitRegistry()
+        slot = agent._foreground_waits.register("call-fail", "terminal")
+        outcomes = []
+
+        def fail_handoff():
+            assert slot.background_requested.wait(1)
+            slot.fail_background("cannot adopt original process")
+
+        thread = threading.Thread(target=fail_handoff)
+        thread.start()
+        result = agent.request_durable_steer(
+            "do not inject me",
+            mailbox_id="mail-fail",
+            outcome_callback=outcomes.append,
+            force=True,
+        )
+        thread.join(1)
+
+        assert result["status"] == "force_background_failed"
+        assert result["errors"] == ["cannot adopt original process"]
+        assert outcomes == ["force_background_failed"]
+        assert agent._drain_pending_steer_envelopes() == []
+        agent._foreground_waits.unregister(slot)
+
+    def test_force_completion_race_keeps_steer_without_inventing_handoff(self):
+        from tools.foreground_wait import ForegroundWaitRegistry
+
+        registry = ForegroundWaitRegistry()
+        slot = registry.register("call-race", "delegation")
+        registry.unregister(slot)
+
+        result = registry.request_background([slot])
+
+        assert result == {
+            "status": "backgrounded",
+            "wait_kinds": ["delegation"],
+            "handoffs": [],
+        }
+
     def test_accepts_non_empty_text(self):
         agent = _bare_agent()
         assert agent.steer("go ahead and check the logs") is True
@@ -83,6 +283,24 @@ class TestSteerAcceptance:
             ("mail-1", "injected"),
             ("mail-2", "injected"),
         ]
+
+    def test_handoff_tool_result_precedes_exact_parent_steer_marker(self):
+        agent = _bare_agent()
+        agent.steer("parent says continue elsewhere")
+        content = (
+            '{"status":"backgrounded","foreground_handoff":'
+            '{"kind":"process","session_id":"proc_original",'
+            '"continue":"process(action=\\"wait\\", session_id=\\"proc_original\\")"}}'
+        )
+        messages = [{"role": "tool", "content": content, "tool_call_id": "1"}]
+
+        agent._apply_pending_steer_to_tool_results(messages, num_tool_msgs=1)
+
+        delivered = messages[0]["content"]
+        assert delivered.index("proc_original") < delivered.index(
+            "[OUT-OF-BAND USER MESSAGE"
+        )
+        assert "parent says continue elsewhere" in delivered
 
     def test_interrupt_acks_tracked_envelope_as_superseded(self):
         agent = _bare_agent()
