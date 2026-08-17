@@ -991,6 +991,7 @@ async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
                 interim_assistant_callback=_interim_cb, **run.agent_kwargs)
         if protected is not None:
             from tools.delegate_tool import configure_protected_agent_tools
+            agent.skill_scope_task_id = run.protected_attempt_id
             agent.delegation_backing_registry = protected.backing_registry
             agent.resolved_invocation_scope = protected.invocation_scope
             configure_protected_agent_tools(agent, protected.invocation_scope.profile)

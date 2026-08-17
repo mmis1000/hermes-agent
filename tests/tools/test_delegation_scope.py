@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from pathlib import Path, PurePosixPath
 import tempfile
 
@@ -157,6 +158,120 @@ def test_trusted_run_execution_admits_real_directory_as_root_scope(tmp_path):
     assert record is not None
     assert record.backing == grant.backing
     assert record.trusted_host_path is True
+    assert admitted.invocation_scope.skill_names == frozenset()
+    assert admitted.invocation_scope.all_skills is False
+
+
+def test_trusted_run_execution_admits_specific_skill_names(tmp_path, monkeypatch):
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    monkeypatch.setattr(
+        "tools.skills_tool._find_all_skills",
+        lambda: [{"name": "first"}, {"name": "second"}],
+    )
+    monkeypatch.setattr(
+        "tools.skills_tool.skill_view",
+        lambda name, **_kwargs: json.dumps(
+            {"success": name in {"first", "second"}}
+        ),
+    )
+
+    admitted = admit_trusted_run_execution(
+        _policy(profiles=("isolated",)),
+        {
+            "profile": "isolated",
+            "workdir": str(repository),
+            "reveal": [{"path": str(repository), "mode": "rw"}],
+            "skills": ["second", "first", "second"],
+        },
+    )
+
+    assert admitted.invocation_scope.skill_names == frozenset({"first", "second"})
+    assert admitted.invocation_scope.all_skills is False
+
+
+def test_trusted_run_execution_admits_explicit_all_skills(tmp_path):
+    repository = tmp_path / "repository"
+    repository.mkdir()
+
+    admitted = admit_trusted_run_execution(
+        _policy(profiles=("isolated",)),
+        {
+            "profile": "isolated",
+            "workdir": str(repository),
+            "reveal": [{"path": str(repository), "mode": "rw"}],
+            "skills": "all",
+        },
+    )
+
+    assert admitted.invocation_scope.skill_names == frozenset()
+    assert admitted.invocation_scope.all_skills is True
+
+
+@pytest.mark.parametrize("skills", [None, "selected", {}, [""], [1]])
+def test_trusted_run_execution_rejects_invalid_skill_grant(
+    tmp_path,
+    skills,
+):
+    repository = tmp_path / "repository"
+    repository.mkdir()
+
+    with pytest.raises((TypeError, ValueError), match="skills"):
+        admit_trusted_run_execution(
+            _policy(profiles=("isolated",)),
+            {
+                "profile": "isolated",
+                "workdir": str(repository),
+                "reveal": [{"path": str(repository), "mode": "rw"}],
+                "skills": skills,
+            },
+        )
+
+
+def test_trusted_run_execution_rejects_unknown_skill(tmp_path, monkeypatch):
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    monkeypatch.setattr(
+        "tools.skills_tool._find_all_skills",
+        lambda: [{"name": "known"}],
+    )
+
+    with pytest.raises(ValueError, match="unknown skill.*missing"):
+        admit_trusted_run_execution(
+            _policy(profiles=("isolated",)),
+            {
+                "profile": "isolated",
+                "workdir": str(repository),
+                "reveal": [{"path": str(repository), "mode": "rw"}],
+                "skills": ["missing"],
+            },
+        )
+
+
+def test_trusted_run_execution_rejects_unviewable_skill_name(tmp_path, monkeypatch):
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    monkeypatch.setattr(
+        "tools.skills_tool._find_all_skills",
+        lambda: [{"name": "duplicate"}],
+    )
+    monkeypatch.setattr(
+        "tools.skills_tool.skill_view",
+        lambda *_args, **_kwargs: json.dumps(
+            {"success": False, "error": "ambiguous skill name"}
+        ),
+    )
+
+    with pytest.raises(ValueError, match="not uniquely viewable"):
+        admit_trusted_run_execution(
+            _policy(profiles=("isolated",)),
+            {
+                "profile": "isolated",
+                "workdir": str(repository),
+                "reveal": [{"path": str(repository), "mode": "rw"}],
+                "skills": ["duplicate"],
+            },
+        )
 
 
 @pytest.mark.parametrize(

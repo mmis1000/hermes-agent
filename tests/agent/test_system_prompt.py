@@ -214,6 +214,21 @@ class TestContextFileCwd:
         assert "chosen workspace instructions" in context
 
 
+def test_protected_skill_scope_is_forwarded_to_prompt_builder():
+    agent = _make_agent(
+        valid_tool_names=["skill_view"],
+        skill_scope_task_id="protected-attempt",
+    )
+    with patch(
+        "agent.prompt_builder.build_skills_system_prompt",
+        return_value="bounded skills",
+    ) as build_skills:
+        parts = _prompt_parts(agent)
+
+    assert "bounded skills" in parts["volatile"]
+    assert build_skills.call_args.kwargs["task_id"] == "protected-attempt"
+
+
 def _stable_prompt(agent):
     with (
         patch("agent.prompt_builder.load_soul_md", return_value=""),
