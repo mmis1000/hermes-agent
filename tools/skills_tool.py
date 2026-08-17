@@ -694,8 +694,8 @@ def _is_skill_disabled(name: str, platform: str = None) -> bool:
         return False
 
 
-def _protected_skill_path_allowed(task_id: str | None, path: Path) -> bool | None:
-    """Return None for ordinary calls, otherwise whether path is in attempt scope."""
+def _protected_skill_authority(task_id: str | None):
+    """Return None for ordinary calls, otherwise the active attempt authority."""
 
     if not task_id:
         return None
@@ -706,6 +706,53 @@ def _protected_skill_path_allowed(task_id: str | None, path: Path) -> bool | Non
         return None
     if getattr(authority, "state", None) not in {"starting", "active"}:
         return False
+    return authority
+
+
+def _trusted_skill_name_for_path(path: Path) -> str | None:
+    """Return the owning active-profile skill name for a trusted skill path."""
+
+    from agent.skill_utils import get_external_skills_dirs
+
+    try:
+        candidate = path.resolve(strict=True)
+    except OSError:
+        return None
+
+    roots = [_skills_dir(), *get_external_skills_dirs()]
+    for root in roots:
+        try:
+            resolved_root = root.resolve(strict=True)
+        except OSError:
+            continue
+        if candidate != resolved_root and resolved_root not in candidate.parents:
+            continue
+
+        current = candidate if candidate.is_dir() else candidate.parent
+        while current == resolved_root or resolved_root in current.parents:
+            skill_md = current / "SKILL.md"
+            if skill_md.is_file():
+                try:
+                    frontmatter, _ = _parse_frontmatter(
+                        skill_md.read_text(encoding="utf-8")[:4000]
+                    )
+                except Exception:
+                    return None
+                return str(frontmatter.get("name") or current.name)[:MAX_NAME_LENGTH]
+            if current == resolved_root:
+                break
+            current = current.parent
+    return None
+
+
+def _protected_skill_path_allowed(task_id: str | None, path: Path) -> bool | None:
+    """Return None for ordinary calls, otherwise whether skill tools may read path."""
+
+    authority = _protected_skill_authority(task_id)
+    if authority is None:
+        return None
+    if authority is False:
+        return False
     backing_registry = getattr(authority, "backing_registry", None)
     if backing_registry is None:
         return False
@@ -714,7 +761,7 @@ def _protected_skill_path_allowed(task_id: str | None, path: Path) -> bool | Non
     except OSError:
         return False
     for grant in authority.invocation_scope.visible_objects:
-        if grant.backing.kind != "host_path" or grant.object_type != "directory":
+        if grant.backing.kind != "host_path":
             continue
         record = backing_registry.get(grant.backing.object_id)
         if (
@@ -726,11 +773,21 @@ def _protected_skill_path_allowed(task_id: str | None, path: Path) -> bool | Non
         ):
             continue
         root = Path(record.backing.identity)
-        if candidate == root or root in candidate.parents:
+        if (
+            candidate == root
+            or (grant.object_type == "directory" and root in candidate.parents)
+        ):
             # Re-check after candidate resolution. Trusted host records pin and
-            # verify the directory device/inode on every registry lookup.
+            # verify the object device/inode on every registry lookup.
             return backing_registry.get(grant.backing.object_id) == record
-    return False
+
+    scope = authority.invocation_scope
+    skill_name = _trusted_skill_name_for_path(candidate)
+    if skill_name is None:
+        return False
+    if bool(getattr(scope, "all_skills", False)):
+        return True
+    return skill_name in frozenset(getattr(scope, "skill_names", ()))
 
 
 def _protected_skill_search_dirs(
@@ -739,18 +796,15 @@ def _protected_skill_search_dirs(
 ) -> List[Path] | None:
     if not task_id:
         return None
-    from tools.delegation_scope import attempt_scope_registry
-
-    authority = attempt_scope_registry.get(task_id)
+    authority = _protected_skill_authority(task_id)
     if authority is None:
         return None
-    if getattr(authority, "state", None) not in {"starting", "active"}:
+    if authority is False:
         return []
-    return [
-        path
-        for path in candidates
-        if _protected_skill_path_allowed(task_id, path) is True
-    ]
+    # Candidate roots are trusted host configuration. Authorization is applied
+    # to each discovered SKILL.md/path, which supports both selected skills and
+    # exact-file visible-object grants without revealing the whole root.
+    return list(candidates)
 
 
 def _discover_skill_linked_files(
@@ -761,8 +815,17 @@ def _discover_skill_linked_files(
 ) -> tuple[bool, Dict[str, List[str]]]:
     """Discover linked files, revalidating protected authority around scans."""
 
-    if protected and _protected_skill_path_allowed(task_id, skill_dir) is not True:
-        return False, {}
+    directory_authorized = True
+    if protected:
+        directory_authorized = (
+            _protected_skill_path_allowed(task_id, skill_dir) is True
+        )
+        if not directory_authorized:
+            # An exact visible-object grant for SKILL.md authorizes the skill
+            # document itself, but must not imply access to sibling resources.
+            if _protected_skill_path_allowed(task_id, skill_dir / "SKILL.md") is True:
+                return True, {}
+            return False, {}
 
     linked: Dict[str, List[str]] = {}
     specs = (
@@ -834,6 +897,7 @@ def _find_all_skills(
         else (
             "protected",
             tuple(str(path) for path in search_dirs),
+            task_id,
             bool(skip_disabled),
         )
     )
@@ -842,7 +906,7 @@ def _find_all_skills(
     # disabling a skill is a config change with no filesystem mtime bump.
     disabled = (
         set()
-        if skip_disabled or search_dirs is not None
+        if skip_disabled or (search_dirs is not None and not task_id)
         else _get_disabled_skill_names()
     )
 
@@ -948,6 +1012,24 @@ def _find_all_skills(
                 )
                 continue
 
+    if task_id:
+        viewable_skills = []
+        for skill in skills:
+            try:
+                probe = json.loads(
+                    skill_view(
+                        skill["name"],
+                        task_id=task_id,
+                        preprocess=False,
+                        _viewability_probe=True,
+                    )
+                )
+            except Exception:
+                probe = {"success": False}
+            if probe.get("success"):
+                viewable_skills.append(skill)
+        skills = viewable_skills
+
     # Store in cache keyed by the scan signature computed BEFORE the scan
     # (a write racing the scan changes the signature, so the next call
     # re-scans rather than serving the torn result past the TTL). Same
@@ -959,6 +1041,28 @@ def _find_all_skills(
 def _sort_skills(skills: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Keep every skill listing path ordered the same way."""
     return sorted(skills, key=lambda s: (s.get("category") or "", s["name"]))
+
+
+def _effective_skills(
+    *,
+    task_id: str | None = None,
+    candidate_dirs: List[Path] | None = None,
+) -> List[Dict[str, Any]]:
+    """Return the catalog authorized for one ordinary or protected caller."""
+
+    if candidate_dirs is None:
+        from agent.skill_utils import get_external_skills_dirs
+
+        candidate_dirs = []
+        active_skills_dir = _skills_dir()
+        if active_skills_dir.exists():
+            candidate_dirs.append(active_skills_dir)
+        candidate_dirs.extend(get_external_skills_dirs())
+    protected_dirs = _protected_skill_search_dirs(task_id, candidate_dirs)
+    return _find_all_skills(
+        search_dirs=protected_dirs,
+        task_id=task_id if protected_dirs is not None else None,
+    )
 
 
 def skills_list(category: str = None, task_id: str = None) -> str:
@@ -987,24 +1091,10 @@ def skills_list(category: str = None, task_id: str = None) -> str:
         if protected_dirs is None and not active_skills_dir.exists():
             active_skills_dir.mkdir(parents=True, exist_ok=True)
 
-        # Find all skills
-        all_skills = _find_all_skills()
-        try:
-            from hermes_cli.plugins import discover_plugins, get_plugin_manager
-
-            discover_plugins()
-            for plugin_skill in get_plugin_manager().list_plugin_skill_metadata():
-                frontmatter = plugin_skill.pop("frontmatter", {})
-                if not skill_matches_platform(frontmatter):
-                    continue
-                if _is_skill_disabled(plugin_skill["name"]):
-                    continue
-                all_skills.append(plugin_skill)
-        except Exception:
-            logger.debug("Plugin skill listing failed", exc_info=True)
-        all_skills = _find_all_skills(
-            search_dirs=protected_dirs,
-            task_id=task_id if protected_dirs is not None else None,
+        # Use the same effective catalog as protected prompt construction.
+        all_skills = _effective_skills(
+            task_id=task_id,
+            candidate_dirs=candidate_dirs,
         )
 
         if not all_skills:
@@ -1245,6 +1335,7 @@ def skill_view(
     file_path: str = None,
     task_id: str = None,
     preprocess: bool = True,
+    _viewability_probe: bool = False,
 ) -> str:
     """
     View the content of a skill or a specific file within a skill directory.
@@ -1279,6 +1370,10 @@ def skill_view(
 
         local_category_name: str | None = None
         protected_call = _protected_skill_search_dirs(task_id, []) is not None
+        if protected_call:
+            # Protected runs may read authorized skill resources, but must not
+            # turn skill preprocessing into host-side command execution.
+            preprocess = False
         if protected_call and ":" in name:
             from agent.skill_utils import is_valid_namespace, parse_qualified_name
 
@@ -1730,6 +1825,12 @@ def skill_view(
                         "Enable it with `hermes skills` or inspect the files directly on disk."
                     ),
                 },
+                ensure_ascii=False,
+            )
+
+        if _viewability_probe:
+            return json.dumps(
+                {"success": True, "name": resolved_name},
                 ensure_ascii=False,
             )
 

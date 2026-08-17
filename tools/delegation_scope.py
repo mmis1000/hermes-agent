@@ -42,6 +42,10 @@ class ResolvedInvocationScope:
     reveal: tuple[RevealRequest, ...]
     visible_objects: tuple[VisibleObjectGrant, ...]
     profile_template_hash: str | None = None
+    # Top-level Runs may add skill-tool authority without adding filesystem
+    # reveals. Child delegation keeps the default empty selection.
+    skill_names: frozenset[str] = frozenset()
+    all_skills: bool = False
 
 
 @dataclass(frozen=True)
@@ -944,12 +948,63 @@ def admit_trusted_run_execution(
 
     if not isinstance(base_policy, DelegationSessionPolicy):
         raise ValueError("Runs protected execution requires admitted filesystem isolation")
-    if not isinstance(execution, Mapping) or set(execution) != {
-        "profile",
-        "workdir",
-        "reveal",
-    }:
-        raise ValueError("Runs execution must contain exactly profile, workdir, and reveal")
+    required_keys = {"profile", "workdir", "reveal"}
+    allowed_keys = required_keys | {"skills"}
+    if (
+        not isinstance(execution, Mapping)
+        or not required_keys.issubset(execution)
+        or not set(execution).issubset(allowed_keys)
+    ):
+        raise ValueError(
+            "Runs execution must contain profile, workdir, and reveal, "
+            "with optional skills"
+        )
+
+    raw_skills = execution.get("skills", [])
+    all_skills = raw_skills == "all"
+    skill_names: frozenset[str]
+    if all_skills:
+        skill_names = frozenset()
+    elif isinstance(raw_skills, list):
+        if any(not isinstance(name, str) or not name.strip() for name in raw_skills):
+            raise TypeError("Runs execution skills must be non-empty skill names")
+        skill_names = frozenset(name.strip() for name in raw_skills)
+        if skill_names:
+            from tools.skills_tool import _find_all_skills, skill_view
+
+            available_names = {
+                str(item.get("name", "")).strip()
+                for item in _find_all_skills()
+                if str(item.get("name", "")).strip()
+            }
+            unknown = sorted(skill_names - available_names)
+            if unknown:
+                raise ValueError(
+                    "execution.skills contains unknown skill name(s): "
+                    + ", ".join(unknown)
+                )
+            unviewable = []
+            for skill_name in sorted(skill_names):
+                try:
+                    viewed = json.loads(
+                        skill_view(
+                            skill_name,
+                            preprocess=False,
+                            _viewability_probe=True,
+                        )
+                    )
+                except Exception:
+                    viewed = {"success": False}
+                if not viewed.get("success"):
+                    unviewable.append(skill_name)
+            if unviewable:
+                raise ValueError(
+                    "execution.skills contains skill name(s) that are not "
+                    "uniquely viewable: "
+                    + ", ".join(unviewable)
+                )
+    else:
+        raise TypeError('Runs execution skills must be an array or the string "all"')
 
     requests = _parse_reveal(execution.get("reveal"))
     if not requests:
@@ -1010,6 +1065,11 @@ def admit_trusted_run_execution(
     )
     if scope is None:
         raise ValueError("Runs protected execution did not resolve an invocation scope")
+    scope = replace(
+        scope,
+        skill_names=skill_names,
+        all_skills=all_skills,
+    )
     return TrustedRunExecution(policy, registry, scope)
 
 
