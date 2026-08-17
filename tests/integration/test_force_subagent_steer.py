@@ -6,7 +6,7 @@ import time
 from types import SimpleNamespace
 
 import tools.delegate_tool as dt
-from tests.run_agent.test_tool_call_guardrail_runtime import _make_agent, _mock_tool_call
+from tests.agent.test_tool_call_guardrail_runtime import _make_agent, _mock_tool_call
 from tests.tools.test_delegation_control import _starting_steer_attempt
 from tools.delegation_control import delegation_control
 from tools.process_registry import process_registry
@@ -24,7 +24,7 @@ def test_public_force_steer_handoffs_worker_before_existing_parent_marker():
     command = (
         "python -u -c \"import os,time; "
         "print('BEFORE:'+str(os.getpid()),flush=True); "
-        "time.sleep(1.5); print('AFTER',flush=True)\""
+        "time.sleep(10); print('AFTER',flush=True)\""
     )
 
     dt._register_subagent(
@@ -92,18 +92,21 @@ def test_public_force_steer_handoffs_worker_before_existing_parent_marker():
             )
         )
         assert forced["status"] == "accepted"
-        worker.join(3)
+        worker.join(5)
         assert not worker.is_alive()
         assert errors == []
 
         tool_content = messages[0]["content"]
-        marker_position = tool_content.index("[OUT-OF-BAND USER MESSAGE")
-        guidance_position = tool_content.index("parent guidance")
-        tool_payload = json.loads(tool_content[:marker_position].rstrip())
+        assert messages[0]["role"] == "tool"
+        steer_row = messages[1]
+        assert steer_row["role"] == "user"
+        assert "[OUT-OF-BAND USER MESSAGE" in steer_row["content"]
+        assert "parent guidance" in steer_row["content"]
+        assert "[OUT-OF-BAND USER MESSAGE" not in tool_content
+        tool_payload = json.loads(tool_content)
         advertised = tool_payload["foreground_handoff"]
         session_id = advertised["session_id"]
-        handoff_position = tool_content.index(session_id)
-        assert handoff_position < marker_position < guidance_position
+        assert session_id in tool_content
         assert advertised["continue"] == (
             f'process(action="wait", session_id="{session_id}")'
         )
@@ -117,15 +120,22 @@ def test_public_force_steer_handoffs_worker_before_existing_parent_marker():
         original = process_registry.get(session_id)
         assert original is not None
         assert not original.exited
+        output_deadline = time.monotonic() + 1
+        while (
+            "BEFORE:" not in original.output_buffer
+            and not original.exited
+            and time.monotonic() < output_deadline
+        ):
+            time.sleep(0.01)
         assert "BEFORE:" in original.output_buffer
-        waited = process_registry.wait(session_id, timeout=3)
+        waited = process_registry.wait(session_id, timeout=15)
         assert waited["status"] == "exited"
         assert waited["exit_code"] == 0
         assert waited["output"].count("BEFORE:") == 1
         assert waited["output"].count("AFTER") == 1
         assert repository.inspect_steer(forced["mailbox_id"])["status"] == "injected"
     finally:
-        worker.join(3)
+        worker.join(5)
         cleanup_vm(task_id)
         dt._unregister_subagent(
             "sa-force-integration", str(attempt["attempt_id"])
