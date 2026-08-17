@@ -3715,6 +3715,78 @@ class AIAgent:
             self._pending_redirect = None
         return text
 
+    def request_durable_steer(
+        self,
+        text: str,
+        *,
+        mailbox_id: str,
+        outcome_callback,
+        force: bool = False,
+    ) -> dict:
+        """Queue a tracked steer, optionally handing foreground waits off first."""
+        waits = getattr(self, "_foreground_waits", None)
+        active = waits.snapshot() if waits is not None else []
+        wait_kinds = sorted({slot.kind for slot in active})
+        if active and not force:
+            if callable(outcome_callback):
+                outcome_callback("foreground_wait")
+            return {"status": "foreground_wait", "wait_kinds": wait_kinds}
+
+        accepted = self.steer(
+            text,
+            mailbox_id=mailbox_id,
+            outcome_callback=outcome_callback,
+        )
+        if not accepted:
+            return {"status": "too_late_after_completion", "wait_kinds": wait_kinds}
+        if not active:
+            return {"status": "accepted", "wait_kinds": []}
+
+        result = waits.request_background(active)
+        if result.get("status") != "backgrounded":
+            self._remove_pending_steer_envelope(mailbox_id)
+            if callable(outcome_callback):
+                outcome_callback("force_background_failed")
+            return {
+                "status": "force_background_failed",
+                "wait_kinds": result.get("wait_kinds") or wait_kinds,
+                "errors": result.get("errors") or ["foreground handoff failed"],
+            }
+        return {
+            "status": "accepted",
+            "wait_kinds": result.get("wait_kinds") or wait_kinds,
+        }
+
+    def _remove_pending_steer_envelope(self, mailbox_id: str) -> None:
+        """Remove one exact tracked envelope after a failed forced handoff."""
+        lock = getattr(self, "_pending_steer_lock", None)
+
+        def _remove() -> None:
+            queue = self._steer_queue_unlocked()
+            self._pending_steer_envelopes = [
+                item for item in queue if item.get("mailbox_id") != mailbox_id
+            ]
+            self._sync_pending_steer_text_unlocked(self._pending_steer_envelopes)
+
+        if lock is None:
+            _remove()
+        else:
+            with lock:
+                _remove()
+
+    def _drain_pending_steer_envelopes(self) -> list:
+        lock = getattr(self, "_pending_steer_lock", None)
+        if lock is None:
+            queue = list(self._steer_queue_unlocked())
+            self._pending_steer_envelopes = []
+            self._pending_steer = None
+            return queue
+        with lock:
+            queue = list(self._steer_queue_unlocked())
+            self._pending_steer_envelopes = []
+            self._pending_steer = None
+        return queue
+
     def _requeue_pending_steer_envelopes(self, envelopes: list) -> None:
         if not envelopes:
             return

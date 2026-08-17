@@ -1017,6 +1017,47 @@ def wait_for_delegation(
                 current["claimed_delivery"] = bool(claimed)
                 return current
 
+            from tools.foreground_wait import current_foreground_wait
+
+            wait_slot = current_foreground_wait()
+            if (
+                wait_slot is not None
+                and wait_slot.kind == "delegation"
+                and wait_slot.background_requested.is_set()
+            ):
+                if owns_hold:
+                    release_wait_hold(
+                        delegation_id,
+                        claim_id,
+                        session_key=session_key,
+                        run_id=bound_run_id,
+                    )
+                current = get_async_delegation(
+                    delegation_id, session_key=session_key, run_id=bound_run_id
+                ) or snapshot
+                handoff = {
+                    "kind": "delegation",
+                    "delegation_id": delegation_id,
+                    "run_id": bound_run_id,
+                    "continue": (
+                        'delegation(action="wait", delegation_id='
+                        f'"{delegation_id}", run_id="{bound_run_id}")'
+                    ),
+                    "inspect": (
+                        'delegation(action="status", delegation_id='
+                        f'"{delegation_id}")'
+                    ),
+                    "stop": (
+                        'delegation(action="interrupt", delegation_id='
+                        f'"{delegation_id}", cascade=true)'
+                    ),
+                }
+                current["status"] = "backgrounded"
+                current["claimed_delivery"] = False
+                current["foreground_handoff"] = handoff
+                wait_slot.complete_background(handoff)
+                return current
+
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 latest = get_async_delegation(
@@ -1275,9 +1316,10 @@ def enqueue_subagent_steer(
     *,
     session_key: str,
     message: str,
+    force: bool = False,
 ) -> Dict[str, Any]:
     outcome = _repository().enqueue_steer(
-        delegation_id, subagent_id, session_key, message
+        delegation_id, subagent_id, session_key, message, force=force
     )
     if outcome.get("status") == "accepted":
         _notify_state_change()

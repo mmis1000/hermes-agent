@@ -1317,17 +1317,22 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         try:
             try:
                 def _execute(next_args: dict[str, Any]) -> Any:
-                    return agent._invoke_tool(
-                        function_name,
-                        next_args,
-                        effective_task_id,
-                        tool_call.id,
-                        messages=messages,
-                        pre_tool_block_checked=True,
-                        skip_tool_request_middleware=True,
-                        skip_tool_execution_middleware=True,
-                        tool_request_middleware_trace=list(middleware_trace),
-                    )
+                    from tools.foreground_wait import track_foreground_wait
+
+                    with track_foreground_wait(
+                        agent, str(tool_call.id), function_name, next_args
+                    ):
+                        return agent._invoke_tool(
+                            function_name,
+                            next_args,
+                            effective_task_id,
+                            tool_call.id,
+                            messages=messages,
+                            pre_tool_block_checked=True,
+                            skip_tool_request_middleware=True,
+                            skip_tool_execution_middleware=True,
+                            tool_request_middleware_trace=list(middleware_trace),
+                        )
 
                 managed = _run_agent_tool_execution_middleware(
                     agent,
@@ -2347,27 +2352,32 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     from model_tools import suppress_post_tool_call_hook
 
                     with suppress_post_tool_call_hook():
-                        return _ra().handle_function_call(
-                            function_name,
-                            next_args,
-                            effective_task_id,
-                            tool_call_id=tool_call.id,
-                            session_id=agent.session_id or "",
-                            turn_id=getattr(agent, "_current_turn_id", "") or "",
-                            api_request_id=getattr(agent, "_current_api_request_id", "")
-                            or "",
-                            enabled_tools=(
-                                list(agent.valid_tool_names)
-                                if agent.valid_tool_names
-                                else None
-                            ),
-                            skip_pre_tool_call_hook=True,
-                            skip_tool_request_middleware=True,
-                            skip_tool_execution_middleware=True,
-                            tool_request_middleware_trace=list(middleware_trace),
-                            enabled_toolsets=getattr(agent, "enabled_toolsets", None),
-                            disabled_toolsets=getattr(agent, "disabled_toolsets", None),
-                        )
+                        from tools.foreground_wait import track_foreground_wait
+
+                        with track_foreground_wait(
+                            agent, str(tool_call.id), function_name, next_args
+                        ):
+                            return _ra().handle_function_call(
+                                function_name,
+                                next_args,
+                                effective_task_id,
+                                tool_call_id=tool_call.id,
+                                session_id=agent.session_id or "",
+                                turn_id=getattr(agent, "_current_turn_id", "") or "",
+                                api_request_id=getattr(agent, "_current_api_request_id", "")
+                                or "",
+                                enabled_tools=(
+                                    list(agent.valid_tool_names)
+                                    if agent.valid_tool_names
+                                    else None
+                                ),
+                                skip_pre_tool_call_hook=True,
+                                skip_tool_request_middleware=True,
+                                skip_tool_execution_middleware=True,
+                                tool_request_middleware_trace=list(middleware_trace),
+                                enabled_toolsets=getattr(agent, "enabled_toolsets", None),
+                                disabled_toolsets=getattr(agent, "disabled_toolsets", None),
+                            )
 
                 (
                     function_result,
@@ -2429,27 +2439,32 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     from model_tools import suppress_post_tool_call_hook
 
                     with suppress_post_tool_call_hook():
-                        return _ra().handle_function_call(
-                            function_name,
-                            next_args,
-                            effective_task_id,
-                            tool_call_id=tool_call.id,
-                            session_id=agent.session_id or "",
-                            turn_id=getattr(agent, "_current_turn_id", "") or "",
-                            api_request_id=getattr(agent, "_current_api_request_id", "")
-                            or "",
-                            enabled_tools=(
-                                list(agent.valid_tool_names)
-                                if agent.valid_tool_names
-                                else None
-                            ),
-                            skip_pre_tool_call_hook=True,
-                            skip_tool_request_middleware=True,
-                            skip_tool_execution_middleware=True,
-                            tool_request_middleware_trace=list(middleware_trace),
-                            enabled_toolsets=getattr(agent, "enabled_toolsets", None),
-                            disabled_toolsets=getattr(agent, "disabled_toolsets", None),
-                        )
+                        from tools.foreground_wait import track_foreground_wait
+
+                        with track_foreground_wait(
+                            agent, str(tool_call.id), function_name, next_args
+                        ):
+                            return _ra().handle_function_call(
+                                function_name,
+                                next_args,
+                                effective_task_id,
+                                tool_call_id=tool_call.id,
+                                session_id=agent.session_id or "",
+                                turn_id=getattr(agent, "_current_turn_id", "") or "",
+                                api_request_id=getattr(agent, "_current_api_request_id", "")
+                                or "",
+                                enabled_tools=(
+                                    list(agent.valid_tool_names)
+                                    if agent.valid_tool_names
+                                    else None
+                                ),
+                                skip_pre_tool_call_hook=True,
+                                skip_tool_request_middleware=True,
+                                skip_tool_execution_middleware=True,
+                                tool_request_middleware_trace=list(middleware_trace),
+                                enabled_toolsets=getattr(agent, "enabled_toolsets", None),
+                                disabled_toolsets=getattr(agent, "disabled_toolsets", None),
+                            )
 
                 (
                     function_result,

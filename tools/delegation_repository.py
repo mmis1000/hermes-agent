@@ -411,6 +411,7 @@ class DelegationRepository:
         logical_id: str,
         session_key: str,
         message: str,
+        force: bool = False,
     ) -> Dict[str, Any]:
         """Append one ordered steer to the current authorized attempt."""
         now = time.time()
@@ -446,7 +447,7 @@ class DelegationRepository:
             conn.execute(
                 "INSERT INTO delegation_steer_mailbox "
                 "(mailbox_id,delegation_id,logical_id,attempt_id,sequence_number,"
-                "message,status,created_at) VALUES (?,?,?,?,?,?,'pending',?)",
+                "message,force,status,created_at) VALUES (?,?,?,?,?,?,?,'pending',?)",
                 (
                     mailbox_id,
                     delegation_id,
@@ -454,6 +455,7 @@ class DelegationRepository:
                     attempt["attempt_id"],
                     sequence,
                     message,
+                    1 if force else 0,
                     now,
                 ),
             )
@@ -464,13 +466,14 @@ class DelegationRepository:
             "run_id": str(attempt["run_id"]),
             "attempt_state": str(attempt["state"]),
             "sequence_number": sequence,
+            "force": bool(force),
         }
 
     def pending_steers(self, attempt_id: str) -> List[Dict[str, Any]]:
         conn = self._connect()
         try:
             rows = conn.execute(
-                "SELECT mailbox_id,message,sequence_number FROM delegation_steer_mailbox "
+                "SELECT mailbox_id,message,sequence_number,force FROM delegation_steer_mailbox "
                 "WHERE attempt_id=? AND status='pending' ORDER BY sequence_number",
                 (attempt_id,),
             ).fetchall()
@@ -512,7 +515,11 @@ class DelegationRepository:
                 (mailbox_id,),
             ).rowcount
         return (
-            {"status": "claimed", "message": str(row["message"])}
+            {
+                "status": "claimed",
+                "message": str(row["message"]),
+                "force": bool(row["force"]),
+            }
             if changed == 1
             else {"status": "stale"}
         )
@@ -538,6 +545,8 @@ class DelegationRepository:
             "injected",
             "superseded_by_interrupt",
             "too_late_after_completion",
+            "foreground_wait",
+            "force_background_failed",
         }:
             raise ValueError("invalid steer outcome")
         now = time.time()

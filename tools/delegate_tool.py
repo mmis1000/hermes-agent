@@ -298,7 +298,12 @@ def interrupt_subagent_status(subagent_id: str, reason: str = "") -> str:
     return "interrupt_requested"
 
 
-def forward_pending_subagent_steers(subagent_id: str, attempt_id: str) -> int:
+def forward_pending_subagent_steers(
+    subagent_id: str,
+    attempt_id: str,
+    *,
+    outcome_sink: Optional[Dict[str, Any]] = None,
+) -> int:
     """Forward ordered durable mailbox items to one exact live attempt."""
     if not subagent_id or not attempt_id:
         return 0
@@ -308,7 +313,11 @@ def forward_pending_subagent_steers(subagent_id: str, attempt_id: str) -> int:
             return 0
         agent = record.get("agent")
     steer = getattr(agent, "steer", None)
-    if not callable(steer):
+    request_durable = getattr(agent, "request_durable_steer", None)
+    request_defined = callable(getattr(type(agent), "request_durable_steer", None)) or callable(
+        getattr(agent, "__dict__", {}).get("request_durable_steer")
+    )
+    if not callable(steer) and not (request_defined and callable(request_durable)):
         return 0
 
     try:
@@ -331,14 +340,31 @@ def forward_pending_subagent_steers(subagent_id: str, attempt_id: str) -> int:
         def _ack(outcome: str, *, _mailbox_id: str = mailbox_id) -> None:
             repository.resolve_steer(_mailbox_id, outcome)
 
-        accepted = bool(
-            steer(
+        if request_defined and callable(request_durable):
+            outcome = request_durable(
                 str(claimed.get("message") or ""),
                 mailbox_id=mailbox_id,
                 outcome_callback=_ack,
+                force=bool(claimed.get("force")),
             )
-        )
+            outcome = outcome if isinstance(outcome, dict) else {"status": "rejected"}
+            if outcome_sink is not None:
+                outcome_sink[mailbox_id] = dict(outcome)
+            status = str(outcome.get("status") or "rejected")
+            accepted = status == "accepted"
+        else:
+            accepted = bool(
+                steer(
+                    str(claimed.get("message") or ""),
+                    mailbox_id=mailbox_id,
+                    outcome_callback=_ack,
+                )
+            )
+            status = "accepted" if accepted else "too_late_after_completion"
         if not accepted:
+            if status in {"foreground_wait", "force_background_failed"}:
+                repository.resolve_steer(mailbox_id, status)
+                continue
             repository.resolve_steer(mailbox_id, "too_late_after_completion")
             break
         repository.mark_steer_forwarded(mailbox_id)
