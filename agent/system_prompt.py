@@ -317,11 +317,15 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
             available_tools=agent.valid_tool_names,
             available_toolsets=avail_toolsets,
             compact_categories=_compact_cats or None,
+            task_id=getattr(agent, "skill_scope_task_id", None),
         )
     else:
         skills_prompt = ""
     if skills_prompt:
         stable_parts.append(skills_prompt)
+    skill_scope_task_id = getattr(agent, "skill_scope_task_id", None)
+    if skill_scope_task_id:
+        stable_parts.append(f"Skill scope: {skill_scope_task_id}")
 
     # Alibaba Coding Plan API always returns "glm-4.7" as model name regardless
     # of the requested model. Inject explicit model identity into the system prompt

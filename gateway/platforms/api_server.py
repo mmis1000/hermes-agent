@@ -5009,6 +5009,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 if protected_execution is not None:
                     from tools.delegate_tool import configure_protected_agent_tools
 
+                    # Prompt construction and skill tools must consult the same
+                    # immutable protected attempt authority.
+                    agent.skill_scope_task_id = root_attempt_id
                     agent.delegation_backing_registry = (
                         protected_execution.backing_registry
                     )
