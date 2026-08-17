@@ -505,6 +505,8 @@ def _resolve_container_task_id(task_id: Optional[str]) -> str:
     from tools.delegation_scope import attempt_scope_registry
     if task_id and attempt_scope_registry.get(task_id) is not None:
         return task_id
+    if task_id and (_task_env_overrides.get(_qualify_task_key(task_id)) or {}).get("delegation_scope_id"):
+        return task_id
     if task_id and _has_isolation_overrides(task_id):
         return _qualify_task_key(task_id)
     scope = _session_scope()
@@ -1287,6 +1289,7 @@ def _run_foreground(
             # internal env.execute() consumers stay unbounded.
             result = env.execute(
                 command, timeout=effective_timeout, cwd=command_cwd, bounded_capture=True,
+                foreground_handoff={"command": command, "task_id": eff, "session_key": session_key, "cwd": command_cwd},
                 **_yield_kwargs(command, env_type=env_type, cwd=command_cwd, effective_task_id=eff,
                                 task_id=task_id, session_key=session_key),
             )
@@ -1307,6 +1310,8 @@ def _run_foreground(
                          max_retries, _safe_command_preview(command), type(e).__name__, e, eff, env_type)
             return _error_json(_redact_terminal_error_text(f"Command execution failed: {type(e).__name__}: {e}"))
 
+    if result.get("foreground_handoff"):
+        return json.dumps({**result, "exit_code": result.get("returncode"), "error": None}, ensure_ascii=False)
     if result.get("yielded_session_id"):  # handed to the background: no exit status yet
         return json.dumps({
             "output": result.get("output", ""), "exit_code": None, "error": None,
@@ -1765,3 +1770,38 @@ def acquire_protected_environment(
             _active_environments[effective_task_id] = env
             _last_activity[effective_task_id] = time.time()
         return env, env_type, effective_task_id
+
+
+def _configure_forced_handoff_session(proc_session, session_key: str) -> None:
+    """Route completion for a foreground process that was adopted mid-wait."""
+    from tools.process_registry import process_registry
+    from gateway.session_context import (
+        async_delivery_supported,
+        get_session_env,
+    )
+
+    if not async_delivery_supported():
+        proc_session.notify_on_complete = False
+        return
+    platform = get_session_env("HERMES_SESSION_PLATFORM", "")
+    if not platform:
+        return
+    proc_session.watcher_platform = platform
+    proc_session.watcher_chat_id = get_session_env("HERMES_SESSION_CHAT_ID", "")
+    proc_session.watcher_user_id = get_session_env("HERMES_SESSION_USER_ID", "")
+    proc_session.watcher_user_name = get_session_env("HERMES_SESSION_USER_NAME", "")
+    proc_session.watcher_thread_id = get_session_env("HERMES_SESSION_THREAD_ID", "")
+    proc_session.watcher_message_id = get_session_env("HERMES_SESSION_MESSAGE_ID", "")
+    proc_session.watcher_interval = 5
+    process_registry.pending_watchers.append({
+        "session_id": proc_session.id,
+        "check_interval": 5,
+        "session_key": session_key,
+        "platform": proc_session.watcher_platform,
+        "chat_id": proc_session.watcher_chat_id,
+        "user_id": proc_session.watcher_user_id,
+        "user_name": proc_session.watcher_user_name,
+        "thread_id": proc_session.watcher_thread_id,
+        "message_id": proc_session.watcher_message_id,
+        "notify_on_complete": True,
+    })

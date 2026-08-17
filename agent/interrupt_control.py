@@ -172,6 +172,12 @@ def _clear_pending_steer(agent, outcome: str) -> None:
     ack_steer_envelopes(drain_steer_envelopes(agent), outcome)
 
 
+def _remove_steer_envelope(agent, mailbox_id: str) -> None:
+    """Retract one tracked envelope after a failed forced handoff."""
+    with _ic_lock(agent, "_pending_steer_lock"):
+        _set_steer_queue(agent, [item for item in _steer_queue(agent) if item.get("mailbox_id") != mailbox_id])
+
+
 class InterruptControlMixin:
     """interrupt()/hard_interrupt()/clear_interrupt()/steer()/redirect() (see module docstring)."""
 
@@ -202,6 +208,8 @@ class InterruptControlMixin:
         )
 
         def _publish_interrupt_state() -> None:
+            if hard_cancel:
+                _clear_pending_steer(self, "superseded_by_interrupt")
             self._interrupt_requested = True
             self._interrupt_message = message
             self._tool_interrupt_reason = tool_interrupt_reason
@@ -325,6 +333,33 @@ class InterruptControlMixin:
             queue.append(envelope)
             _set_steer_queue(self, queue)
         return True
+
+    def request_durable_steer(self, text: str, *, mailbox_id: str, outcome_callback, force: bool = False) -> dict:
+        """Queue a tracked steer, optionally handing foreground waits off to the background first."""
+        waits = getattr(self, "_foreground_waits", None)
+        active = waits.snapshot() if waits is not None else []
+        wait_kinds = sorted({slot.kind for slot in active})
+        if active and not force:
+            if callable(outcome_callback):
+                outcome_callback("foreground_wait")
+            return {"status": "foreground_wait", "wait_kinds": wait_kinds}
+
+        if not self.steer(text, mailbox_id=mailbox_id, outcome_callback=outcome_callback):
+            return {"status": "too_late_after_completion", "wait_kinds": wait_kinds}
+        if not active:
+            return {"status": "accepted", "wait_kinds": []}
+
+        result = waits.request_background(active)
+        if result.get("status") != "backgrounded":
+            _remove_steer_envelope(self, mailbox_id)
+            if callable(outcome_callback):
+                outcome_callback("force_background_failed")
+            return {
+                "status": "force_background_failed",
+                "wait_kinds": result.get("wait_kinds") or wait_kinds,
+                "errors": result.get("errors") or ["foreground handoff failed"],
+            }
+        return {"status": "accepted", "wait_kinds": result.get("wait_kinds") or wait_kinds}
 
     def redirect(self, text: str) -> bool:
         """Redirect the active turn without converting it into a new task: during a model request only that
