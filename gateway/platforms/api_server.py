@@ -1423,8 +1423,16 @@ class APIServerAdapter(BasePlatformAdapter):
         self._run_streams: Dict[str, "asyncio.Queue[Optional[Dict]]"] = {}
         # Creation timestamps for orphaned-run TTL sweep
         self._run_streams_created: Dict[str, float] = {}
-        # Runs with a connected SSE consumer; their queue is actively draining.
-        self._run_stream_subscribers: set[str] = set()
+        # One owning SSE handler per run. A replacement cancels and awaits the
+        # stale owner before consuming from the shared transport.
+        self._run_stream_subscribers: Dict[str, "asyncio.Task"] = {}
+        # Serialize replacement handoffs and keep the TTL sweep from reclaiming
+        # transport while a handler is waiting to take ownership.
+        self._run_stream_handoff_locks: Dict[str, "asyncio.Lock"] = {}
+        self._run_stream_handoffs: Dict[str, int] = {}
+        # At most one event (including the terminal sentinel) can be interrupted
+        # during an SSE write. Preserve it for at-least-once replacement delivery.
+        self._run_stream_pending: Dict[str, Optional[Dict[str, Any]]] = {}
         # Active run agent/task references for stop support
         self._active_run_agents: Dict[str, Any] = {}
         self._active_run_tasks: Dict[str, "asyncio.Task"] = {}
@@ -6802,6 +6810,7 @@ class APIServerAdapter(BasePlatformAdapter):
         created_at = time.time()
         self._run_streams[run_id] = q
         self._run_streams_created[run_id] = created_at
+        self._run_stream_pending.pop(run_id, None)
         self._run_approval_sessions[run_id] = approval_session_key
 
         event_cb = self._make_run_event_callback(run_id, loop)
@@ -7203,8 +7212,7 @@ class APIServerAdapter(BasePlatformAdapter):
             return web.json_response(_openai_error(f"Run not found: {run_id}", code="run_not_found"), status=404)
 
         q = self._run_streams[run_id]
-        self._run_stream_subscribers.add(run_id)
-
+        owner_task = asyncio.current_task()
         response = web.StreamResponse(
             status=200,
             headers={
@@ -7213,27 +7221,63 @@ class APIServerAdapter(BasePlatformAdapter):
                 "X-Accel-Buffering": "no",
             },
         )
-        await response.prepare(request)
-
+        inflight_event: Optional[Dict[str, Any]] = None
+        has_inflight_event = False
         try:
+            handoff_lock = self._run_stream_handoff_locks.setdefault(run_id, asyncio.Lock())
+            self._run_stream_handoffs[run_id] = self._run_stream_handoffs.get(run_id, 0) + 1
+            try:
+                async with handoff_lock:
+                    previous_owner = self._run_stream_subscribers.get(run_id)
+                    # Claim ownership before cancellation so the stale owner's
+                    # finalizer cannot erase this replacement's marker.
+                    self._run_stream_subscribers[run_id] = owner_task
+                    if previous_owner is not None and previous_owner is not owner_task:
+                        previous_owner.cancel()
+                        try:
+                            await previous_owner
+                        except asyncio.CancelledError:
+                            pass
+                        except Exception as exc:
+                            logger.debug("[api_server] replaced SSE subscriber for run %s: %s", run_id, exc)
+            finally:
+                remaining_handoffs = self._run_stream_handoffs.get(run_id, 1) - 1
+                if remaining_handoffs > 0:
+                    self._run_stream_handoffs[run_id] = remaining_handoffs
+                else:
+                    self._run_stream_handoffs.pop(run_id, None)
+
+            await response.prepare(request)
             while True:
                 try:
-                    event = await asyncio.wait_for(q.get(), timeout=30.0)
+                    if run_id in self._run_stream_pending:
+                        inflight_event = self._run_stream_pending.pop(run_id)
+                    else:
+                        inflight_event = await asyncio.wait_for(q.get(), timeout=30.0)
+                    has_inflight_event = True
                 except asyncio.TimeoutError:
                     await response.write(b": keepalive\n\n")
                     continue
-                if event is None:
+                if inflight_event is None:
                     # Run finished — send final SSE comment and close
                     await response.write(b": stream closed\n\n")
+                    has_inflight_event = False
                     break
-                payload = _sse_frame(event)
+                payload = _sse_frame(inflight_event)
                 await response.write(payload)
+                has_inflight_event = False
+                inflight_event = None
+        except asyncio.CancelledError:
+            raise
         except Exception as exc:
             logger.debug("[api_server] SSE stream error for run %s: %s", run_id, exc)
         finally:
-            self._run_stream_subscribers.discard(run_id)
-            self._run_streams.pop(run_id, None)
-            self._run_streams_created.pop(run_id, None)
+            if has_inflight_event and self._run_streams.get(run_id) is q:
+                self._run_stream_pending.setdefault(run_id, inflight_event)
+            # Release only this connection's ownership. A replacement may have
+            # installed itself after cancellation began.
+            if self._run_stream_subscribers.get(run_id) is owner_task:
+                self._run_stream_subscribers.pop(run_id, None)
 
         return response
 
@@ -7433,6 +7477,7 @@ class APIServerAdapter(BasePlatformAdapter):
             for run_id, created_at in list(self._run_streams_created.items())
             if now - created_at > self._RUN_STREAM_TTL
             and run_id not in self._run_stream_subscribers
+            and self._run_stream_handoffs.get(run_id, 0) == 0
         ]
         for run_id in stale:
             logger.debug("[api_server] sweeping expired run transport %s", run_id)
@@ -7451,6 +7496,9 @@ class APIServerAdapter(BasePlatformAdapter):
             # independent and survives until the executor-backed task returns.
             self._run_streams.pop(run_id, None)
             self._run_streams_created.pop(run_id, None)
+            self._run_stream_pending.pop(run_id, None)
+            self._run_stream_handoff_locks.pop(run_id, None)
+            self._run_stream_handoffs.pop(run_id, None)
             if task_done:
                 self._active_run_agents.pop(run_id, None)
                 self._active_run_tasks.pop(run_id, None)

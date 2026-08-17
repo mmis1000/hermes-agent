@@ -589,6 +589,233 @@ class TestRunEvents:
 
 class TestSteerRun:
     @pytest.mark.asyncio
+    async def test_active_run_stream_can_reconnect_during_subscriber_handoff(self, adapter):
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                mock_agent, agent_ready, interrupted = _make_slow_agent()
+                mock_create.return_value = mock_agent
+
+                started = await cli.post("/v1/runs", json={"input": "hello"})
+                run_id = (await started.json())["run_id"]
+                assert agent_ready.wait(timeout=3.0)
+                stream_delta = mock_create.call_args.kwargs["stream_delta_callback"]
+
+                first = await cli.get(f"/v1/runs/{run_id}/events")
+                assert first.status == 200
+
+                # Connect the replacement before the stale client has finalized.
+                # The server must transfer sole ownership before reading again.
+                second = await cli.get(f"/v1/runs/{run_id}/events")
+                assert second.status == 200
+                assert run_id in adapter._run_stream_subscribers
+
+                # Emit only after the replacement response is established, so
+                # this cannot pass by consuming a previously buffered event.
+                stream_delta("after reconnect")
+                stop = await cli.post(f"/v1/runs/{run_id}/stop")
+                assert stop.status == 200
+                body = await asyncio.wait_for(second.text(), timeout=3.0)
+                assert "after reconnect" in body
+                assert "run.cancelled" in body
+                assert interrupted.is_set()
+                first.close()
+
+    @pytest.mark.asyncio
+
+    async def test_subscriber_handoff_restores_event_interrupted_during_write(self, adapter):
+        run_id = "run_write_handoff"
+        queue = asyncio.Queue()
+        await queue.put({"event": "message.delta", "run_id": run_id, "delta": "preserved"})
+        adapter._run_streams[run_id] = queue
+        adapter._run_streams_created[run_id] = time.time()
+
+        class FakeStreamResponse:
+            def __init__(self, block_first_write=False):
+                self.block_first_write = block_first_write
+                self.write_started = asyncio.Event()
+                self.writes = []
+
+            async def prepare(self, _request):
+                return None
+
+            async def write(self, payload):
+                if self.block_first_write and payload.startswith(b"data:"):
+                    self.write_started.set()
+                    await asyncio.Event().wait()
+                self.writes.append(payload)
+
+        stale_response = FakeStreamResponse(block_first_write=True)
+        replacement_response = FakeStreamResponse()
+        stale_request = MagicMock(match_info={"run_id": run_id}, headers={})
+        replacement_request = MagicMock(match_info={"run_id": run_id}, headers={})
+
+        with patch(
+            "gateway.platforms.api_server.web.StreamResponse",
+            side_effect=[stale_response, replacement_response],
+        ):
+            stale_task = asyncio.create_task(adapter._handle_run_events(stale_request))
+            await asyncio.wait_for(stale_response.write_started.wait(), timeout=1.0)
+            replacement_task = asyncio.create_task(adapter._handle_run_events(replacement_request))
+            await queue.put(None)
+            await asyncio.wait_for(replacement_task, timeout=1.0)
+            await asyncio.gather(stale_task, return_exceptions=True)
+
+        replacement_body = b"".join(replacement_response.writes)
+        assert b'"delta": "preserved"' in replacement_body
+        assert b"stream closed" in replacement_body
+        assert run_id not in adapter._run_stream_subscribers
+        assert run_id not in adapter._run_stream_pending
+
+    @pytest.mark.asyncio
+
+    async def test_overlapping_replacements_serialize_ownership_and_block_ttl_sweep(self, adapter):
+        run_id = "run_triple_handoff"
+        queue = asyncio.Queue()
+        await queue.put({"event": "message.delta", "run_id": run_id, "delta": "initial"})
+        adapter._run_streams[run_id] = queue
+        adapter._run_streams_created[run_id] = time.time() - adapter._RUN_STREAM_TTL - 1
+        release_stale = asyncio.Event()
+
+        class SlowCancelResponse:
+            def __init__(self):
+                self.write_started = asyncio.Event()
+
+            async def prepare(self, _request):
+                return None
+
+            async def write(self, payload):
+                if payload.startswith(b"data:"):
+                    self.write_started.set()
+                    try:
+                        await asyncio.Event().wait()
+                    except asyncio.CancelledError:
+                        await release_stale.wait()
+                        raise
+
+        class RecordingResponse:
+            def __init__(self):
+                self.prepared = asyncio.Event()
+                self.writes = []
+
+            async def prepare(self, _request):
+                self.prepared.set()
+
+            async def write(self, payload):
+                self.writes.append(payload)
+
+        stale_response = SlowCancelResponse()
+        middle_response = RecordingResponse()
+        final_response = RecordingResponse()
+        request = MagicMock(match_info={"run_id": run_id}, headers={})
+
+        with patch(
+            "gateway.platforms.api_server.web.StreamResponse",
+            side_effect=[stale_response, middle_response, final_response],
+        ):
+            stale_task = asyncio.create_task(adapter._handle_run_events(request))
+            await asyncio.wait_for(stale_response.write_started.wait(), timeout=1.0)
+            middle_task = asyncio.create_task(adapter._handle_run_events(request))
+            while adapter._run_stream_subscribers.get(run_id) is stale_task:
+                await asyncio.sleep(0)
+            final_task = asyncio.create_task(adapter._handle_run_events(request))
+            while adapter._run_stream_handoffs.get(run_id, 0) < 2:
+                await asyncio.sleep(0)
+
+            adapter._sweep_orphaned_runs_once(time.time())
+            assert run_id in adapter._run_streams
+
+            release_stale.set()
+            await asyncio.wait_for(final_response.prepared.wait(), timeout=1.0)
+            await queue.put({"event": "message.delta", "run_id": run_id, "delta": "future"})
+            await queue.put(None)
+            await asyncio.wait_for(final_task, timeout=1.0)
+            await asyncio.gather(stale_task, middle_task, return_exceptions=True)
+
+        assert b'"delta": "future"' in b"".join(final_response.writes)
+        assert b'"delta": "future"' not in b"".join(middle_response.writes)
+        assert run_id not in adapter._run_stream_subscribers
+        assert adapter._run_stream_handoffs.get(run_id, 0) == 0
+
+    @pytest.mark.asyncio
+
+    async def test_subscriber_handoff_restores_terminal_sentinel_interrupted_during_write(self, adapter):
+        run_id = "run_sentinel_handoff"
+        queue = asyncio.Queue()
+        await queue.put(None)
+        adapter._run_streams[run_id] = queue
+        adapter._run_streams_created[run_id] = time.time()
+
+        class FakeStreamResponse:
+            def __init__(self, block_close=False):
+                self.block_close = block_close
+                self.close_started = asyncio.Event()
+                self.writes = []
+
+            async def prepare(self, _request):
+                return None
+
+            async def write(self, payload):
+                if self.block_close and payload.startswith(b": stream closed"):
+                    self.close_started.set()
+                    await asyncio.Event().wait()
+                self.writes.append(payload)
+
+        stale_response = FakeStreamResponse(block_close=True)
+        replacement_response = FakeStreamResponse()
+        request = MagicMock(match_info={"run_id": run_id}, headers={})
+
+        with patch(
+            "gateway.platforms.api_server.web.StreamResponse",
+            side_effect=[stale_response, replacement_response],
+        ):
+            stale_task = asyncio.create_task(adapter._handle_run_events(request))
+            await asyncio.wait_for(stale_response.close_started.wait(), timeout=1.0)
+            replacement_task = asyncio.create_task(adapter._handle_run_events(request))
+            await asyncio.wait_for(replacement_task, timeout=1.0)
+            await asyncio.gather(stale_task, return_exceptions=True)
+
+        assert b"stream closed" in b"".join(replacement_response.writes)
+        assert run_id not in adapter._run_stream_pending
+        assert run_id not in adapter._run_stream_subscribers
+
+    @pytest.mark.asyncio
+
+    async def test_prepare_failure_releases_subscriber_for_ttl_sweep(self, adapter):
+        run_id = "run_prepare_failure"
+        adapter._run_streams[run_id] = asyncio.Queue()
+        adapter._run_streams_created[run_id] = 0
+        request = MagicMock()
+        request.match_info = {"run_id": run_id}
+        request.headers = {}
+
+        with patch(
+            "gateway.platforms.api_server.web.StreamResponse.prepare",
+            new=AsyncMock(side_effect=ConnectionResetError("client disconnected")),
+        ):
+            await adapter._handle_run_events(request)
+
+        assert run_id not in adapter._run_stream_subscribers
+        adapter._sweep_orphaned_runs_once(time.time())
+        assert run_id not in adapter._run_streams
+        assert run_id not in adapter._run_streams_created
+
+    @pytest.mark.asyncio
+
+    def test_sweep_keeps_transport_with_active_subscriber(self, adapter):
+        run_id = "run_subscribed"
+        queue = asyncio.Queue()
+        adapter._run_streams[run_id] = queue
+        adapter._run_streams_created[run_id] = 0
+        adapter._run_stream_subscribers[run_id] = MagicMock()
+
+        adapter._sweep_orphaned_runs_once(time.time())
+
+        assert adapter._run_streams[run_id] is queue
+        assert run_id in adapter._run_streams_created
+
+    @pytest.mark.asyncio
+
     async def test_steer_running_agent(self, adapter):
         app = _create_runs_app(adapter)
         agent = MagicMock()
