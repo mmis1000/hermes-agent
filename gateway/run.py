@@ -25284,6 +25284,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     **run_scope,
                 ) and durable_authoritative:
                     return False
+            except Exception as exc:
+                logger.warning(
+                    "Could not acknowledge durable async completion %s: %s",
+                    durable_delegation_id, exc,
+                )
+                return False
+            return True
+
+        if evt.get("type") == "async_delegation":
             parent_session_id = str(evt.get("parent_session_id") or "").strip()
             if parent_session_id:
                 # Pre-flight (#65838-class): adapter acceptance is NOT proof of
@@ -25353,20 +25362,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # re-poll and try again rather than dropping or
                     # misrouting the result.
                     return False
-        if identity is not None:
-            with self._completion_delivery_lock:
-                if (
-                    identity in self._completion_deliveries_inflight
-                    or identity in self._completion_deliveries_delivered
-                ):
-                    return None
-                evt["_gateway_async_delivery_claim"] = durable_claim_id
-            except Exception as exc:
-                logger.warning(
-                    "Could not claim durable async completion %s: %s",
-                    durable_delegation_id, exc,
-                )
-                return False
 
         accepted = False
         try:
