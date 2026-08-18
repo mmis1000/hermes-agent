@@ -1241,6 +1241,37 @@ def apply_wal_with_fallback(
         return "delete"
 
 
+def ensure_state_schema(conn: sqlite3.Connection) -> None:
+    """Apply the shared session schema to an already-open connection.
+
+    Used by auxiliary stores (delegation repository, etc.) that share the
+    session schema helpers but do not construct a SessionDB.
+    """
+    helper = SessionSchemaMixin.__new__(SessionSchemaMixin)
+    owns_transaction = not conn.in_transaction
+    if owns_transaction:
+        conn.execute("BEGIN IMMEDIATE")
+    try:
+        cursor = conn.cursor()
+        cursor.executescript(SCHEMA_SQL)
+        helper._reconcile_columns(cursor)
+        try:
+            cursor.execute(
+                "CREATE INDEX IF NOT EXISTS idx_messages_platform_msg_id "
+                "ON messages(session_id, platform_message_id) "
+                "WHERE platform_message_id IS NOT NULL"
+            )
+        except sqlite3.OperationalError:
+            pass
+        cursor.executescript(DEFERRED_INDEX_SQL)
+        if owns_transaction:
+            conn.commit()
+    except BaseException:
+        if owns_transaction:
+            conn.rollback()
+        raise
+
+
 def _set_journal_mode_no_wait(conn: sqlite3.Connection, mode: str) -> str:
     """Execute ``PRAGMA journal_mode=<mode>`` without waiting on other openers.
 
