@@ -146,8 +146,6 @@ async def resolve_image_source(
                 raise SourceUnsafe(str(exc), src=s, origin="file")
         data = await asyncio.to_thread(host_target.read_bytes)
         return _finalize(data, "", "file", s, permitted)
-    if _is_local_terminal_backend():
-        return _finalize(data, "", "file", s)
     if _is_local_terminal_backend() and not _is_protected_task(ctx.task_id):
         # Local backend: any path was host-readable, so a miss simply means
         # the file doesn't exist — no sandbox to fall back to.
@@ -322,7 +320,9 @@ def _is_protected_task(task_id: Optional[str]) -> bool:
         return False
 
 
-async def _resolve_container_fallback(p: Path, ctx: ResolveContext, src: str) -> ResolvedImage:
+async def _resolve_container_fallback(
+    p: Path, ctx: ResolveContext, src: str, permitted: tuple = ("image",)
+) -> ResolvedImage:
     """Read the image bytes inside the sandbox (fail-closed when none exists).
 
     Reached when a host read is not permitted or the host file is absent. The
