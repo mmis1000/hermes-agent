@@ -13,7 +13,7 @@ import asyncio
 import json
 import threading
 import time
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from aiohttp import web
@@ -799,8 +799,6 @@ class TestSteerRun:
         adapter._sweep_orphaned_runs_once(time.time())
         assert run_id not in adapter._run_streams
         assert run_id not in adapter._run_streams_created
-
-    @pytest.mark.asyncio
 
     def test_sweep_keeps_transport_with_active_subscriber(self, adapter):
         run_id = "run_subscribed"

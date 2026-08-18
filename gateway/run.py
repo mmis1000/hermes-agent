@@ -4342,7 +4342,12 @@ class TurnRunner:
 
         # Verbose mode: show detailed arguments, respects tool_preview_length
         if ctx.progress_mode == "verbose":
-            if _code_block_full is not None:
+            if _code_block_full is not None and not (
+                ctx.source.platform == Platform.TELEGRAM
+                and bool(getattr(_progress_adapter, "_rich_messages_enabled", False)
+                         or (callable(getattr(_progress_adapter, "_rich_delivery_enabled", None))
+                             and _progress_adapter._rich_delivery_enabled()))
+            ):
                 ctx.last_was_terminal_block[0] = True
                 ctx.progress_queue.put(_code_block_full)
                 return
@@ -22435,11 +22440,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not text_already_delivered:
             text_content = _strip_response_attachments_for_direct_send(response, adapter)
             if text_content:
-                await adapter.send(
-                    source.chat_id,
-                    text_content,
-                    metadata=metadata,
-                )
+                try:
+                    await adapter.send(
+                        source.chat_id,
+                        text_content,
+                        metadata=metadata,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Failed to send queued first-response text; continuing with attachments: %s",
+                        exc,
+                    )
 
         # Failed turns still deliver their (normalized failure) text above,
         # but must not upload attachments as if the turn succeeded — mirrors

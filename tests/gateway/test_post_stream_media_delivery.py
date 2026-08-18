@@ -126,6 +126,7 @@ async def test_queued_followup_preserves_markdown_attachment(
 
     adapter = SimpleNamespace(
         send=AsyncMock(return_value=SendResult(success=True, message_id="text")),
+        extract_media=BasePlatformAdapter.extract_media,
     )
     source = SimpleNamespace(
         chat_id="-100123",
@@ -161,7 +162,10 @@ async def test_queued_followup_delivers_media_when_text_send_raises(tmp_path):
     markdown_path = tmp_path / "report.md"
     markdown_path.write_text("# Report\n", encoding="utf-8")
     response = f"Report ready.\n\nMEDIA:{markdown_path}"
-    adapter = SimpleNamespace(send=AsyncMock(side_effect=RuntimeError("text boom")))
+    adapter = SimpleNamespace(
+        send=AsyncMock(side_effect=RuntimeError("text boom")),
+        extract_media=BasePlatformAdapter.extract_media,
+    )
     source = SimpleNamespace(
         chat_id="-100123",
         thread_id="777",
