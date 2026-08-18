@@ -2612,6 +2612,8 @@ def _interpret_signal_exit(exit_code: int) -> str | None:
     the 128+signum band are the shell convention (very likely but not
     guaranteed, so those notes hedge with "usually").
     """
+    if exit_code is None:
+        return None
     if exit_code < 0:
         signum = -exit_code
         if signum == 2:  # SIGINT — executor's interrupt-marker path owns it
@@ -2645,7 +2647,7 @@ def _interpret_exit_code(command: str, exit_code: int) -> str | None:
     The note is appended to the tool result so the model doesn't waste
     turns investigating expected exit codes.
     """
-    if exit_code == 0:
+    if exit_code is None or exit_code == 0:
         return None
 
     # Signal terminations (ported from Kilo-Org/kilocode#12698, adapted to
@@ -3574,9 +3576,12 @@ def terminal_tool(
             from agent.redact import redact_terminal_output
             output = redact_terminal_output(output.strip(), command) if output else ""
 
-            # Interpret non-zero exit codes that aren't real errors
-            # (e.g. grep=1 means "no matches", diff=1 means "files differ")
-            exit_note = _interpret_exit_code(command, returncode)
+            if result.get("status") == "backgrounded":
+                exit_note = None
+            else:
+                # Interpret non-zero exit codes that aren't real errors
+                # (e.g. grep=1 means "no matches", diff=1 means "files differ")
+                exit_note = _interpret_exit_code(command, returncode)
 
             # Output-pattern failure hints: map well-known error shapes
             # (command-not-found, ModuleNotFoundError, gh field drift,
@@ -3584,7 +3589,7 @@ def terminal_tool(
             # fixes the root cause on the next call instead of spending
             # turns on re-diagnosis. See tools/terminal_hints.py.
             failure_hint = None
-            if returncode != 0 and not exit_note:
+            if returncode not in (None, 0) and not exit_note:
                 try:
                     from tools.terminal_hints import annotate_failure
                     failure_hint = annotate_failure(command, returncode, output)
@@ -3673,25 +3678,26 @@ def terminal_tool(
                 result_dict["notify_on_complete"] = bool(
                     handoff_session and handoff_session.notify_on_complete
                 )
-            try:
-                from agent.verification_evidence import record_terminal_result
+            if returncode is not None:
+                try:
+                    from agent.verification_evidence import record_terminal_result
 
-                evidence = record_terminal_result(
-                    command=command,
-                    cwd=command_cwd,
-                    session_id=session_id or task_id or effective_task_id or "default",
-                    exit_code=returncode,
-                    output=output,
-                )
-                if evidence:
-                    result_dict["verification_evidence"] = {
-                        "status": evidence.get("status"),
-                        "kind": evidence.get("kind"),
-                        "scope": evidence.get("scope"),
-                        "canonical_command": evidence.get("canonical_command"),
-                    }
-            except Exception:
-                logger.debug("verification evidence recording failed", exc_info=True)
+                    evidence = record_terminal_result(
+                        command=command,
+                        cwd=command_cwd,
+                        session_id=session_id or task_id or effective_task_id or "default",
+                        exit_code=returncode,
+                        output=output,
+                    )
+                    if evidence:
+                        result_dict["verification_evidence"] = {
+                            "status": evidence.get("status"),
+                            "kind": evidence.get("kind"),
+                            "scope": evidence.get("scope"),
+                            "canonical_command": evidence.get("canonical_command"),
+                        }
+                except Exception:
+                    logger.debug("verification evidence recording failed", exc_info=True)
             if approval_note:
                 # Treat rc=130 as an interrupt only when the executor's marker is
                 # present.  A command can legitimately exit 130 on its own
