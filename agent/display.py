@@ -450,6 +450,41 @@ def _browser_exec_step_label(args: dict, max_chars: int = 80) -> str | None:
     return label
 
 
+_DELEGATION_ACTIONS = frozenset({
+    "abandon", "interrupt", "list", "resume", "status", "steer", "tail", "wait",
+})
+
+
+def _delegation_action_preview(args: dict, *, max_len: int | None) -> str:
+    """Summarize a durable delegation control without hiding its action."""
+    raw_action = args.get("action")
+    action = _oneline(raw_action).lower() if isinstance(raw_action, str) else "manage"
+    if action not in _DELEGATION_ACTIONS:
+        action = "manage"
+    preview = action
+
+    detail_key = None
+    if action in {"steer", "resume"}:
+        detail_key = "message"
+    elif action in {"interrupt", "abandon"}:
+        detail_key = "reason"
+
+    if detail_key is not None and args.get(detail_key) is not None:
+        detail = redact_sensitive_text(_oneline(str(args[detail_key])), force=True)
+        if detail:
+            preview = f"{action}: {detail}"
+    elif action == "wait":
+        timeout_seconds = args.get("timeout_seconds")
+        if (
+            isinstance(timeout_seconds, (int, float))
+            and not isinstance(timeout_seconds, bool)
+            and timeout_seconds > 0
+        ):
+            preview = f"wait · {timeout_seconds:g}s"
+
+    return _truncate_preview(preview, max_len)
+
+
 def build_tool_preview(tool_name: str, args: dict, max_len: int | None = None) -> str | None:
     """Build a short preview of a tool call's primary argument for display.
 
