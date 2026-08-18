@@ -25284,13 +25284,33 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     **run_scope,
                 ) and durable_authoritative:
                     return False
+                evt.pop("_gateway_async_delivery_claim", None)
+                evt.pop("_gateway_async_delivery_accepted", None)
+                return True
             except Exception as exc:
                 logger.warning(
                     "Could not acknowledge durable async completion %s: %s",
                     durable_delegation_id, exc,
                 )
                 return False
-            return True
+
+        if durable_delegation_id:
+            try:
+                from tools.async_delegation import claim_completion_delivery
+
+                durable_claim_id = f"gateway:{id(self)}:{__import__('uuid').uuid4().hex}"
+                if not claim_completion_delivery(
+                    durable_delegation_id, durable_claim_id,
+                    **run_scope,
+                ):
+                    return None
+                evt["_gateway_async_delivery_claim"] = durable_claim_id
+            except Exception as exc:
+                logger.warning(
+                    "Could not claim durable async completion %s: %s",
+                    durable_delegation_id, exc,
+                )
+                return False
 
         if evt.get("type") == "async_delegation":
             parent_session_id = str(evt.get("parent_session_id") or "").strip()

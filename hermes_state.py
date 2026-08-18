@@ -8574,6 +8574,69 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         return f"{base} #{max_num + 1}"
 
+    @staticmethod
+    def _session_model_config(row: Any) -> Dict[str, Any]:
+        """Decode one session row's model_config without trusting its shape."""
+        raw = row["model_config"] if row is not None else None
+        if isinstance(raw, dict):
+            return dict(raw)
+        if not isinstance(raw, str) or not raw:
+            return {}
+        try:
+            value = json.loads(raw)
+        except (TypeError, ValueError):
+            return {}
+        return value if isinstance(value, dict) else {}
+
+    def control_session_candidates(self, session_id: str) -> List[str]:
+        """Return exact session plus proven compression ancestors, newest first.
+
+        Branches, delegates, and arbitrary sessions sharing a conversation root
+        are deliberately excluded. This is the ownership seam used by durable
+        delegation controls when the originating parent was compressed after it
+        spawned a child.
+        """
+        if not session_id:
+            return []
+        candidates: List[str] = []
+        current = session_id
+        seen: set[str] = set()
+        with self._lock:
+            for _ in range(100):
+                if not current or current in seen:
+                    break
+                seen.add(current)
+                candidates.append(current)
+                row = self._conn.execute(
+                    """SELECT child.parent_session_id, child.source,
+                              child.model_config, parent.end_reason
+                       FROM sessions child
+                       LEFT JOIN sessions parent ON parent.id=child.parent_session_id
+                       WHERE child.id=?""",
+                    (current,),
+                ).fetchone()
+                config = self._session_model_config(row) if row is not None else {}
+                if (
+                    row is None
+                    or row["end_reason"] != "compression"
+                    or row["source"] in {"subagent", "tool"}
+                    or config.get("_delegate_from") is not None
+                    or config.get("_branched_from") is not None
+                ):
+                    break
+                current = row["parent_session_id"]
+        return candidates
+
+    def is_authorized_control_session(
+        self, origin_session_id: str, candidate_session_id: str
+    ) -> bool:
+        """Whether candidate is the origin or its proven compression tip."""
+        return bool(
+            origin_session_id
+            and origin_session_id
+            in self.control_session_candidates(candidate_session_id)
+        )
+
     def get_compression_tip(self, session_id: str) -> Optional[str]:
         """Walk the compression-continuation chain forward and return the tip.
 
