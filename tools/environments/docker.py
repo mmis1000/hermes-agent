@@ -1045,9 +1045,15 @@ class DockerEnvironment(BaseEnvironment):
                 writable_args.extend([
                     "--tmpfs", "/workspace:rw,exec,nosuid,nodev,mode=1777,size=10g",
                 ])
+            root_tmpfs_mode = "0700"
+            for mount in trusted_mounts or ():
+                target = str(mount.get("target") or "")
+                if target == "/root" or target.startswith("/root/"):
+                    root_tmpfs_mode = "0755"
+                    break
             writable_args.extend([
                 "--tmpfs", "/home:rw,exec,nosuid,nodev,mode=1777,size=1g",
-                "--tmpfs", "/root:rw,exec,nosuid,nodev,mode=0700,size=1g",
+                "--tmpfs", f"/root:rw,exec,nosuid,nodev,mode={root_tmpfs_mode},size=1g",
             ])
 
         if bind_host_cwd:
@@ -1619,20 +1625,16 @@ class DockerEnvironment(BaseEnvironment):
         resolve_passthrough_value = None
         multiplex_active = False
         is_global_env = lambda _name: False  # noqa: E731
-        try:
-            from tools.env_passthrough import (
-                get_all_passthrough,
-                resolve_passthrough_value,
-            )
-            from agent.secret_scope import _is_global_env, is_multiplex_active as _is_multiplex_active
-            is_global_env = _is_global_env
-            multiplex_active = _is_multiplex_active()
-            passthrough_keys = set(get_all_passthrough())
-        except Exception:
-            pass
         if not getattr(self, "_suppress_implicit_mounts", False):
             try:
-                from tools.env_passthrough import get_all_passthrough
+                from tools.env_passthrough import (
+                    get_all_passthrough,
+                    resolve_passthrough_value as _resolve_passthrough_value,
+                )
+                from agent.secret_scope import _is_global_env, is_multiplex_active as _is_multiplex_active
+                is_global_env = _is_global_env
+                multiplex_active = _is_multiplex_active()
+                resolve_passthrough_value = _resolve_passthrough_value
                 passthrough_keys = set(get_all_passthrough())
             except Exception:
                 pass
