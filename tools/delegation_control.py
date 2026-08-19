@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Model-facing lifecycle controls for background subagent delegations."""
+"""Internal durable lifecycle controls used by delegate_task(action=...)."""
 
 from __future__ import annotations
 
@@ -10,7 +10,6 @@ from typing import Any, Dict, List, Optional
 from tools import async_delegation as _async
 from tools import delegate_tool as _delegate
 from tools.approval import get_current_session_key
-from tools.registry import registry
 
 _ACTIONS = {"list", "status", "tail", "wait", "steer", "resume", "interrupt", "abandon"}
 _TOOL_FIELDS = {
@@ -41,10 +40,6 @@ _MAX_TAIL_EVENTS = 64
 _MAX_REASON_CHARS = 1000
 _MAX_STEER_CHARS = 12000
 _MAX_ID_CHARS = 200
-
-
-def check_delegation_control_requirements() -> bool:
-    return True
 
 
 def _invalid(action: str, error: str) -> str:
@@ -649,99 +644,3 @@ def _handle_delegation_args(args: Dict[str, Any], *, parent_agent=None) -> str:
         force=args.get("force"),
         parent_agent=parent_agent,
     )
-
-
-DELEGATION_CONTROL_SCHEMA = {
-    "name": "delegation",
-    "description": (
-        "Observe and control background work previously spawned by delegate_task. "
-        "Actions are session-scoped: list/status inspect lifecycle state, tail "
-        "returns bounded assistant text and tool previews (never hidden reasoning), "
-        "wait blocks for a bounded time and consumes an unclaimed completed result, "
-        "steer durably queues guidance for one exact live child attempt, resume "
-        "starts a new attempt from a terminal child's persisted transcript, "
-        "interrupt requests a cooperative stop while preserving delivery, and "
-        "abandon suppresses stale delivery before requesting interruption."
-    ),
-    "parameters": {
-        "type": "object",
-        "additionalProperties": False,
-        "properties": {
-            "action": {
-                "type": "string",
-                "enum": sorted(_ACTIONS),
-                "description": "Lifecycle action to perform.",
-            },
-            "delegation_id": {
-                "type": "string",
-                "maxLength": _MAX_ID_CHARS,
-                "description": "Handle returned by delegate_task; omitted only for list.",
-            },
-            "subagent_id": {
-                "type": "string",
-                "maxLength": _MAX_ID_CHARS,
-                "description": "Child filter/branch target; required for steer/resume.",
-            },
-            "attempt_id": {
-                "type": "string",
-                "maxLength": _MAX_ID_CHARS,
-                "description": "Exact historical attempt selector; accepted only by tail.",
-            },
-            "run_id": {
-                "type": "string",
-                "maxLength": _MAX_ID_CHARS,
-                "description": "Exact execution run selector; accepted only by wait.",
-            },
-            "timeout_seconds": {
-                "type": "number",
-                "minimum": 0,
-                "maximum": _MAX_WAIT_SECONDS,
-                "description": "Bounded wait duration; default 30 seconds. Zero checks immediately.",
-            },
-            "limit": {
-                "type": "integer",
-                "minimum": 1,
-                "maximum": _MAX_TAIL_EVENTS,
-                "description": "Recent events returned by tail; default 20.",
-            },
-            "cascade": {
-                "type": "boolean",
-                "description": (
-                    "Interrupt descendants of the delegation or selected child branch. "
-                    "Defaults true; false is rejected because cooperative agent interrupts propagate."
-                ),
-            },
-            "reason": {
-                "type": "string",
-                "maxLength": _MAX_REASON_CHARS,
-                "description": "Optional audit reason for interrupt or abandon.",
-            },
-            "message": {
-                "type": "string",
-                "maxLength": _MAX_STEER_CHARS,
-                "description": "Guidance for steer, or the next user instruction for resume.",
-            },
-            "force": {
-                "type": "boolean",
-                "description": (
-                    "For steer only: move supported foreground waits to background "
-                    "before delivering the guidance. Defaults false."
-                ),
-            },
-        },
-        "required": ["action"],
-    },
-}
-
-
-registry.register(
-    name="delegation",
-    toolset="delegation",
-    schema=DELEGATION_CONTROL_SCHEMA,
-    handler=lambda args, **kw: _handle_delegation_args(
-        args, parent_agent=kw.get("parent_agent")
-    ),
-    check_fn=check_delegation_control_requirements,
-    emoji="🎛️",
-    max_result_size_chars=24000,
-)

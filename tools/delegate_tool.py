@@ -54,7 +54,7 @@ from tools.delegate_tool_toolsets import (  # noqa: F401
     DELEGATE_BLOCKED_TOOLS, _expand_parent_toolsets, _resolve_child_toolsets, _strip_blocked_tools,
 )
 from tools.delegate_tool_results import (  # noqa: F401
-    _apply_summary_budget, _build_child_preserving_parent_tools, _run_child_lifecycle, _summarize_tool_arguments,
+    _apply_summary_budget, _build_child_preserving_parent_tools, _finalize_child_results, _run_child_lifecycle, _summarize_tool_arguments,
 )
 
 _ROLES = frozenset({"leaf", "orchestrator"})
@@ -485,6 +485,8 @@ def delegate_task(
     max_iterations: Optional[int] = None, role: Optional[str] = None, background: Optional[bool] = None,
     output_schema: Optional[Dict[str, Any]] = None, images: Optional[List[str]] = None, action: Optional[str] = None,
     subagent_id: Optional[str] = None, message: Optional[str] = None, parent_agent=None,
+    delegation_id: Optional[str] = None, attempt_id: Optional[str] = None, run_id: Optional[str] = None,
+    timeout_seconds: Optional[float] = None, limit: Optional[int] = None, cascade: Optional[bool] = None, reason: Optional[str] = None, force: Optional[bool] = None,
     credentials_cfg: Optional[Dict[str, Any]] = None,
     profile: Optional[str] = None, workdir: Optional[str] = None, reveal: Optional[list] = None,
     model: Optional[str] = None, provider: Optional[str] = None, reasoning_effort: Optional[str] = None,
@@ -497,8 +499,8 @@ def delegate_task(
         return tool_error("delegate_task requires a parent agent context.")
 
     normalized_action = (action or "").strip().lower()
-    if normalized_action in _CONTROL_ACTIONS:
-        return _handle_control_action(normalized_action, subagent_id, message, parent_agent)
+    if normalized_action in _MERGED_CONTROL_ACTIONS:
+        return _route_delegate_control_action(normalized_action, parent_agent=parent_agent, subagent_id=subagent_id, message=message, delegation_id=delegation_id, attempt_id=attempt_id, run_id=run_id, timeout_seconds=timeout_seconds, limit=limit, cascade=cascade, reason=reason, force=force)
     if normalized_action and normalized_action != "spawn":
         return tool_error(f"Unknown action '{action}'. Use spawn (default), list, steer, or stop.")
 
@@ -898,6 +900,8 @@ def _strip_model_hidden_task_fields(tasks: Any) -> Any:
     return [{k: v for k, v in t.items() if k not in _MODEL_HIDDEN_TASK_FIELDS} if isinstance(t, dict) else t for t in tasks]
 
 
+DELEGATE_TASK_SCHEMA["parameters"]["properties"].update({'profile': {'type': 'string', 'description': 'Execution profile selected from the profiles admitted for this agent.'}, 'workdir': {'type': 'string', 'description': 'Canonical absolute working directory inside the selected execution profile.'}, 'reveal': {'type': 'array', 'items': {'type': 'object', 'properties': {'path': {'type': 'string'}, 'mode': {'type': 'string', 'enum': ['ro', 'rw']}}, 'required': ['path', 'mode'], 'additionalProperties': False}, 'description': 'Visible objects explicitly requested from the parent/session ceiling.'}, 'action': {'type': 'string', 'enum': ['spawn', 'list', 'status', 'tail', 'wait', 'steer', 'resume', 'interrupt', 'stop', 'abandon'], 'description': "Default 'spawn' (omit for normal delegation). Live orchestration without a delegation_id: 'list' shows this conversation's live children; 'steer' queues course-correction text (subagent_id + message); 'stop' ends one child early (subagent_id). Durable lifecycle on the same tool: 'status', 'tail', 'wait', 'resume', 'interrupt', 'abandon' require the handle returned by spawn. 'stop' with a delegation_id is an alias for interrupt. Control actions return immediately; goal/tasks are ignored when action is not spawn."}, 'delegation_id': {'type': 'string', 'description': 'Handle returned by a spawn. Required for status/tail/wait/resume/interrupt/abandon; omitted for live list/steer/stop.'}, 'attempt_id': {'type': 'string', 'description': 'Exact historical attempt selector; accepted only by tail.'}, 'run_id': {'type': 'string', 'description': 'Exact execution run selector; accepted only by wait.'}, 'timeout_seconds': {'type': 'number', 'description': 'Bounded wait duration; default 30 seconds. Zero checks immediately.'}, 'limit': {'type': 'integer', 'description': 'Recent events returned by tail; default 20.'}, 'cascade': {'type': 'boolean', 'description': 'Interrupt descendants of the delegation or selected child branch. Defaults true.'}, 'reason': {'type': 'string', 'description': 'Optional audit reason for interrupt or abandon.'}, 'force': {'type': 'boolean', 'description': 'For steer only: move supported foreground waits to background before delivering the guidance.'}})
+
 registry.register(
     name="delegate_task",
     toolset="delegation",
@@ -908,6 +912,7 @@ registry.register(
         background=_model_background_value(args, kw.get("parent_agent")), output_schema=args.get("output_schema"),
         images=args.get("images"), action=args.get("action"), subagent_id=args.get("subagent_id"), message=args.get("message"),
         profile=args.get("profile"), workdir=args.get("workdir"), reveal=args.get("reveal"),
+        **{key: args.get(key) for key in ("delegation_id", "attempt_id", "run_id", "timeout_seconds", "limit", "cascade", "reason", "force")},
         parent_agent=kw.get("parent_agent"),
     ),
     check_fn=check_delegate_requirements,
@@ -1059,3 +1064,98 @@ def forward_pending_subagent_steers(
         repository.mark_steer_forwarded(mailbox_id)
         forwarded += 1
     return forwarded
+
+
+def _route_delegate_control_action(
+    action: str,
+    *,
+    parent_agent: Any,
+    subagent_id: Optional[str] = None,
+    message: Optional[str] = None,
+    delegation_id: Optional[str] = None,
+    attempt_id: Optional[str] = None,
+    run_id: Optional[str] = None,
+    timeout_seconds: Optional[float] = None,
+    limit: Optional[int] = None,
+    cascade: Optional[bool] = None,
+    reason: Optional[str] = None,
+    force: Optional[bool] = None,
+) -> str:
+    """Route a control action to the live tree or the durable lifecycle plane."""
+    has_delegation_id = bool(str(delegation_id or "").strip())
+    live_compatible = action in _LIVE_CONTROL_ACTIONS or (
+        action == "interrupt" and not has_delegation_id and bool(str(subagent_id or "").strip())
+    )
+    if live_compatible and not has_delegation_id:
+        live_action = "stop" if action == "interrupt" else action
+        live = _handle_control_action(live_action, subagent_id, message, parent_agent)
+        if action != "list":
+            return live
+        # Merge durable session list onto the live-tree snapshot so
+        # action='list' covers both upstream children and our records.
+        live_payload = json.loads(live)
+        try:
+            from tools.delegation_control import delegation_control
+
+            durable = json.loads(
+                delegation_control(action="list", parent_agent=parent_agent)
+            )
+            live_payload["delegations"] = durable.get("delegations") or []
+            live_payload["status"] = durable.get("status") or "ok"
+        except Exception:
+            live_payload["delegations"] = []
+            live_payload["status"] = "ok"
+        return json.dumps(live_payload, ensure_ascii=False)
+
+    from tools.delegation_control import delegation_control
+
+    durable_action = "interrupt" if action == "stop" else action
+    return delegation_control(
+        action=durable_action,
+        delegation_id=delegation_id,
+        subagent_id=subagent_id,
+        attempt_id=attempt_id,
+        run_id=run_id,
+        timeout_seconds=timeout_seconds,
+        limit=limit,
+        cascade=cascade,
+        reason=reason,
+        message=message,
+        force=force,
+        parent_agent=parent_agent,
+    )
+
+_LIVE_CONTROL_ACTIONS = frozenset({"list", "steer", "stop"})
+_MERGED_CONTROL_ACTIONS = frozenset({"list", "status", "tail", "wait", "steer", "resume", "interrupt", "stop", "abandon"})
+
+
+def _build_child_preserving_parent_tools(**kwargs):
+    """Build a child without leaking its resolved toolset into the parent."""
+    import model_tools
+
+    with _CHILD_CONSTRUCTION_LOCK:
+        parent_tool_names = list(model_tools._last_resolved_tool_names)
+        try:
+            child = _build_child_agent(**kwargs)
+        finally:
+            model_tools._last_resolved_tool_names = parent_tool_names
+    child._delegate_saved_tool_names = parent_tool_names
+    return child
+
+
+def _run_child_lifecycle(
+    task_index: int, goal: str, child=None, parent_agent=None
+) -> Dict[str, Any]:
+    """Run one child and apply the same host lifecycle used by delegate_task."""
+    result = _run_single_child(task_index, goal, child, parent_agent)
+    result.setdefault("task_index", task_index)
+    task = {"goal": goal}
+    _finalize_child_results(
+        [result],
+        [{"goal": ""} for _ in range(task_index)] + [task],
+        [(task_index, task, child)],
+        parent_agent,
+    )
+    return result
+
+_CHILD_CONSTRUCTION_LOCK = threading.RLock()

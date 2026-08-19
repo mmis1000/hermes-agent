@@ -70,7 +70,7 @@ class TestSteerAcceptance:
         ) as slot:
             assert slot is None
         with track_foreground_wait(
-            agent, "call-wait", "delegation", {"action": "wait"}
+            agent, "call-wait", "delegate_task", {"action": "wait"}
         ) as slot:
             assert slot is not None
             assert slot.kind == "delegation"
@@ -79,7 +79,7 @@ class TestSteerAcceptance:
         from types import SimpleNamespace
         from unittest.mock import MagicMock
 
-        from tests.run_agent.test_tool_call_guardrail_runtime import (
+        from tests.agent.test_tool_call_guardrail_runtime import (
             _make_agent,
             _mock_tool_call,
         )
@@ -271,7 +271,9 @@ class TestSteerAcceptance:
 
         agent._apply_pending_steer_to_tool_results(messages, num_tool_msgs=1)
 
-        assert messages[0]["content"].endswith(
+        assert messages[0]["content"] == "output"
+        assert messages[1]["role"] == "user"
+        assert messages[1]["content"].endswith(
             "first\nsecond\n[/OUT-OF-BAND USER MESSAGE]"
         )
         assert outcomes == [
@@ -291,10 +293,11 @@ class TestSteerAcceptance:
 
         agent._apply_pending_steer_to_tool_results(messages, num_tool_msgs=1)
 
-        delivered = messages[0]["content"]
-        assert delivered.index("proc_original") < delivered.index(
-            "[OUT-OF-BAND USER MESSAGE"
-        )
+        assert messages[0]["content"] == content
+        assert "proc_original" in content
+        assert messages[1]["role"] == "user"
+        delivered = messages[1]["content"]
+        assert "[OUT-OF-BAND USER MESSAGE" in delivered
         assert "parent says continue elsewhere" in delivered
 
     def test_interrupt_acks_tracked_envelope_as_superseded(self):
@@ -306,10 +309,12 @@ class TestSteerAcceptance:
             outcome_callback=outcomes.append,
         )
 
-        agent._clear_pending_steer("superseded_by_interrupt")
+        agent.interrupt(hard_cancel=True)
+        agent.clear_interrupt()
 
         assert outcomes == ["superseded_by_interrupt"]
         assert agent._pending_steer is None
+        assert agent._pending_steer_envelopes == []
 
 
 class TestSteerDrain:
@@ -584,7 +589,7 @@ class TestActiveTurnRedirectCheckpoint:
         assert placeholder["role"] == "assistant"
         assert placeholder["display_kind"] == "hidden"
         assert placeholder.get("content") == ""
-        assert not placeholder.get("api_content")
+        assert placeholder.get("api_content") == "[response interrupted]"
         assert correction["content"] == "New direction."
         assert (
             "[This response was interrupted by a user correction.]"
@@ -610,7 +615,7 @@ class TestActiveTurnRedirectCheckpoint:
         assert placeholder["role"] == "assistant"
         assert placeholder.get("display_kind") == "hidden"
         assert placeholder.get("content") == ""
-        assert not placeholder.get("api_content")
+        assert placeholder.get("api_content") == "[response interrupted]"
         assert correction["role"] == "user"
         assert correction["content"] == "Stop and do X instead."
         assert correction["api_content"].startswith(
@@ -633,8 +638,10 @@ class TestSteerInjection:
         # The LAST tool result is modified; earlier ones are untouched.
         assert messages[2]["content"] == "ls output A"
         assert "ls output B" in messages[3]["content"]
-        assert STEER_MARKER_OPEN in messages[3]["content"]
-        assert "please also check auth.log" in messages[3]["content"]
+        assert messages[3]["content"] == "ls output B"
+        assert messages[4]["role"] == "user"
+        assert STEER_MARKER_OPEN in messages[4]["content"]
+        assert "please also check auth.log" in messages[4]["content"]
         # And pending_steer is consumed.
         assert agent._pending_steer is None
 
@@ -673,12 +680,13 @@ class TestSteerInjection:
             {"role": "tool", "content": list(original_blocks), "tool_call_id": "1"}
         ]
         agent._apply_pending_steer_to_tool_results(messages, num_tool_msgs=1)
-        new_content = messages[-1]["content"]
+        new_content = messages[0]["content"]
         assert isinstance(new_content, list)
-        assert len(new_content) == 2
+        assert len(new_content) == 1
         assert new_content[0] == {"type": "text", "text": "existing output"}
-        assert new_content[1]["type"] == "text"
-        assert "extra note" in new_content[1]["text"]
+        assert len(new_content) == 1
+        assert messages[1]["role"] == "user"
+        assert "extra note" in messages[1]["content"]
 
 
 
@@ -722,7 +730,7 @@ class TestSteerClearedOnInterrupt:
         agent._pending_redirect = "also drop this"
         assert agent._pending_steer == "will be dropped"
 
-        agent.clear_interrupt()
+        agent.clear_interrupt(hard_cancel=True)
         assert agent._pending_steer is None
         assert agent._pending_redirect is None
 
@@ -803,7 +811,7 @@ class TestSteerMarkerContract:
         """
         from agent.prompt_builder import STEER_CHANNEL_NOTE
 
-        assert "latest tool-result batch" in STEER_CHANNEL_NOTE
+        assert "latest tool results" in STEER_CHANNEL_NOTE
         assert "no later assistant message follows it" in STEER_CHANNEL_NOTE
         assert "do not treat it as a new message" in STEER_CHANNEL_NOTE
         assert "repeat completed work" in STEER_CHANNEL_NOTE

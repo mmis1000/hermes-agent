@@ -171,14 +171,27 @@ def test_status_projection_redacts_backing_identity_and_reports_cleanup_failure(
     }
 
 
-def test_tool_schema_and_runtime_validation_are_strict():
+def test_standalone_delegation_tool_is_not_registered():
+    import tools.delegate_tool  # noqa: F401
     import tools.delegation_control  # noqa: F401
+    from tools.registry import registry
+
+    definitions = registry.get_definitions({"delegate_task", "delegation"})
+    names = {item["function"]["name"] for item in definitions}
+    assert "delegate_task" in names
+    assert "delegation" not in names
+
+
+def test_tool_schema_and_runtime_validation_are_strict():
+    import tools.delegate_tool  # noqa: F401
     from tools.delegation_control import _handle_delegation_args, delegation_control
     from tools.registry import registry
 
-    definitions = registry.get_definitions({"delegation"})
-    control = next(item for item in definitions if item["function"]["name"] == "delegation")
-    assert control["function"]["parameters"]["additionalProperties"] is False
+    definitions = registry.get_definitions({"delegate_task"})
+    control = next(item for item in definitions if item["function"]["name"] == "delegate_task")
+    action_enum = control["function"]["parameters"]["properties"]["action"]["enum"]
+    assert "resume" in action_enum
+    assert "wait" in action_enum
 
     cases = [
         _handle_delegation_args({"action": "list", "unexpected": True}),
@@ -204,11 +217,12 @@ def test_tool_schema_and_runtime_validation_are_strict():
 
 
 def test_resume_control_is_strict_and_forwards_live_parent(monkeypatch):
+    import tools.delegate_tool  # noqa: F401
     from tools.delegation_control import _handle_delegation_args, delegation_control
     from tools.registry import registry
 
-    definitions = registry.get_definitions({"delegation"})
-    control = next(item for item in definitions if item["function"]["name"] == "delegation")
+    definitions = registry.get_definitions({"delegate_task"})
+    control = next(item for item in definitions if item["function"]["name"] == "delegate_task")
     assert "resume" in control["function"]["parameters"]["properties"]["action"]["enum"]
     for args in (
         {"action": "resume", "delegation_id": "d", "message": "next"},
