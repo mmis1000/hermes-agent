@@ -8637,6 +8637,128 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             in self.control_session_candidates(candidate_session_id)
         )
 
+    def get_subagent_resume_bundle(
+        self,
+        child_session_id: str,
+        reconstruction_metadata: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Return validated provider-facing history for one durable child.
+
+        The walk is child-only and fail-closed: every included segment must be a
+        ``source='subagent'`` row carrying the same stable ``_delegate_from``
+        owner marker. Parent-agent rows are never queried into the replay. A
+        compression continuation is followed only when its parent ended for
+        compression and it carries that same marker.
+        """
+        if not isinstance(reconstruction_metadata, dict):
+            raise ValueError("missing reconstruction metadata")
+        try:
+            metadata = json.loads(json.dumps(reconstruction_metadata))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("corrupt reconstruction metadata") from exc
+        expected_child = metadata.get("child_session_id")
+        delegate_from = metadata.get("parent_session_id")
+        if (
+            not isinstance(child_session_id, str)
+            or not child_session_id
+            or expected_child != child_session_id
+            or not isinstance(delegate_from, str)
+            or not delegate_from
+        ):
+            raise ValueError("incomplete reconstruction metadata")
+
+        with self._lock:
+            start = self._conn.execute(
+                "SELECT id,parent_session_id,source,model_config,end_reason "
+                "FROM sessions WHERE id=?",
+                (child_session_id,),
+            ).fetchone()
+            if start is None:
+                raise ValueError("missing subagent transcript")
+
+            # Follow only this child's compression continuation, never a sibling
+            # delegate/branch that happens to share the same parent.
+            tip = child_session_id
+            seen_forward = {tip}
+            for _ in range(100):
+                row = self._conn.execute(
+                    """SELECT child.id
+                       FROM sessions parent
+                       JOIN sessions child ON child.parent_session_id=parent.id
+                       WHERE parent.id=? AND parent.end_reason='compression'
+                         AND child.source='subagent'
+                         AND json_extract(COALESCE(child.model_config, '{}'),
+                                          '$._delegate_from')=?
+                       ORDER BY child.started_at DESC, child.id DESC LIMIT 1""",
+                    (tip, delegate_from),
+                ).fetchone()
+                if row is None or not row["id"] or row["id"] in seen_forward:
+                    break
+                tip = row["id"]
+                seen_forward.add(tip)
+
+            # Walk backward over resume/compression child segments, stopping
+            # immediately before the owning parent session.
+            child_ids_tip_to_root: List[str] = []
+            current = tip
+            seen: set[str] = set()
+            owner_parent = None
+            for _ in range(100):
+                if not current or current in seen:
+                    raise ValueError("corrupt subagent lineage")
+                seen.add(current)
+                row = self._conn.execute(
+                    "SELECT id,parent_session_id,source,model_config "
+                    "FROM sessions WHERE id=?",
+                    (current,),
+                ).fetchone()
+                if row is None:
+                    raise ValueError("missing subagent lineage segment")
+                config = self._session_model_config(row)
+                if row["source"] != "subagent" or config.get("_delegate_from") != delegate_from:
+                    owner_parent = current
+                    break
+                child_ids_tip_to_root.append(current)
+                current = row["parent_session_id"]
+            else:
+                raise ValueError("subagent lineage exceeds safety bound")
+
+            if owner_parent is None:
+                owner_parent = current
+            if child_session_id not in child_ids_tip_to_root:
+                raise ValueError("foreign subagent lineage")
+
+            child_ids = list(reversed(child_ids_tip_to_root))
+            placeholders = ",".join("?" for _ in child_ids)
+            rows = self._conn.execute(
+                f"SELECT session_id, {self._CONVERSATION_ROW_COLUMNS} "
+                f"FROM messages WHERE session_id IN ({placeholders}) AND active=1 "
+                "ORDER BY id",
+                tuple(child_ids),
+            ).fetchall()
+
+        if not self.is_authorized_control_session(delegate_from, owner_parent):
+            raise ValueError("foreign subagent lineage")
+        history = self._rows_to_conversation(
+            rows,
+            session_id=tip,
+            include_ancestors=False,
+            repair_alternation=True,
+        )
+        from agent.replay_cleanup import sanitize_replay_history
+
+        history = sanitize_replay_history(history)
+        if not history:
+            raise ValueError("missing subagent transcript")
+        return {
+            "history": history,
+            "prior_child_session_id": tip,
+            "initial_child_session_id": child_session_id,
+            "parent_session_id": delegate_from,
+            "child_lineage": child_ids,
+            "reconstruction_metadata": metadata,
+        }
+
     def get_compression_tip(self, session_id: str) -> Optional[str]:
         """Walk the compression-continuation chain forward and return the tip.
 
