@@ -70,7 +70,7 @@ class TestSteerAcceptance:
         ) as slot:
             assert slot is None
         with track_foreground_wait(
-            agent, "call-wait", "delegation", {"action": "wait"}
+            agent, "call-wait", "delegate_task", {"action": "wait"}
         ) as slot:
             assert slot is not None
             assert slot.kind == "delegation"

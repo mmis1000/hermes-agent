@@ -61,18 +61,25 @@ class TestSessionIdForwarding:
         assert captured["session_id"] is None
 
     def test_parent_agent_forwarded_for_stateful_agent_tools(self):
-        """Registry handlers such as delegation resume receive the live caller."""
+        """delegate_task control actions receive the live caller."""
+        import run_agent
+
         captured = {}
-        parent = object()
-        with patch("model_tools.registry", _make_registry(captured)):
-            from model_tools import handle_function_call
-            handle_function_call(
-                "delegation",
-                {"action": "resume", "delegation_id": "d", "subagent_id": "sa", "message": "next"},
-                task_id="task-parent",
-                session_id="sess-parent",
-                parent_agent=parent,
-                skip_pre_tool_call_hook=True,
+
+        def fake_delegate_task(**kwargs):
+            captured.update(kwargs)
+            return "{}"
+
+        parent = type("Parent", (), {"_delegate_depth": 0})()
+        with patch("tools.delegate_tool.delegate_task", fake_delegate_task):
+            run_agent.AIAgent._dispatch_delegate_task(
+                parent,
+                {
+                    "action": "resume",
+                    "delegation_id": "d",
+                    "subagent_id": "sa",
+                    "message": "next",
+                },
             )
         assert captured.get("parent_agent") is parent
 
@@ -90,7 +97,7 @@ class TestSessionIdForwarding:
                 {
                     "type": "function",
                     "function": {
-                        "name": "delegation",
+                        "name": "delegate_task",
                         "description": "stateful test tool",
                         "parameters": {"type": "object"},
                     },
@@ -99,15 +106,15 @@ class TestSessionIdForwarding:
         )
         monkeypatch.setattr(
             "tools.tool_search.resolve_underlying_call",
-            lambda args: ("delegation", {"action": "list"}, None),
+            lambda args: ("delegate_task", {"action": "list"}, None),
         )
         monkeypatch.setattr(
             "tools.tool_search.scoped_deferrable_names",
-            lambda defs: {"delegation"},
+            lambda defs: {"delegate_task"},
         )
 
         def recording_dispatch(**kwargs):
-            if kwargs.get("function_name") == "delegation":
+            if kwargs.get("function_name") == "delegate_task":
                 captured.update(kwargs)
                 return '{"ok": true}'
             return original(**kwargs)
@@ -115,7 +122,7 @@ class TestSessionIdForwarding:
         monkeypatch.setattr(model_tools, "handle_function_call", recording_dispatch)
         result = original(
             function_name="tool_call",
-            function_args={"name": "delegation", "arguments": {"action": "list"}},
+            function_args={"name": "delegate_task", "arguments": {"action": "list"}},
             parent_agent=parent,
         )
 

@@ -2058,6 +2058,32 @@ class TestDispatchDelegateTask(unittest.TestCase):
         self.assertEqual(captured["provider"], "openrouter")
         self.assertEqual(captured["reasoning_effort"], "low")
 
+    def test_dispatch_kwargs_are_accepted_by_delegate_task(self):
+        import inspect
+
+        from tools.delegate_tool import delegate_task as real_delegate_task
+
+        params = inspect.signature(real_delegate_task).parameters
+        for name in (
+            "action",
+            "subagent_id",
+            "message",
+            "delegation_id",
+            "attempt_id",
+            "run_id",
+            "timeout_seconds",
+            "limit",
+            "cascade",
+            "reason",
+            "force",
+            "model",
+            "provider",
+            "profile",
+            "workdir",
+            "reveal",
+        ):
+            self.assertIn(name, params)
+
     def test_registry_handler_forwards_per_call_overrides(self):
         from tools.registry import registry
 

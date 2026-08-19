@@ -51,7 +51,6 @@ TOOL_KIND_MAP: Dict[str, ToolKind] = {
     "browser_get_images": "read",
     # Agent internals
     "delegate_task": "execute",
-    "delegation": "execute",
     "vision_analyze": "read",
     "image_generate": "execute",
     "text_to_speech": "execute",
@@ -62,7 +61,7 @@ TOOL_KIND_MAP: Dict[str, ToolKind] = {
 
 _POLISHED_TOOLS = {
     # Core operator loop
-    "todo", "memory", "session_search", "delegate_task", "delegation",
+    "todo", "memory", "session_search", "delegate_task",
     # Files / execution
     "read_file", "write_file", "patch", "search_files", "terminal", "process", "execute_code",
     # Skills / web / browser / media
@@ -127,18 +126,10 @@ def build_tool_title(tool_name: str, args: Dict[str, Any]) -> str:
         sid = str(args.get("session_id") or "").strip()
         return f"process {action}: {sid}" if sid else f"process {action}"
     if tool_name == "delegate_task":
-        tasks = args.get("tasks")
-        if isinstance(tasks, list) and tasks:
-            return f"delegate batch ({len(tasks)} tasks)"
-        goal = args.get("goal", "")
-        if goal and len(goal) > 60:
-            goal = goal[:57] + "..."
-        return f"delegate: {goal}" if goal else "delegate task"
-    if tool_name == "delegation":
         from agent.display import build_tool_preview
 
         preview = build_tool_preview(tool_name, args, max_len=80)
-        return f"delegation: {preview}" if preview else "delegation"
+        return f"delegate: {preview}" if preview else "delegate task"
     if tool_name == "session_search":
         query = str(args.get("query") or "").strip()
         return f"session search: {query}" if query else "recent sessions"
@@ -1241,32 +1232,29 @@ def _build_tool_start(
         )
 
     if tool_name == "delegate_task":
-        tasks = arguments.get("tasks")
-        if isinstance(tasks, list) and tasks:
-            lines = [f"Delegating {len(tasks)} tasks", ""]
-            for i, task in enumerate(tasks[:8], 1):
-                if isinstance(task, dict):
-                    goal = str(task.get("goal") or "").strip()
-                    role = str(task.get("role") or "").strip()
-                    lines.append(f"{i}. " + _truncate_text(goal, limit=160) + (f" ({role})" if role else ""))
-            if len(tasks) > 8:
-                lines.append(f"... {len(tasks) - 8} more")
-            content = [_text("\n".join(lines))]
-        else:
-            goal = str(arguments.get("goal") or "").strip()
-            content = [_text("Delegating task" + (f":\n{_truncate_text(goal, limit=800)}" if goal else ""))]
-        return acp.start_tool_call(
-            tool_call_id, title, kind=kind, content=content, locations=locations,
-        )
-
-    if tool_name == "delegation":
         from agent.display import build_tool_preview
 
-        preview = build_tool_preview(tool_name, arguments, max_len=500)
-        content = [_text(preview)] if preview else None
+        action = str(arguments.get("action") or "").strip().lower()
+        if action and action != "spawn":
+            preview = build_tool_preview(tool_name, arguments, max_len=500)
+            content = [_text(preview)] if preview else None
+        else:
+            tasks = arguments.get("tasks")
+            if isinstance(tasks, list) and tasks:
+                lines = [f"Delegating {len(tasks)} tasks", ""]
+                for i, task in enumerate(tasks[:8], 1):
+                    if isinstance(task, dict):
+                        goal = str(task.get("goal") or "").strip()
+                        role = str(task.get("role") or "").strip()
+                        lines.append(f"{i}. " + _truncate_text(goal, limit=160) + (f" ({role})" if role else ""))
+                if len(tasks) > 8:
+                    lines.append(f"... {len(tasks) - 8} more")
+                content = [_text("\n".join(lines))]
+            else:
+                goal = str(arguments.get("goal") or "").strip()
+                content = [_text("Delegating task" + (f":\n{_truncate_text(goal, limit=800)}" if goal else ""))]
         return acp.start_tool_call(
             tool_call_id, title, kind=kind, content=content, locations=locations,
-            raw_input=None,
         )
 
     if tool_name == "session_search":

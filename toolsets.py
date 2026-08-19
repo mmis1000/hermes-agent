@@ -70,8 +70,8 @@ _HERMES_CORE_TOOLS = [
     "session_search",
     # Clarifying questions
     "clarify",
-    # Code execution + durable delegation lifecycle
-    "execute_code", "delegate_task", "delegation",
+    # Code execution
+    "execute_code", "delegate_task",
     # Cronjob management
     "cronjob",
     # Home Assistant smart home control (gated on HASS_TOKEN via check_fn)
@@ -298,9 +298,6 @@ TOOLSETS = {
     
     "delegation": {
         "description": "Spawn, inspect, wait for, and control isolated subagents",
-        # The lifecycle control tool registers into this toolset at runtime.
-        # Keep static membership limited to delegate_task so platform-composite
-        # inference remains stable when registry overlays add tools.
         "tools": ["delegate_task"],
         "includes": []
     },

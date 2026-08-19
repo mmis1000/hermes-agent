@@ -8532,6 +8532,14 @@ class AIAgent:
             action=function_args.get("action"),
             subagent_id=function_args.get("subagent_id"),
             message=function_args.get("message"),
+            delegation_id=function_args.get("delegation_id"),
+            attempt_id=function_args.get("attempt_id"),
+            run_id=function_args.get("run_id"),
+            timeout_seconds=function_args.get("timeout_seconds"),
+            limit=function_args.get("limit"),
+            cascade=function_args.get("cascade"),
+            reason=function_args.get("reason"),
+            force=function_args.get("force"),
             parent_agent=self,
         )
 

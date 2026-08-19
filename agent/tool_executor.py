@@ -2226,7 +2226,17 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         elif function_name == "delegate_task":
             _action_arg = str(function_args.get("action") or "").strip().lower()
             tasks_arg = function_args.get("tasks")
-            if _action_arg in ("list", "steer", "stop"):
+            if _action_arg in (
+                "list",
+                "status",
+                "tail",
+                "wait",
+                "steer",
+                "resume",
+                "interrupt",
+                "stop",
+                "abandon",
+            ):
                 spinner_label = f"🔀 subagent {_action_arg}"
             elif tasks_arg and isinstance(tasks_arg, list):
                 spinner_label = f"🔀 delegating {len(tasks_arg)} tasks · (/agents to monitor)"

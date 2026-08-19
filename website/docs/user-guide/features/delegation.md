@@ -237,7 +237,7 @@ With a hard cap configured, if a subagent times out having made **zero** API cal
 
 ## Stall Detection for Background Subagents
 
-Background delegations (`delegate_task(background=true)`) are watched by a
+Background delegations are watched by a
 **progress-based stall monitor** — on by default, zero config. Unlike a
 wall-clock timeout, it never touches a child that is making progress, no
 matter how long it runs.
@@ -273,12 +273,12 @@ as the safety net for anything else.
 
 ## Steering a Subagent During a Foreground Wait
 
-`delegation(action="steer", ...)` normally queues guidance for the child without interrupting its current tool. If the child is blocked in a foreground `terminal(...)` command or `delegation(action="wait", ...)`, ordinary steering instead returns `status="foreground_wait"` and does not queue the message. Retry explicitly with `force=true` to move only that wait into the background and deliver the guidance through the normal steer queue.
+`delegate_task(action="steer", ...)` normally queues guidance for the child without interrupting its current tool. If the child is blocked in a foreground `terminal(...)` command or `delegate_task(action="wait", ...)`, ordinary steering instead returns `status="foreground_wait"` and does not queue the message. Retry explicitly with `force=true` to move only that wait into the background and deliver the guidance through the normal steer queue.
 
 The underlying work is not restarted or cancelled:
 
 - A terminal command is adopted by the process registry. The interrupted tool result includes its `session_id` and exact `process(action="wait"|"log"|"kill", ...)` recovery calls.
-- A delegation wait releases its delivery hold while leaving the child running. The result includes its `delegation_id`, `run_id`, and exact `delegation(action="wait"|"status"|"interrupt", ...)` recovery calls.
+- A delegation wait releases its delivery hold while leaving the child running. The result includes its `delegation_id`, `run_id`, and exact `delegate_task(action="wait"|"status"|"interrupt", ...)` recovery calls.
 
 The recovery result is added before the parent's out-of-band steer message, so the child receives both the new direction and the handle for work it may resume, inspect, or stop later. `force=true` applies only to these two supported foreground waits; it is not a general cancellation mode.
 
@@ -315,17 +315,21 @@ Interrupting a child throws away its in-flight work; often you just want to redi
 
 ### From the parent agent (model-facing)
 
-The parent agent orchestrates its own running children with the same `delegate_task` tool it spawned them with — no separate control tool:
+The parent agent orchestrates its own running children with the same `delegate_task` tool it spawned them with — no second schema:
 
 ```json
 {"action": "list"}
 {"action": "steer", "subagent_id": "sa-0-1a2b3c4d", "message": "focus on pricing instead"}
 {"action": "stop",  "subagent_id": "sa-0-1a2b3c4d"}
+{"action": "wait", "delegation_id": "dlg_...", "timeout_seconds": 30}
+{"action": "status", "delegation_id": "dlg_..."}
+{"action": "resume", "delegation_id": "dlg_...", "subagent_id": "sa-0-1a2b3c4d", "message": "continue from the last attempt"}
 ```
 
-- **`list`** returns the conversation's live children: `subagent_id`, goal, status, `running_seconds`, `accepting_steer`, and the live transcript path. Ids also come back in the spawn dispatch response as `subagent_ids`.
+- **`list`** returns the conversation's live children: `subagent_id`, goal, status, `running_seconds`, `accepting_steer`, and the live transcript path. Ids also come back in the spawn dispatch response as `subagent_ids`. Without a handle it also includes durable records from this session.
 - **`steer`** queues a course correction into a running child without stopping it (delivery semantics below).
-- **`stop`** ends a child early at its next iteration boundary; the partial result still re-enters the conversation as a normal completion message.
+- **`stop`** ends a live child early at its next iteration boundary; the partial result still re-enters the conversation as a normal completion message. With a `delegation_id`, `stop` aliases `interrupt`.
+- **`status` / `tail` / `wait` / `resume` / `interrupt` / `abandon`** operate on the handle returned by spawn. Use one bounded `wait` only when the parent must synchronize; prefer async delivery otherwise.
 
 Control actions run synchronously in-turn (never backgrounded), are scoped to the caller's own spawn tree — a conversation can never see or control another session's children — and never consume the per-turn subagent spawn cap, so `stop` keeps working even after the cap is hit.
 
@@ -378,7 +382,7 @@ delegate_task(
 ```
 
 - `role="leaf"` (default): child cannot delegate further — identical to the flat-delegation behavior.
-- `role="orchestrator"`: child retains the `delegation` toolset. Gated by `delegation.max_spawn_depth` (default **1** = flat, so `role="orchestrator"` is a no-op at defaults). Raise `max_spawn_depth` to 2 to allow orchestrator children to spawn leaf grandchildren; 3+ for deeper trees. There is no upper ceiling — cost is the practical limit.
+- `role="orchestrator"`: child retains `delegate_task` via the `delegation` toolset. Gated by `delegation.max_spawn_depth` (default **1** = flat, so `role="orchestrator"` is a no-op at defaults). Raise `max_spawn_depth` to 2 to allow orchestrator children to spawn leaf grandchildren; 3+ for deeper trees. There is no upper ceiling — cost is the practical limit.
 - `delegation.orchestrator_enabled: false`: global kill switch that forces every child to `leaf` regardless of the `role` parameter.
 
 **Cost warning:** With `max_spawn_depth: 3` and `max_concurrent_children: 3`, the tree can reach 3×3×3 = 27 concurrent leaf agents. Each extra level multiplies spend — raise `max_spawn_depth` intentionally.
