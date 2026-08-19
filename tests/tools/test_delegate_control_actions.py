@@ -8,6 +8,7 @@ integration contracts: control actions are synchronous (never
 backgrounded) and never consume the per-turn subagent spawn cap.
 """
 
+import inspect
 import json
 import weakref
 
@@ -324,6 +325,8 @@ def test_spawn_count_zero_for_control_actions():
     assert _subagent_spawn_count({"action": "status", "delegation_id": "d"}) == 0
     assert _subagent_spawn_count({"action": "interrupt", "delegation_id": "d"}) == 0
     assert _subagent_spawn_count({"action": "abandon", "delegation_id": "d"}) == 0
+    assert _subagent_spawn_count({"action": "resume", "delegation_id": "d"}) == 0
+    assert _subagent_spawn_count({"action": "steer", "force": True, "subagent_id": "x"}) == 0
     # Spawn shapes unchanged
     assert _subagent_spawn_count({"goal": "g"}) == 1
     assert _subagent_spawn_count({"action": "spawn", "goal": "g"}) == 1
@@ -359,3 +362,79 @@ def test_control_action_not_blocked_at_spawn_cap():
     )
     # And spawns remain blocked afterwards — the control call didn't reset it
     assert ctl2.before_call("delegate_task", {"goal": "c"}).action == "block"
+
+
+# ---------------------------------------------------------------------------
+# Rebase/production regressions: dispatcher leftovers + resume SessionDB seam
+# ---------------------------------------------------------------------------
+
+
+def _dispatch_parent():
+    parent = _StubParent()
+    parent._delegate_depth = 0
+    return parent
+
+
+def test_production_dispatch_action_list_does_not_typeerror():
+    """Live crash: leftover dispatcher forwarded action= after fork dropped it."""
+    import run_agent
+
+    out = json.loads(
+        run_agent.AIAgent._dispatch_delegate_task(_dispatch_parent(), {"action": "list"})
+    )
+    assert out["action"] == "list"
+
+
+def test_production_dispatch_force_steer_does_not_typeerror():
+    """Live crash: force=True on a foreground-wait steer must stay a live kwarg."""
+    import run_agent
+
+    out = json.loads(
+        run_agent.AIAgent._dispatch_delegate_task(
+            _dispatch_parent(),
+            {
+                "action": "steer",
+                "subagent_id": "sid-missing",
+                "message": "course correct",
+                "force": True,
+            },
+        )
+    )
+    dumped = json.dumps(out)
+    assert "unexpected keyword argument" not in dumped
+    assert out.get("action") == "steer" or "No live" in dumped or out.get("status")
+
+
+def test_production_dispatch_resume_does_not_typeerror():
+    """Live crash: resume routed through the leftover dispatcher action= path."""
+    import run_agent
+
+    out = json.loads(
+        run_agent.AIAgent._dispatch_delegate_task(
+            _dispatch_parent(),
+            {
+                "action": "resume",
+                "delegation_id": "deleg-missing",
+                "subagent_id": "sa-missing",
+                "message": "continue",
+            },
+        )
+    )
+    assert out["action"] == "resume"
+    assert out["status"] in {"not_found", "invalid_arguments", "resume_unavailable"}
+
+
+def test_sessiondb_still_defines_subagent_resume_bundle():
+    """Live crash: rebase dropped SessionDB.get_subagent_resume_bundle.
+
+    Resume tests that monkeypatch load_subagent_resume_bundle stay green even
+    when the real SessionDB method is gone. This seam must fail in the same
+    focused suite as the dispatcher tests.
+    """
+    from hermes_state import SessionDB
+
+    method = getattr(SessionDB, "get_subagent_resume_bundle", None)
+    assert callable(method)
+    params = inspect.signature(method).parameters
+    assert "child_session_id" in params
+    assert "reconstruction_metadata" in params

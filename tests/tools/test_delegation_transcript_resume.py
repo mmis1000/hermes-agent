@@ -5,6 +5,17 @@ import pytest
 from hermes_state import SessionDB
 
 
+def test_sessiondb_defines_get_subagent_resume_bundle():
+    """Fail closed if rebase drops the live resume hydration method again."""
+    import inspect
+
+    method = getattr(SessionDB, "get_subagent_resume_bundle", None)
+    assert callable(method)
+    params = inspect.signature(method).parameters
+    assert "child_session_id" in params
+    assert "reconstruction_metadata" in params
+
+
 @pytest.fixture
 def db(tmp_path):
     return SessionDB(tmp_path / "state.db")
