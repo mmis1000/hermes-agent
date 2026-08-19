@@ -1040,15 +1040,15 @@ def wait_for_delegation(
                     "delegation_id": delegation_id,
                     "run_id": bound_run_id,
                     "continue": (
-                        'delegation(action="wait", delegation_id='
+                        'delegate_task(action="wait", delegation_id='
                         f'"{delegation_id}", run_id="{bound_run_id}")'
                     ),
                     "inspect": (
-                        'delegation(action="status", delegation_id='
+                        'delegate_task(action="status", delegation_id='
                         f'"{delegation_id}")'
                     ),
                     "stop": (
-                        'delegation(action="interrupt", delegation_id='
+                        'delegate_task(action="interrupt", delegation_id='
                         f'"{delegation_id}", cascade=true)'
                     ),
                 }

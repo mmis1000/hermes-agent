@@ -1055,17 +1055,26 @@ Enable/disable per platform via `hermes tools` (the curses UI) or the
 ## Delegation (`delegate_task`)
 
 `tools/delegate_tool.py` spawns a subagent with an isolated
-context + terminal session. By default the parent waits for the
-child's summary before continuing its own loop. With `background=true`,
-Hermes returns a delegation id immediately and the result re-enters the
-conversation later through the async-delegation completion queue.
+context + terminal session. Top-level calls return a handle
+immediately and the result re-enters later through the
+async-delegation completion queue. Control live or durable
+children through the same tool (`action=`), not a second schema.
 
-Two shapes:
+Two spawn shapes:
 
-- **Single:** pass `goal` (+ optional `context`, `toolsets`).
+- **Single:** pass `goal` (+ optional `context`).
 - **Batch (parallel):** pass `tasks: [...]` — each gets its own subagent
   running concurrently. Concurrency is capped by
   `delegation.max_concurrent_children` (default 3).
+
+Control (`action`, omit or `"spawn"` to create work):
+
+- Live tree, no handle: `list`, `steer` (`subagent_id` + `message`),
+  `stop` (`subagent_id`).
+- Durable handle from spawn: `status`, `tail`, `wait`, `resume`,
+  `interrupt`, `abandon`. `stop` with a `delegation_id` aliases
+  `interrupt`. Use one bounded `wait` only when the parent must
+  synchronize.
 
 Roles:
 

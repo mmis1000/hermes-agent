@@ -280,6 +280,25 @@ def test_delegate_task_requires_parent_agent_for_control():
     assert "requires a parent agent" in out
 
 
+def test_delegate_task_wait_routes_to_durable_control():
+    out = json.loads(delegate_task(action="wait", parent_agent=_StubParent()))
+    assert out["action"] == "wait"
+    assert out["status"] == "invalid_arguments"
+    assert "delegation_id" in out["error"]
+
+
+def test_delegate_task_stop_with_delegation_id_aliases_interrupt():
+    out = json.loads(
+        delegate_task(
+            action="stop",
+            delegation_id="deleg-missing",
+            parent_agent=_StubParent(),
+        )
+    )
+    assert out["action"] == "interrupt"
+    assert out["status"] == "not_found"
+
+
 def test_empty_tasks_array_with_goal_is_single_task_not_batch_error():
     """Small models emit tasks=[] alongside goal; that must not trip the
     'Batch mode requires at least 2 tasks' gate (observed live with
@@ -301,6 +320,10 @@ def test_spawn_count_zero_for_control_actions():
     assert _subagent_spawn_count({"action": "list"}) == 0
     assert _subagent_spawn_count({"action": "steer", "subagent_id": "x"}) == 0
     assert _subagent_spawn_count({"action": "stop", "subagent_id": "x"}) == 0
+    assert _subagent_spawn_count({"action": "wait", "delegation_id": "d"}) == 0
+    assert _subagent_spawn_count({"action": "status", "delegation_id": "d"}) == 0
+    assert _subagent_spawn_count({"action": "interrupt", "delegation_id": "d"}) == 0
+    assert _subagent_spawn_count({"action": "abandon", "delegation_id": "d"}) == 0
     # Spawn shapes unchanged
     assert _subagent_spawn_count({"goal": "g"}) == 1
     assert _subagent_spawn_count({"action": "spawn", "goal": "g"}) == 1

@@ -98,12 +98,12 @@ def test_delegation_tool_chrome_shows_action_and_message():
     )
     args = {"action": "steer", "message": "Focus on lifecycle tests"}
     d.dispatch(ToolCallChunk(
-        tool_name="delegation",
-        preview=build_tool_preview("delegation", args),
+        tool_name="delegate_task",
+        preview=build_tool_preview("delegate_task", args),
         args=args,
     ))
     assert len(lines) == 1
-    assert 'delegation: "steer: Focus on lifecycle tests"' in lines[0]
+    assert 'delegate_task: "steer: Focus on lifecycle tests"' in lines[0]
 
 
 def test_tool_preview_truncated_to_cap():

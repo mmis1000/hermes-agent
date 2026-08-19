@@ -153,7 +153,7 @@ def process_handoff(session_id: str) -> Dict[str, str]:
 def supported_wait_kind(tool_name: str, args: Dict[str, Any]) -> Optional[str]:
     if tool_name == "terminal" and not bool(args.get("background", False)):
         return "terminal"
-    if tool_name == "delegation" and str(args.get("action") or "").lower() == "wait":
+    if tool_name == "delegate_task" and str(args.get("action") or "").lower() == "wait":
         return "delegation"
     return None
 

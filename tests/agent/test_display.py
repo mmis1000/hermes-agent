@@ -114,12 +114,12 @@ class TestBuildToolPreview:
         ],
     )
     def test_delegation_preview_shows_action_and_relevant_detail(self, action, extra, expected):
-        result = build_tool_preview("delegation", {"action": action, **extra})
+        result = build_tool_preview("delegate_task", {"action": action, **extra})
         assert result == expected
 
     def test_delegation_preview_collapses_multiline_message(self):
         result = build_tool_preview(
-            "delegation",
+            "delegate_task",
             {"action": "steer", "message": "Focus on tests\nthen inspect   the diff"},
         )
         assert result == "steer: Focus on tests then inspect the diff"
@@ -127,7 +127,7 @@ class TestBuildToolPreview:
     def test_delegation_preview_force_redacts_message_secrets(self):
         secret = "sk-proj-abcdefghijklmnopqrstuvwxyz123456"
         result = build_tool_preview(
-            "delegation",
+            "delegate_task",
             {"action": "resume", "message": f"Continue with token {secret}"},
         )
         assert result is not None
@@ -142,7 +142,7 @@ class TestBuildToolPreview:
             "message": f"Use {secret}",
             "reason": f"Superseded after {secret}",
         }
-        safe = redact_tool_args_for_display("delegation", raw)
+        safe = redact_tool_args_for_display("delegate_task", raw)
         assert isinstance(safe, dict)
         assert safe is not raw
         assert secret in raw["message"]
@@ -157,7 +157,7 @@ class TestBuildToolPreview:
         raw_detail = ["Continue", {"token": secret}]
         args = {"action": action, detail_key: raw_detail}
 
-        result = build_tool_preview("delegation", args)
+        result = build_tool_preview("delegate_task", args)
 
         assert result is not None
         assert secret not in result
@@ -167,7 +167,7 @@ class TestBuildToolPreview:
 
     def test_delegation_preview_respects_complete_preview_limit(self):
         result = build_tool_preview(
-            "delegation",
+            "delegate_task",
             {"action": "steer", "message": "A" * 80},
             max_len=24,
         )
@@ -178,12 +178,15 @@ class TestBuildToolPreview:
         "args",
         [{}, {"action": None}, {"action": 123}, {"action": "launch"}],
     )
-    def test_delegation_preview_uses_manage_for_missing_or_malformed_action(self, args):
-        assert build_tool_preview("delegation", args) == "manage"
+    def test_delegate_task_preview_without_control_action_is_spawn(self, args):
+        assert build_tool_preview("delegate_task", args) is None
+
+    def test_delegate_task_preview_uses_goal_for_spawn(self):
+        assert build_tool_preview("delegate_task", {"goal": "Do the thing"}) == "Do the thing"
 
     def test_delegation_preview_normalizes_supported_action(self):
         assert build_tool_preview(
-            "delegation",
+            "delegate_task",
             {"action": "  STEER  ", "message": "Focus on tests"},
         ) == "steer: Focus on tests"
 
@@ -236,11 +239,11 @@ class TestCuteToolMessagePreviewLength:
 
     def test_delegation_completion_shows_action_and_message(self):
         line = get_cute_tool_message(
-            "delegation",
+            "delegate_task",
             {"action": "steer", "message": "Focus on lifecycle tests"},
             0.1,
         )
-        assert line.startswith("┊ 🎛️ control")
+        assert line.startswith("┊ 🔀 delegate")
         assert "steer" in line
         assert "Focus on lifecycle tests" in line
 
@@ -370,11 +373,11 @@ class TestBuildToolLabel:
         from agent.display import build_status_phrase, build_tool_label
 
         args = {"action": "steer", "message": "Focus on lifecycle tests"}
-        assert build_tool_label("delegation", args) == (
-            "Controlling delegation steer: Focus on lifecycle tests"
+        assert build_tool_label("delegate_task", args) == (
+            "Delegating steer: Focus on lifecycle tests"
         )
-        assert build_status_phrase("delegation", args, max_len=100) == (
-            "is controlling delegation steer: Focus on lifecycle tests…"
+        assert build_status_phrase("delegate_task", args, max_len=100) == (
+            "is delegating steer: Focus on lifecycle tests…"
         )
 
     def test_read_file_uses_basename(self):
