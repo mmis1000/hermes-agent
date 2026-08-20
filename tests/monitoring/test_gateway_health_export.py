@@ -5,6 +5,17 @@ import logging
 import pytest
 
 
+def test_background_work_counts_each_live_delegated_task(monkeypatch):
+    from agent.monitoring.gateway_health_export import _read_background_work_count
+    from tools import async_delegation
+    from tools.process_registry import process_registry
+
+    monkeypatch.setattr(async_delegation, "active_task_count", lambda: 2)
+    monkeypatch.setattr(process_registry, "count_running", lambda: 0)
+
+    assert _read_background_work_count() == 2
+
+
 
 
 

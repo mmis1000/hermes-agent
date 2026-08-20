@@ -13,6 +13,35 @@ import pytest
 
 from tools.delegation_repository import DelegationRepository
 
+
+def test_connect_closes_connection_when_schema_bootstrap_fails(
+    tmp_path, monkeypatch
+):
+    from tools import delegation_repository as repository_module
+
+    captured = {}
+    real_connect = sqlite3.connect
+
+    def recording_connect(*args, **kwargs):
+        connection = real_connect(*args, **kwargs)
+        captured["connection"] = connection
+        return connection
+
+    monkeypatch.setattr(repository_module.sqlite3, "connect", recording_connect)
+    monkeypatch.setattr(
+        repository_module,
+        "ensure_state_schema",
+        lambda _connection: (_ for _ in ()).throw(
+            sqlite3.DatabaseError("schema failed")
+        ),
+    )
+
+    with pytest.raises(sqlite3.DatabaseError, match="schema failed"):
+        DelegationRepository(tmp_path / "state.db")._connect()
+
+    with pytest.raises(sqlite3.ProgrammingError):
+        captured["connection"].execute("SELECT 1")
+
 def _released_schema(path: str) -> None:
     conn = sqlite3.connect(path)
     conn.execute(
@@ -600,6 +629,31 @@ def test_retention_protects_active_attempts_and_nonterminal_delivery(repo):
         assert repo.snapshot(delegation_id)["delivery_state"] == state
     for state in ("delivered", "consumed", "suppressed"):
         assert repo.snapshot(f"deleg-{state}") is None
+
+
+def test_prune_ages_terminal_delegation_from_recent_completion(repo):
+    created = repo.register_initial_dispatch(
+        _record("deleg-recent-completion", ["sa-recent"], 1.0)
+    )
+    attempt_id = created["attempts"][0]["attempt_id"]
+    repo.transition_attempt(attempt_id, {"starting"}, "completed")
+    completed_at = time.time()
+    repo.complete_run(
+        created["run_id"],
+        {"status": "completed", "completed_at": completed_at},
+        {"summary": "done"},
+    )
+    repo.acknowledge_pending("deleg-recent-completion")
+    with repo.write_txn() as connection:
+        connection.execute(
+            "UPDATE async_delegations SET updated_at=1 WHERE delegation_id=?",
+            ("deleg-recent-completion",),
+        )
+
+    outcome = repo.prune(cutoff=completed_at - 1, max_terminal=100)
+
+    assert outcome["deleted"] == 0
+    assert repo.snapshot("deleg-recent-completion") is not None
 
 def test_authorized_snapshot_derives_compatibility_fields(repo):
     created = repo.register_initial_dispatch(_record())

@@ -177,11 +177,50 @@ def test_cleanup_revokes_before_reverse_teardown_and_is_idempotent(
     assert current is not None and current.state == "cleaned"
     assert '"cleanup":"succeeded"' in caplog.text
     assert '"environment_owner":"attempt-clean"' in caplog.text
-
     monkeypatch.setattr(terminal_tool, "_create_environment", MagicMock())
     with pytest.raises(ValueError, match="cleaned"):
         terminal_tool.acquire_task_environment(authority.attempt_id)
 
+
+def test_concurrent_cleanup_waits_for_the_inflight_teardown():
+    authority = attempt_scope_registry.reserve(
+        _scope(), "logical-concurrent", attempt_id="attempt-concurrent"
+    )
+    entered = threading.Event()
+    release = threading.Event()
+    second_done = threading.Event()
+    calls = []
+
+    def blocking_cleanup():
+        calls.append("cleanup")
+        entered.set()
+        assert release.wait(timeout=2)
+
+    attempt_scope_registry.add_resource(
+        authority.attempt_id, "resource", blocking_cleanup
+    )
+    first = threading.Thread(
+        target=attempt_scope_registry.cleanup, args=(authority.attempt_id,)
+    )
+
+    def run_second():
+        attempt_scope_registry.cleanup(authority.attempt_id)
+        second_done.set()
+
+    second = threading.Thread(target=run_second)
+    first.start()
+    assert entered.wait(timeout=1)
+    second.start()
+    time.sleep(0.05)
+    assert not second_done.is_set()
+    assert attempt_scope_registry.get(authority.attempt_id).state != "cleaned"
+    release.set()
+    first.join(timeout=2)
+    second.join(timeout=2)
+
+    assert second_done.is_set()
+    assert calls == ["cleanup"]
+    assert attempt_scope_registry.get(authority.attempt_id).state == "cleaned"
 
 def test_protected_force_remove_waits_for_docker_removal(monkeypatch):
     env = docker_env.DockerEnvironment.__new__(docker_env.DockerEnvironment)

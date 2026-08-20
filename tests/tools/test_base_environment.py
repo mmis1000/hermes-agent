@@ -50,6 +50,38 @@ class TestBoundedOutputCollector:
         assert rendered.endswith("[Command timed out after 1s]")
         assert "[OUTPUT TRUNCATED" in rendered
 
+    def test_bounded_foreground_wait_reports_the_spill_file(
+        self, monkeypatch, tmp_path
+    ):
+        class FakeStdout:
+            def __iter__(self):
+                return iter(["x" * 1_000])
+
+            def fileno(self):
+                raise OSError("not a real fd")
+
+            def close(self):
+                pass
+
+        class FakeProcess:
+            stdout = FakeStdout()
+            returncode = 0
+            pid = 123
+
+            @staticmethod
+            def poll():
+                return 0
+
+        monkeypatch.setattr("tools.tool_output_limits.get_max_bytes", lambda: 100)
+        monkeypatch.setattr("tools.environments.base.get_hermes_home", lambda: tmp_path)
+
+        result = _TestableEnv()._wait_for_process(
+            FakeProcess(), timeout=1, bounded_capture=True
+        )
+
+        assert result["output_total_chars"] == 1_000
+        assert result["full_output_path"]
+
 
 class TestWrapCommand:
     def test_basic_shape(self):

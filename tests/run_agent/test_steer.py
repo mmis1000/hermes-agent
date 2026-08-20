@@ -306,10 +306,12 @@ class TestSteerAcceptance:
             outcome_callback=outcomes.append,
         )
 
-        agent._clear_pending_steer("superseded_by_interrupt")
+        agent.interrupt(hard_cancel=True)
+        agent.clear_interrupt()
 
         assert outcomes == ["superseded_by_interrupt"]
         assert agent._pending_steer is None
+        assert agent._pending_steer_envelopes == []
 
 
 class TestSteerDrain:

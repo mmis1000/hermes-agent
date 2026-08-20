@@ -1025,14 +1025,6 @@ def _stored_prompt_matches_runtime(agent, prompt: str) -> bool:
     current_platform = str(getattr(agent, "platform", "") or "").strip()
     if stored_platform and current_platform and stored_platform != current_platform:
         return False
-    stored_skill_scope = line_value("Skill scope")
-    raw_skill_scope = getattr(agent, "skill_scope_task_id", None)
-    current_skill_scope = (
-        raw_skill_scope.strip() if isinstance(raw_skill_scope, str) else ""
-    )
-    if stored_skill_scope != current_skill_scope:
-        return False
-
     return True
 
 
@@ -3491,6 +3483,7 @@ def run_conversation(
                         message_count=len(api_messages),
                         assistant_content_chars=len(_hook_text),
                         assistant_tool_call_count=len(_hook_tool_calls),
+                        moa_references=_moa_reference_metrics_for_hook(agent),
                         _hook_available=True,
                         advance_session_event=True,
                     )
@@ -6629,49 +6622,6 @@ def run_conversation(
                     assistant_message.content = "\n".join(parts)
                 else:
                     assistant_message.content = str(raw)
-
-            try:
-                from hermes_cli.lifecycle import (
-                    has_hook,
-                    invoke_hook as _invoke_hook,
-                )
-                if has_hook("post_api_request"):
-                    _assistant_tool_calls = (
-                        getattr(assistant_message, "tool_calls", None) or []
-                    )
-                    _assistant_text = assistant_message.content or ""
-                    _api_ended_at = api_start_time + api_duration
-                    _invoke_hook(
-                        "post_api_request",
-                        task_id=effective_task_id,
-                        turn_id=turn_id,
-                        api_request_id=api_request_id,
-                        session_id=agent.session_id or "",
-                        platform=agent.platform or "",
-                        model=agent.model,
-                        provider=agent.provider,
-                        base_url=agent.base_url,
-                        api_mode=agent.api_mode,
-                        api_call_count=api_call_count,
-                        api_duration=api_duration,
-                        started_at=api_start_time,
-                        ended_at=_api_ended_at,
-                        finish_reason=finish_reason,
-                        message_count=len(api_messages),
-                        response_model=getattr(response, "model", None),
-                        response=agent._api_response_payload_for_hook(
-                            response,
-                            assistant_message,
-                            finish_reason=finish_reason,
-                        ),
-                        usage=agent._usage_summary_for_api_request_hook(response),
-                        assistant_message=assistant_message,
-                        assistant_content_chars=len(_assistant_text),
-                        assistant_tool_call_count=len(_assistant_tool_calls),
-                        moa_references=_moa_reference_metrics_for_hook(agent),
-                    )
-            except Exception:
-                pass
 
             # Handle assistant response
             if assistant_message.content and not agent.quiet_mode:

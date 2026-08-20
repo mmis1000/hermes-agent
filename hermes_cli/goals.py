@@ -1550,7 +1550,7 @@ class GoalManager:
             max_retries=int(max_retries) if max_retries else DEFAULT_GATE_MAX_RETRIES,
         )
         self._state.gates.append(gate)
-        save_goal(self.session_id, self._state)
+        save_goal(self.session_id, self._state, db=self._db)
         return gate
 
     def remove_gate(self, index_1based: int) -> str:
@@ -1561,7 +1561,7 @@ class GoalManager:
         if idx < 0 or idx >= len(self._state.gates):
             raise IndexError(f"index out of range (1..{len(self._state.gates)})")
         removed = self._state.gates.pop(idx)
-        save_goal(self.session_id, self._state)
+        save_goal(self.session_id, self._state, db=self._db)
         return removed.command
 
     def clear_gates(self) -> int:
@@ -1570,7 +1570,7 @@ class GoalManager:
             raise RuntimeError("no active goal")
         prev = len(self._state.gates)
         self._state.gates = []
-        save_goal(self.session_id, self._state)
+        save_goal(self.session_id, self._state, db=self._db)
         return prev
 
     def render_gates(self) -> str:
@@ -1634,7 +1634,7 @@ class GoalManager:
                 state.paused_reason = (
                     f"quality gate exhausted {gate.attempts - 1} retries: $ {gate.command}"
                 )
-                save_goal(self.session_id, state)
+                save_goal(self.session_id, state, db=self._db)
                 return {
                     "status": "paused",
                     "should_continue": False,
@@ -1649,7 +1649,7 @@ class GoalManager:
                     ),
                 }
 
-            save_goal(self.session_id, state)
+            save_goal(self.session_id, state, db=self._db)
             prompt = CONTINUATION_PROMPT_GATE_FAILED_TEMPLATE.format(
                 goal=state.goal,
                 command=gate.command,
@@ -1670,7 +1670,7 @@ class GoalManager:
                 ),
             }
 
-        save_goal(self.session_id, state)
+        save_goal(self.session_id, state, db=self._db)
         return None
 
     # --- /goal wait barrier -------------------------------------------
@@ -1863,7 +1863,7 @@ class GoalManager:
             if gate_decision.get("should_continue") and state.turns_used >= state.max_turns:
                 state.status = "paused"
                 state.paused_reason = f"turn budget exhausted ({state.turns_used}/{state.max_turns})"
-                save_goal(self.session_id, state)
+                save_goal(self.session_id, state, db=self._db)
                 return {
                     "status": "paused",
                     "should_continue": False,

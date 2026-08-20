@@ -194,6 +194,7 @@ class ResolvedAttemptAuthority:
     backing_registry: Any = None
     prepared_mount_sources: dict[str, str] = field(default_factory=dict)
     task_environment_cleaned: bool = True
+    cleanup_in_progress: bool = False
 
 
 class AttemptScopeRegistry:
@@ -201,6 +202,7 @@ class AttemptScopeRegistry:
 
     def __init__(self) -> None:
         self._lock = threading.RLock()
+        self._condition = threading.Condition(self._lock)
         self._records: dict[str, ResolvedAttemptAuthority] = {}
 
     def reserve(
@@ -316,12 +318,15 @@ class AttemptScopeRegistry:
             return record
 
     def cleanup(self, attempt_id: str) -> tuple[Exception, ...]:
-        with self._lock:
+        with self._condition:
             record = self._records.get(attempt_id)
             if record is None:
                 return ()
+            while record.cleanup_in_progress:
+                self._condition.wait()
             if record.state == "cleaned":
                 return ()
+            record.cleanup_in_progress = True
             record.state = "revoked"
             callbacks = list(record.resources.cleanup_callbacks.items())
             record.resources.cleanup_callbacks.clear()
@@ -339,8 +344,10 @@ class AttemptScopeRegistry:
                     record.resources.cleanup_callbacks[resource_key] = callback
             else:
                 record.resources.cleaned_resources.append(resource_key)
-        with self._lock:
+        with self._condition:
             record.state = "revoked" if errors else "cleaned"
+            record.cleanup_in_progress = False
+            self._condition.notify_all()
         logger.info(
             "delegation_scope_outcome %s",
             json.dumps(

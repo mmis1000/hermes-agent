@@ -3,7 +3,7 @@
 import json
 import sys
 import time
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -35,6 +35,23 @@ def test_gate_roundtrip_through_goalstate_json():
     assert g.timeout_seconds == 42
     assert g.max_retries == 7
     assert g.attempts == 0
+
+
+def test_gate_mutation_uses_the_manager_injected_database(monkeypatch):
+    from hermes_cli import goals
+
+    profile_db = MagicMock()
+    profile_db.get_meta.return_value = None
+    ambient_db = MagicMock()
+    monkeypatch.setattr(goals, "_get_session_db", lambda: ambient_db)
+    manager = GoalManager("profile-session", db=profile_db)
+    manager.set("ship it")
+    profile_db.set_meta.reset_mock()
+
+    manager.add_gate("true")
+
+    profile_db.set_meta.assert_called_once()
+    ambient_db.set_meta.assert_not_called()
 
 
 def test_gate_from_dict_defaults_and_garbage():

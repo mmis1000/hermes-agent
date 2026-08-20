@@ -924,6 +924,109 @@ def test_batch_persistence_failure_removes_partial_record_and_submits_no_runner(
     assert ad.get_durable_delegation("deleg-persist-failure") is None
 
 
+def test_single_persistence_failure_removes_partial_record_and_submits_no_runner(
+    monkeypatch,
+):
+    started = threading.Event()
+    monkeypatch.setattr(
+        ad,
+        "_persist_dispatch",
+        lambda _record: (_ for _ in ()).throw(RuntimeError("persistence failed")),
+    )
+
+    result = ad.dispatch_async_delegation(
+        goal="never ran",
+        context=None,
+        toolsets=None,
+        role="leaf",
+        model="m",
+        session_key="owner",
+        runner=lambda: started.set() or {},
+    )
+
+    assert result["status"] == "rejected"
+    assert result["reason"] == "dispatch_setup_failed"
+    assert not started.is_set()
+    assert ad.active_count() == 0
+
+
+def test_single_dispatch_accepts_origin_api_session(monkeypatch):
+    class InlineExecutor:
+        @staticmethod
+        def submit(callback):
+            callback()
+
+    monkeypatch.setattr(ad, "_persist_dispatch", lambda _record: None)
+    monkeypatch.setattr(ad, "_push_completion_event", lambda *_args: None)
+    monkeypatch.setattr(ad, "_get_executor", lambda _limit: InlineExecutor())
+
+    result = ad.dispatch_async_delegation(
+        goal="work",
+        context=None,
+        toolsets=None,
+        role="leaf",
+        model="m",
+        session_key="owner",
+        origin_session_id="api-session",
+        runner=lambda: {"status": "completed"},
+    )
+
+    assert result["status"] == "dispatched"
+
+
+def test_permanently_undeliverable_claim_becomes_terminally_suppressed(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    record = {
+        "delegation_id": "deleg-no-target",
+        "session_key": "owner",
+        "origin_ui_session_id": "",
+        "parent_session_id": None,
+        "dispatched_at": 1.0,
+    }
+    ad._persist_dispatch(record)
+    ad._persist_completion(
+        {
+            "delegation_id": record["delegation_id"],
+            "run_id": record["run_id"],
+            "status": "completed",
+            "completed_at": 2.0,
+        },
+        {"status": "completed", "summary": "done"},
+    )
+    assert ad.claim_completion_delivery(
+        record["delegation_id"], "claim-no-target", run_id=record["run_id"]
+    )
+
+    assert ad.drop_completion_delivery(
+        record["delegation_id"], "claim-no-target", run_id=record["run_id"]
+    )
+    delivery = ad._repository().inspect_delivery(
+        record["delegation_id"], record["run_id"]
+    )
+    assert delivery["delivery_state"] == "suppressed"
+    assert delivery["delivery_claim"] is None
+
+
+def test_batch_rejected_completion_releases_finalizing_slot(monkeypatch):
+    delegation_id = "deleg-stale-batch"
+    ad._records[delegation_id] = {
+        "delegation_id": delegation_id,
+        "run_id": "run-stale",
+        "session_key": "owner",
+        "status": "running",
+        "dispatched_at": 1.0,
+        "interrupt_fn": None,
+    }
+    monkeypatch.setattr(ad, "_persist_completion", lambda *_args: False)
+
+    ad._finalize_batch(delegation_id, {"results": []}, "completed")
+
+    assert ad._records[delegation_id]["status"] == "completed"
+    assert ad.active_count() == 0
+
+
 def test_batch_bind_failure_removes_durable_record_and_submits_no_runner(
     tmp_path, monkeypatch
 ):

@@ -1584,6 +1584,36 @@ class TestHandleProcessRedaction:
         assert "sk-proj-AAAABBBBCCCCDDDDEEEEFFFFGGGG" not in entry["output_preview"]
         assert "curl" in entry["command"]
 
+    def test_protected_list_does_not_include_session_sibling_processes(
+        self, monkeypatch
+    ):
+        from tools import process_registry as pr
+
+        reg = ProcessRegistry()
+        child = _make_session(sid="proc_child", task_id="attempt-child")
+        parent = _make_session(sid="proc_parent", task_id="parent-task")
+        child.session_key = parent.session_key = "shared-session"
+        reg._running[child.id] = child
+        reg._running[parent.id] = parent
+        monkeypatch.setattr(pr, "process_registry", reg)
+        monkeypatch.setattr(
+            "tools.approval.get_current_session_key",
+            lambda default="": "shared-session",
+        )
+        authority = MagicMock(state="active")
+        monkeypatch.setattr(
+            "tools.delegation_scope.attempt_scope_registry.get",
+            lambda task_id: authority if task_id == "attempt-child" else None,
+        )
+
+        out = json.loads(
+            pr._handle_process({"action": "list"}, task_id="attempt-child")
+        )
+
+        assert {item["session_id"] for item in out["processes"]} == {
+            "proc_child"
+        }
+
     def test_disabled_passes_through(self, monkeypatch):
         import agent.redact as _r
         monkeypatch.setattr(_r, "_REDACT_ENABLED", False)

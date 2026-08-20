@@ -388,19 +388,10 @@ def get_tool_definitions(
                 _is_delegated_child_context(),
                 _is_dispatcher_owned_worker(),
                 profile_scope,
+                policy_fingerprint,
             )
         with _tool_defs_cache_lock:
             cached = _tool_defs_cache.get(cache_key) if cache_key is not None else None
-        cache_key = (
-            frozenset(enabled_toolsets) if enabled_toolsets is not None else None,
-            frozenset(disabled_toolsets) if disabled_toolsets else None,
-            registry._generation,
-            cfg_fp,
-            bool(os.environ.get("HERMES_KANBAN_TASK")),
-            bool(skip_tool_search_assembly),
-            policy_fingerprint,
-        )
-        cached = _tool_defs_cache.get(cache_key)
         if cached is not None:
             # Update _last_resolved_tool_names so downstream callers see
             # consistent state even on a cache hit.

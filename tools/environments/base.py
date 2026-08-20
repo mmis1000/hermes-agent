@@ -1094,7 +1094,6 @@ class BaseEnvironment(ABC):
             except Exception:
                 spill_path = None
         output = _BoundedOutputCollector(capture_limit, spill_path=spill_path)
-        output = _BoundedOutputCollector(capture_limit)
         adoption_lock = threading.Lock()
         adopted_session = None
         handoff_failed = False

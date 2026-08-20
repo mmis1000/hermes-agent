@@ -131,6 +131,47 @@ def test_distinct_runs_of_one_delegation_are_delivered_once_each():
     assert adapter.handle_message.await_count == 2
 
 
+def test_terminal_target_drops_the_exact_resumed_run(monkeypatch):
+    from tools import async_delegation
+
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    runner = _runner(adapter)
+    runner._classify_completion_target = AsyncMock(return_value="terminal")
+    captured = {}
+    monkeypatch.setattr(
+        async_delegation,
+        "get_durable_delegation",
+        lambda _delegation_id: {"status": "completed"},
+    )
+    monkeypatch.setattr(
+        async_delegation,
+        "claim_completion_delivery",
+        lambda _delegation_id, _claim_id, **scope: captured.setdefault(
+            "claimed", scope
+        )
+        is not None,
+    )
+
+    def drop(_delegation_id, _claim_id, **scope):
+        captured["dropped"] = scope
+        return True
+
+    monkeypatch.setattr(async_delegation, "drop_completion_delivery", drop)
+    event = _async_event("deleg-resumed-terminal") | {
+        "run_id": "run-resumed",
+        "parent_session_id": "gone-parent",
+    }
+
+    result = asyncio.run(
+        runner._deliver_completion_notification("finished", event)
+    )
+
+    assert result is None
+    assert captured["claimed"] == {"run_id": "run-resumed"}
+    assert captured["dropped"] == {"run_id": "run-resumed"}
+    adapter.handle_message.assert_not_awaited()
+
+
 def test_gateway_idle_watcher_restores_only_gateway_routable_wait_holds(
     monkeypatch, isolated_registry,
 ):

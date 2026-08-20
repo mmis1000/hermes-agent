@@ -117,6 +117,35 @@ def test_micro_judge_malformed_timeout_and_provider_failure_are_conservative(act
     assert "provider URL" not in str(failed.raw_payload)
 
 
+def test_micro_judge_oversized_payload_fails_open(active_state):
+    from hermes_cli.task_intent_micro_judge import (
+        TaskIntentMicroJudge,
+        TaskIntentMicroJudgeConfig,
+    )
+
+    judge = TaskIntentMicroJudge(
+        config=TaskIntentMicroJudgeConfig(
+            enabled=True,
+            max_primary_chars=1_200,
+            max_message_chars=1_200,
+            max_prompt_chars=1_200,
+        ),
+        llm_call=lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("oversized payload must not call the model")
+        ),
+    )
+
+    decision = judge.judge(
+        state=active_state,
+        current_message="x" * 2_000,
+        source_kind="direct_user",
+    )
+
+    assert decision.relationship == "unclear"
+    assert decision.state_effect == "no_change"
+    assert decision.raw_payload["error_type"] == "ValueError"
+
+
 def test_micro_judge_source_authority_and_high_impact_evidence(active_state):
     from hermes_cli.task_intent_micro_judge import TaskIntentMicroJudge
 

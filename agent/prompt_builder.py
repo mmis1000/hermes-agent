@@ -1883,6 +1883,12 @@ def build_skills_system_prompt(
 
             skills_by_category: dict[str, list[tuple[str, str]]] = {}
             for skill in _effective_skills(task_id=task_id):
+                if not _skill_should_show(
+                    skill.get("conditions") or {},
+                    available_tools,
+                    available_toolsets,
+                ):
+                    continue
                 skills_by_category.setdefault(skill.get("category") or "general", []).append(
                     (skill["name"], skill.get("description", ""))
                 )
