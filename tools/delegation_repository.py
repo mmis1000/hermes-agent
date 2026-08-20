@@ -153,6 +153,9 @@ class DelegationRepository:
                 if "locked" not in str(exc).lower() or attempt == 19:
                     raise
                 time.sleep(0.02 * (attempt + 1))
+            except BaseException:
+                conn.close()
+                raise
         raise AssertionError("unreachable")
 
     @contextmanager
@@ -1353,7 +1356,30 @@ class DelegationRepository:
     def prune(self, *, cutoff: float, max_terminal: int) -> Dict[str, Any]:
         with self.write_txn() as conn:
             candidates = conn.execute(
-                "SELECT d.delegation_id,d.updated_at FROM async_delegations d\n                   WHERE NOT EXISTS (SELECT 1 FROM delegation_attempts a\n                       JOIN delegation_logical_subagents l ON l.logical_id=a.logical_id\n                       WHERE l.delegation_id=d.delegation_id\n                         AND a.state IN ('starting','running','finalizing','interrupt_requested'))\n                     AND NOT EXISTS (SELECT 1 FROM delegation_runs r\n                       WHERE r.delegation_id=d.delegation_id\n                         AND (r.completed_at IS NULL OR r.delivery_state NOT IN\n                           ('delivered','consumed','suppressed')))\n                   ORDER BY d.updated_at DESC"
+                "SELECT d.delegation_id,\n"
+                "       MAX(d.updated_at,\n"
+                "           COALESCE((SELECT MAX(a.completed_at)\n"
+                "                     FROM delegation_attempts a\n"
+                "                     JOIN delegation_logical_subagents l\n"
+                "                       ON l.logical_id=a.logical_id\n"
+                "                    WHERE l.delegation_id=d.delegation_id),0),\n"
+                "           COALESCE((SELECT MAX(r.completed_at)\n"
+                "                     FROM delegation_runs r\n"
+                "                    WHERE r.delegation_id=d.delegation_id),0),\n"
+                "           COALESCE((SELECT MAX(r.delivered_at)\n"
+                "                     FROM delegation_runs r\n"
+                "                    WHERE r.delegation_id=d.delegation_id),0))\n"
+                "         AS activity_at\n"
+                "  FROM async_delegations d\n"
+                " WHERE NOT EXISTS (SELECT 1 FROM delegation_attempts a\n"
+                "       JOIN delegation_logical_subagents l ON l.logical_id=a.logical_id\n"
+                "       WHERE l.delegation_id=d.delegation_id\n"
+                "         AND a.state IN ('starting','running','finalizing','interrupt_requested'))\n"
+                "   AND NOT EXISTS (SELECT 1 FROM delegation_runs r\n"
+                "       WHERE r.delegation_id=d.delegation_id\n"
+                "         AND (r.completed_at IS NULL OR r.delivery_state NOT IN\n"
+                "           ('delivered','consumed','suppressed')))\n"
+                " ORDER BY activity_at DESC"
             ).fetchall()
             keep = max(0, int(max_terminal))
             delete_ids = [str(row[0]) for index, row in enumerate(candidates) if float(row[1]) < cutoff or index >= keep]

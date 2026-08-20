@@ -92,6 +92,31 @@ class TestPluginSkillRegistry:
         assert pm.list_plugin_skills("myplugin") == ["bar", "baz", "foo"]
         assert pm.list_plugin_skills("other") == []
 
+    def test_skills_list_includes_registered_plugin_skills(
+        self, pm, tmp_path, monkeypatch
+    ):
+        from tools import skills_tool
+
+        skill_md = tmp_path / "foo" / "SKILL.md"
+        skill_md.parent.mkdir()
+        skill_md.write_text("---\nname: foo\n---\nBody.\n")
+        pm._plugin_skills["myplugin:foo"] = {
+            "path": skill_md,
+            "plugin": "myplugin",
+            "bare_name": "foo",
+            "description": "plugin skill",
+        }
+        empty_skills = tmp_path / "ordinary-skills"
+        empty_skills.mkdir()
+        monkeypatch.setattr(skills_tool, "_skills_dir", lambda: empty_skills)
+        monkeypatch.setattr("agent.skill_utils.get_external_skills_dirs", lambda: [])
+        monkeypatch.setattr("hermes_cli.plugins.discover_plugins", lambda: None)
+        skills_tool._SKILLS_CACHE.clear()
+
+        listed = json.loads(skills_tool.skills_list())
+
+        assert "myplugin:foo" in {skill["name"] for skill in listed["skills"]}
+
     def test_remove_plugin_skill(self, pm, tmp_path):
         md = tmp_path / "SKILL.md"
         md.write_text("---\nname: x\n---\n")

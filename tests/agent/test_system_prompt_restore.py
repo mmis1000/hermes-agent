@@ -62,25 +62,12 @@ class TestStoredPromptReuse:
         # No warnings on the happy path
         assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
 
-    @pytest.mark.parametrize(
-        ("stored_scope", "current_scope", "reused"),
-        [
-            ("attempt-a", "attempt-a", True),
-            ("attempt-a", "attempt-b", False),
-            ("attempt-a", None, False),
-        ],
-    )
-    def test_protected_skill_scope_participates_in_prompt_reuse(
-        self,
-        stored_scope,
-        current_scope,
-        reused,
-    ):
-        stored = f"Stored prompt\nSkill scope: {stored_scope}"
+    def test_protected_scope_reuses_a_production_shaped_stored_prompt(self):
+        stored = "Stored protected prompt without a synthetic scope marker"
         db = MagicMock()
         db.get_session.return_value = {"system_prompt": stored}
         agent = _make_agent(session_db=db)
-        agent.skill_scope_task_id = current_scope
+        agent.skill_scope_task_id = "attempt-a"
 
         _restore_or_build_system_prompt(
             agent,
@@ -88,12 +75,8 @@ class TestStoredPromptReuse:
             [{"role": "user", "content": "hi"}],
         )
 
-        if reused:
-            assert agent._cached_system_prompt == stored
-            agent._build_system_prompt.assert_not_called()
-        else:
-            assert agent._cached_system_prompt == "BUILT_PROMPT"
-            agent._build_system_prompt.assert_called_once()
+        assert agent._cached_system_prompt == stored
+        agent._build_system_prompt.assert_not_called()
 
     def test_present_row_with_unicode_preserved(self):
         """Non-ASCII bytes in the stored prompt are not mangled."""

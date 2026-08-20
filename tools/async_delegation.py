@@ -889,6 +889,19 @@ def complete_completion_delivery(
     )
 
 
+def drop_completion_delivery(
+    delegation_id: str, claim_id: str, *, run_id: Optional[str] = None
+) -> bool:
+    """Terminally suppress an exact claimed completion with no live target."""
+    inspected = _repository().inspect_delivery(delegation_id, run_id)
+    if inspected.get("status") != "found":
+        return False
+    outcome = _repository().commit_run_delivery(
+        str(inspected["run_id"]), claim_id, disposition="suppressed"
+    )
+    return _changed(outcome, "suppressed")
+
+
 def finish_async_delivery(
     delegation_id: str,
     token: str,
@@ -1428,6 +1441,45 @@ def active_count() -> int:
         return sum(1 for r in _records.values() if r.get("status") in _ACTIVE_STATES)
 
 
+def active_task_count() -> int:
+    """Number of active child tasks, expanding a batch to its child count."""
+    with _records_lock:
+        total = 0
+        for record in _records.values():
+            if record.get("status") not in _ACTIVE_STATES:
+                continue
+            goals = record.get("goals") if record.get("is_batch") else None
+            total += len(goals) if isinstance(goals, (list, tuple)) and goals else 1
+        return total
+
+
+def has_live_for_session(
+    session_key: str = "",
+    origin_ui_session_id: str = "",
+    parent_session_id: str = "",
+) -> bool:
+    """Return whether any active record belongs to the selected session."""
+    if not session_key and not origin_ui_session_id and not parent_session_id:
+        return False
+    with _records_lock:
+        return any(
+            record.get("status") in _ACTIVE_STATES
+            and (
+                (session_key and record.get("session_key") == session_key)
+                or (
+                    origin_ui_session_id
+                    and record.get("origin_ui_session_id")
+                    == origin_ui_session_id
+                )
+                or (
+                    parent_session_id
+                    and record.get("parent_session_id") == parent_session_id
+                )
+            )
+            for record in _records.values()
+        )
+
+
 def _new_delegation_id() -> str:
     return f"deleg_{uuid.uuid4().hex[:8]}"
 
@@ -1450,6 +1502,18 @@ def _prune_completed_locked() -> None:
         _records.pop(rid, None)
 
 
+def _current_origin_session_id() -> str:
+    """Return the originating API-server session id without child-id leakage."""
+    try:
+        from gateway.session_context import get_session_env
+
+        if get_session_env("HERMES_SESSION_PLATFORM", "") != "api_server":
+            return ""
+        return get_session_env("HERMES_SESSION_CHAT_ID", "") or ""
+    except Exception:
+        return ""
+
+
 def dispatch_async_delegation(
     *,
     goal: str,
@@ -1461,6 +1525,7 @@ def dispatch_async_delegation(
     parent_session_id: Optional[str] = None,
     runner: Callable[[], Dict[str, Any]],
     origin_ui_session_id: str = "",
+    origin_session_id: str = "",
     interrupt_fn: Optional[Callable[[], None]] = None,
     root_subagent_ids: Optional[List[str]] = None,
     max_async_children: int = _DEFAULT_MAX_ASYNC_CHILDREN,
@@ -1510,6 +1575,7 @@ def dispatch_async_delegation(
         "model": model,
         "session_key": session_key,
         "origin_ui_session_id": origin_ui_session_id,
+        "origin_session_id": origin_session_id,
         "parent_session_id": parent_session_id,
         "status": "running",
         "dispatched_at": dispatched_at,
@@ -1538,7 +1604,17 @@ def dispatch_async_delegation(
             }
         _records[delegation_id] = record
 
-    _persist_dispatch(record)
+    try:
+        _persist_dispatch(record)
+    except Exception as exc:
+        with _records_lock:
+            _records.pop(delegation_id, None)
+        _delete_durable_delegation(delegation_id)
+        return {
+            "status": "rejected",
+            "reason": "dispatch_setup_failed",
+            "error": f"Failed to establish durable async delegation: {exc}",
+        }
     executor = _get_executor(max_async_children)
 
     def _worker() -> None:
@@ -1636,6 +1712,7 @@ def _push_completion_event(
         # session; empty string => CLI (single-session) path.
         "session_key": record.get("session_key", ""),
         "origin_ui_session_id": record.get("origin_ui_session_id", ""),
+        "origin_session_id": record.get("origin_session_id", ""),
         "parent_session_id": record.get("parent_session_id"),
         "goal": record.get("goal", ""),
         "context": record.get("context"),
@@ -1842,6 +1919,11 @@ def _finalize_batch(
             "failed; result lost: %s",
             delegation_id, exc,
         )
+        with _records_lock:
+            record = _records.get(delegation_id)
+            if record is not None:
+                record["status"] = status
+            _prune_completed_locked()
         return
 
     dispatched_at = event_record.get("dispatched_at") or time.time()
@@ -1879,6 +1961,11 @@ def _finalize_batch(
             "Async delegation batch %s rejected stale completion for run %s",
             delegation_id, event_record.get("run_id"),
         )
+        with _records_lock:
+            record = _records.get(delegation_id)
+            if record is not None:
+                record["status"] = status
+            _prune_completed_locked()
         return
     try:
         process_registry.completion_queue.put(evt)

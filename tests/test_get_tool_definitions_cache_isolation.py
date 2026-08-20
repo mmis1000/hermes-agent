@@ -34,6 +34,30 @@ def _clear_cache():
 
 class TestQuietModeCacheIsolation:
 
+    def test_cache_key_separates_runtime_scopes(self, monkeypatch):
+        scope = {"key": "parent"}
+
+        monkeypatch.setattr(
+            model_tools.registry, "current_scope_key", lambda: scope["key"]
+        )
+        monkeypatch.setattr(model_tools, "check_fn_cache_scope", lambda: "profile")
+        monkeypatch.setattr(
+            model_tools,
+            "_compute_tool_definitions",
+            lambda *_args, **_kwargs: [{
+                "type": "function",
+                "function": {"name": scope["key"]},
+            }],
+        )
+
+        parent = model_tools.get_tool_definitions(quiet_mode=True)
+        scope["key"] = "child"
+        child = model_tools.get_tool_definitions(quiet_mode=True)
+
+        assert parent[0]["function"]["name"] == "parent"
+        assert child[0]["function"]["name"] == "child"
+        assert len(model_tools._tool_defs_cache) == 2
+
     def test_first_uncached_call_returns_fresh_list(self):
         """The first quiet_mode call must not alias the cached object \u2014
         otherwise a caller mutating the returned list mutates the cache."""

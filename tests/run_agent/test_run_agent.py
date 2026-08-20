@@ -2993,10 +2993,10 @@ class TestRunConversation:
         with (
             patch("run_agent.handle_function_call", return_value="search result"),
             patch(
-                "hermes_cli.lifecycle.has_hook",
+                "hermes_cli.plugins.has_hook",
                 side_effect=lambda name: name in {"pre_api_request", "post_api_request"},
             ),
-            patch("hermes_cli.lifecycle.invoke_hook", side_effect=_record_hook),
+            patch("hermes_cli.plugins.invoke_hook", side_effect=_record_hook),
             patch.object(agent, "_persist_session"),
             patch.object(agent, "_save_trajectory"),
             patch.object(agent, "_cleanup_task_resources"),
@@ -3019,6 +3019,7 @@ class TestRunConversation:
         assert [call["api_request_id"] for call in pre_request_calls] == [
             call["api_request_id"] for call in post_request_calls
         ]
+        assert len({call["api_request_id"] for call in post_request_calls}) == 2
         assert all("message_count" in c and isinstance(c.get("request_messages"), list) for c in pre_request_calls)
         assert all("request" in c and "messages" in c["request"]["body"] for c in pre_request_calls)
         assert any(msg.get("role") == "user" and msg.get("content") == "search something" for msg in pre_request_calls[0]["request_messages"])

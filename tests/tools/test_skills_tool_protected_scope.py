@@ -284,6 +284,37 @@ def test_protected_prompt_uses_same_specific_skill_catalog(tmp_path, monkeypatch
     assert "unselected skill" not in prompt
 
 
+def test_protected_prompt_hides_granted_skill_with_missing_toolset(
+    tmp_path, monkeypatch
+):
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    global_skills = tmp_path / "global-skills"
+    skill_dir = global_skills / "conditional"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        "---\nname: conditional\ndescription: conditional skill\n"
+        "metadata:\n  hermes:\n    requires_toolsets: [terminal]\n---\nBody.\n",
+        encoding="utf-8",
+    )
+    authority = _protected_authority(repository, skill_names={"conditional"})
+    monkeypatch.setattr(
+        "tools.delegation_scope.attempt_scope_registry.get",
+        lambda task_id: authority if task_id == "protected-attempt" else None,
+    )
+    monkeypatch.setattr(skills_tool, "_skills_dir", lambda: global_skills)
+    monkeypatch.setattr("agent.skill_utils.get_external_skills_dirs", lambda: [])
+    skills_tool._SKILLS_CACHE.clear()
+
+    prompt = build_skills_system_prompt(
+        available_tools={"skill_view"},
+        available_toolsets={"skills"},
+        task_id="protected-attempt",
+    )
+
+    assert "conditional skill" not in prompt
+
+
 def test_visible_skill_file_is_automatically_listed_and_viewable(tmp_path, monkeypatch):
     global_skills = tmp_path / "global-skills"
     skill_dir = _write_skill(global_skills, "file-visible", "visible file")

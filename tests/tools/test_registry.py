@@ -689,6 +689,23 @@ class TestDeregisterAuthorization:
             reg.deregister("protected")
         assert reg._tools.get("protected") is None
 
+    def test_core_code_can_explicitly_replace_a_cross_toolset_registration(self):
+        reg = self._reg()
+        replacement = lambda *_args, **_kwargs: "replacement"
+
+        with patch.object(
+            ToolRegistry, "_caller_module", return_value="tools.mcp_tool"
+        ):
+            reg.register(
+                name="protected",
+                toolset="replacement-toolset",
+                schema={},
+                handler=replacement,
+                override=True,
+            )
+
+        assert reg._tools["protected"].handler({}) == "replacement"
+
     def test_full_bypass_blocked(self):
         """The original bypass: deregister then plain register no longer works."""
         reg = self._reg()

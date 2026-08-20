@@ -814,25 +814,6 @@ class ToolRegistry:
                     f"{operator_provenance!r}"
                 )
             if existing and existing.toolset != toolset:
-                # Allow MCP-to-MCP overwrites (legitimate: server refresh,
-                # or two MCP servers with overlapping tool names).
-                both_mcp = (
-                    existing.toolset.startswith("mcp-")
-                    and toolset.startswith("mcp-")
-                )
-                if both_mcp:
-                    logger.debug(
-                        "Tool '%s': MCP toolset '%s' overwriting MCP toolset '%s'",
-                        name, toolset, existing.toolset,
-                    )
-                    return
-                if not self._plugin_override_allowed(scope, owner):
-                    raise PermissionError(
-                        f"Plugin module {owner!r} cannot override built-in "
-                        f"tool {name!r} without operator opt-in "
-                        f"(allow_tool_override)."
-                    )
-            if existing and existing.toolset != toolset:
                 if override:
                     if owner is not None and not self._plugin_override_allowed(
                         scope, owner

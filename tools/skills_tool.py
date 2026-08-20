@@ -951,8 +951,6 @@ def _find_all_skills(
     # dirs_to_scan already resolved above for the signature. Project dirs
     # iterate through the quarantine chokepoint (scan-time injection gate).
     for scan_dir in dirs_to_scan:
-        if task_id and _protected_skill_path_allowed(task_id, scan_dir) is not True:
-            continue
         _is_project = scan_dir in project_dirs
         _iter = (
             iter_project_skill_files(scan_dir)
@@ -997,10 +995,13 @@ def _find_all_skills(
                 category = _get_category_from_path(skill_md)
 
                 seen_names.add(name)
+                from agent.skill_utils import extract_skill_conditions
+
                 skills.append({
                     "name": name,
                     "description": description,
                     "category": category,
+                    "conditions": extract_skill_conditions(frontmatter),
                 })
 
             except (UnicodeDecodeError, PermissionError) as e:
@@ -1096,6 +1097,16 @@ def skills_list(category: str = None, task_id: str = None) -> str:
             task_id=task_id,
             candidate_dirs=candidate_dirs,
         )
+        if not task_id:
+            from hermes_cli.plugins import discover_plugins, get_plugin_manager
+
+            discover_plugins()
+            seen_names = {skill["name"] for skill in all_skills}
+            all_skills.extend(
+                skill
+                for skill in get_plugin_manager().list_plugin_skill_metadata()
+                if skill["name"] not in seen_names
+            )
 
         if not all_skills:
             return json.dumps(
@@ -1111,6 +1122,11 @@ def skills_list(category: str = None, task_id: str = None) -> str:
         # Filter by category if specified
         if category:
             all_skills = [s for s in all_skills if s.get("category") == category]
+
+        all_skills = [
+            {key: value for key, value in skill.items() if key != "conditions"}
+            for skill in all_skills
+        ]
 
         # Sort by category then name
         all_skills = _sort_skills(all_skills)

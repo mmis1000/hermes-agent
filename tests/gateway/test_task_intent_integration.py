@@ -336,3 +336,23 @@ def test_pre_send_guard_buffers_final_streaming_and_fails_open():
         side_effect=RuntimeError("config unavailable")
     )
     assert runner._pre_send_status_guard_allows_final_streaming() is True
+
+
+@pytest.mark.asyncio
+async def test_disabled_pre_send_guard_is_a_noop_on_the_gateway_path():
+    from gateway.run import GatewayRunner
+
+    runner = object.__new__(GatewayRunner)
+    runner._load_pre_send_status_guard_config = MagicMock(
+        return_value=SimpleNamespace(enabled=False)
+    )
+
+    decision = await runner._judge_pre_send_status(
+        response="done",
+        agent_messages=[],
+        session_id="session-1",
+        session_key="discord:thread-1",
+        platform="discord",
+    )
+
+    assert decision is None

@@ -581,7 +581,6 @@ def _truncate_with_footer(
         tail = tail[nl + 1:]
 
     total = len(content)
-    stored_path = _store_full_text(url, content)
     stored_path = _store_full_text(url, content, task_id=task_id)
     shown = len(head) + len(tail)
 

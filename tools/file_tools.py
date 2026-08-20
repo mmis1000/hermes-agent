@@ -1527,9 +1527,6 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 2000, task_id: str =
             MAX_DOCUMENT_BYTES,
             ExtractionError,
             extract_document_bytes,
-            ExtractionError,
-            extract_document_bytes,
-            extract_document_text,
             is_extractable_document,
         )
 
@@ -1548,20 +1545,6 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 2000, task_id: str =
                     document_bytes, str(_resolved)
                 )
             except (ExtractionError, ValueError, base64.binascii.Error) as exc:
-                from tools.delegation_scope import attempt_scope_registry
-
-                protected_authority = attempt_scope_registry.get(task_id)
-                file_ops = _get_file_ops(task_id)
-                if protected_authority is not None:
-                    document_bytes = file_ops.read_bytes(str(_resolved))
-                    extracted_text = extract_document_bytes(
-                        document_bytes, str(_resolved)
-                    )
-                    extracted_size = len(document_bytes)
-                else:
-                    extracted_text = extract_document_text(str(_resolved))
-                    extracted_size = os.path.getsize(_resolved)
-            except (ExtractionError, OSError):
                 logger.debug("document extraction failed for %s", path, exc_info=True)
                 # For binary document formats, surface the specific failure
                 # (size cap, encrypted, malformed…) instead of falling through
@@ -1595,7 +1578,6 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 2000, task_id: str =
                     "content": file_ops._add_line_numbers(page_text, offset) if page_text else "",
                     "total_lines": total_lines,
                     "file_size": binary.file_size,
-                    "file_size": extracted_size,
                     "truncated": total_lines > end_line,
                     "extracted_document": True,
                 }

@@ -6611,7 +6611,6 @@ def _track_mcp_tool_server(tool_name: str, server_name: str) -> None:
     """Remember the exact raw MCP server that registered *tool_name*."""
     with _lock:
         _mcp_tool_server_names[tool_name] = server_name
-        _mcp_tool_server_names[tool_name] = safe_server_name
         _mcp_tool_server_qualifications[tool_name] = server_name
 
 

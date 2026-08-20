@@ -3245,6 +3245,15 @@ def _handle_process(args, **kw):
             session_key = get_current_session_key(default="") or ""
         except Exception:
             session_key = ""
+        from tools.delegation_scope import attempt_scope_registry
+
+        caller_authority = attempt_scope_registry.get(task_id or "")
+        if caller_authority is not None:
+            if caller_authority.state not in {"starting", "active"}:
+                return tool_error(
+                    f"protected process authority is {caller_authority.state}"
+                )
+            session_key = ""
         return json.dumps(
             {
                 "processes": [

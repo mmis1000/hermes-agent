@@ -40,6 +40,18 @@ class TestTruncation:
         assert out == content
         assert truncated is False
 
+    def test_scoped_truncation_stores_the_full_text_once(self):
+        body = "x" * 20_000
+        with patch.object(wt, "_store_full_text", return_value="/tmp/full.txt") as store:
+            _out, truncated = wt._truncate_with_footer(
+                body, "https://example.com/doc", 3_000, task_id="attempt-1"
+            )
+
+        assert truncated is True
+        store.assert_called_once_with(
+            "https://example.com/doc", body, task_id="attempt-1"
+        )
+
 
     def test_truncation_stores_full_text_readable(self, tmp_path, monkeypatch):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))

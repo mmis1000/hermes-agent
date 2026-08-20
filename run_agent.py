@@ -3539,10 +3539,7 @@ class AIAgent:
         # meant for the agent's next tool-call iteration, which will no
         # longer happen. Drop it instead of surprising the user with a
         # late injection on the post-interrupt turn.
-        _steer_lock = getattr(self, "_pending_steer_lock", None)
-        if _steer_lock is not None:
-            with _steer_lock:
-                self._pending_steer = None
+        self._clear_pending_steer("superseded_by_interrupt")
         return True
 
     def _steer_queue_unlocked(self) -> list:
