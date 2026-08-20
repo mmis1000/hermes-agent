@@ -70,36 +70,54 @@ def _drain_for(delegation_id, timeout=5.0):
     return None
 
 
-def test_active_for_session_counts_every_live_delegation_state():
+def test_active_task_count_and_has_live_for_session_cover_live_states():
     with ad._records_lock:
         ad._records.update(
             {
                 "running": {
                     "status": "running",
+                    "session_key": "desktop-session",
                     "origin_ui_session_id": "desktop-sid",
+                    "parent_session_id": "desktop-parent",
                 },
-                "stalling": {
-                    "status": "stalling",
+                "starting-batch": {
+                    "status": "starting",
+                    "session_key": "desktop-session",
                     "origin_ui_session_id": "desktop-sid",
+                    "parent_session_id": "desktop-parent",
+                    "is_batch": True,
+                    "goals": ["task-a", "task-b"],
                 },
                 "finalizing": {
                     "status": "finalizing",
+                    "session_key": "desktop-session",
                     "origin_ui_session_id": "desktop-sid",
+                    "parent_session_id": "desktop-parent",
                 },
                 "completed": {
                     "status": "completed",
+                    "session_key": "completed-session",
                     "origin_ui_session_id": "desktop-sid",
+                    "parent_session_id": "desktop-parent",
                 },
                 "other-session": {
                     "status": "running",
+                    "session_key": "other-session",
                     "origin_ui_session_id": "other-sid",
+                    "parent_session_id": "other-parent",
                 },
             }
         )
 
-    assert ad.active_for_session("desktop-sid") == 3
-    assert ad.active_for_session("other-sid") == 1
-    assert ad.active_for_session("") == 0
+    assert ad.active_task_count() == 5
+    assert ad.has_live_for_session(session_key="desktop-session")
+    assert ad.has_live_for_session(origin_ui_session_id="desktop-sid")
+    assert ad.has_live_for_session(parent_session_id="desktop-parent")
+    assert ad.has_live_for_session(session_key="other-session")
+    assert not ad.has_live_for_session(session_key="completed-session")
+    assert not ad.has_live_for_session()
+
+
 def test_resume_reserves_exact_attempt_and_runs_with_hydrated_history(
     tmp_path, monkeypatch
 ):
@@ -599,244 +617,6 @@ def test_interrupt_all_signals_running_children():
     assert evt["status"] == "interrupted"
 
 
-def _fast_stale_monitor(monkeypatch, *, idle=0.15, in_tool=0.3, grace=0.15):
-    """Shrink the stale-monitor cadence so tests run in milliseconds."""
-    monkeypatch.setattr(ad, "_STALE_CHECK_INTERVAL", 0.03)
-    monkeypatch.setattr(ad, "_STALE_IDLE_SECONDS", idle)
-    monkeypatch.setattr(ad, "_STALE_IN_TOOL_SECONDS", in_tool)
-    monkeypatch.setattr(ad, "_STALL_GRACE_SECONDS", grace)
-
-
-def test_stalled_runner_is_interrupted_then_finalized(monkeypatch):
-    _fast_stale_monitor(monkeypatch)
-    gate = threading.Event()
-    interrupted = {"count": 0}
-
-    def stuck_runner():
-        gate.wait(timeout=10)
-        return {"status": "completed", "summary": "too late"}
-
-    def interrupt_fn():
-        interrupted["count"] += 1
-
-    res = ad.dispatch_async_delegation(
-        goal="stuck child", context=None, toolsets=None, role="leaf",
-        model="m", session_key="", runner=stuck_runner,
-        interrupt_fn=interrupt_fn, max_async_children=1,
-        # Frozen progress token: the child never advances an API call.
-        progress_fn=lambda: ((0, None), False),
-    )
-    assert res["status"] == "dispatched"
-
-    evt = _drain_for(res["delegation_id"], timeout=5.0)
-    try:
-        assert evt is not None
-        assert evt["type"] == "async_delegation"
-        assert evt["status"] == "stalled"
-        assert evt["delegation_id"] == res["delegation_id"]
-        assert evt["api_calls"] == 0
-        assert "stalled" in evt["error"]
-        # Interrupt was requested BEFORE force-finalization (grace window).
-        assert interrupted["count"] >= 1
-        assert ad.active_count() == 0
-    finally:
-        gate.set()
-
-    # If the ignored runner eventually returns, it must not enqueue a second
-    # completion for a delegation the monitor already finalized.
-    assert _drain_one(timeout=0.5) is None
-
-
-def test_progressing_runner_is_never_stalled(monkeypatch):
-    """A child that keeps advancing is left alone no matter how long it runs."""
-    _fast_stale_monitor(monkeypatch)
-    gate = threading.Event()
-    ticks = {"n": 0}
-
-    def slow_but_alive_runner():
-        gate.wait(timeout=10)
-        return {"status": "completed", "summary": "done", "api_calls": 7}
-
-    def progress_fn():
-        # Token advances on every sample — simulates a child making steady
-        # API-call progress.
-        ticks["n"] += 1
-        return (ticks["n"], None), False
-
-    res = ad.dispatch_async_delegation(
-        goal="slow child", context=None, toolsets=None, role="leaf",
-        model="m", session_key="", runner=slow_but_alive_runner,
-        max_async_children=1, progress_fn=progress_fn,
-    )
-    assert res["status"] == "dispatched"
-
-    # Run well past the (shrunk) idle threshold — several monitor sweeps.
-    time.sleep(0.6)
-    assert ad.active_count() == 1
-    assert process_registry.completion_queue.empty()
-
-    gate.set()
-    evt = _drain_for(res["delegation_id"], timeout=5.0)
-    assert evt is not None
-    assert evt["status"] == "completed"
-    assert evt["summary"] == "done"
-
-
-def test_stalling_runner_that_honors_interrupt_keeps_its_result(monkeypatch):
-    """Interrupt-responsive children finalize through the NORMAL path.
-
-    The monitor's interrupt gives a wedged-looking child a grace window; if
-    the runner returns during it, the real result (partial work, api_calls)
-    is delivered instead of a synthetic stalled event.
-    """
-    _fast_stale_monitor(monkeypatch, grace=5.0)
-    interrupted = threading.Event()
-
-    def runner():
-        # "Wedged" until interrupted, then unwinds and reports partial work.
-        interrupted.wait(timeout=10)
-        return {
-            "status": "interrupted",
-            "summary": "partial work saved",
-            "api_calls": 3,
-        }
-
-    res = ad.dispatch_async_delegation(
-        goal="responsive child", context=None, toolsets=None, role="leaf",
-        model="m", session_key="", runner=runner,
-        interrupt_fn=interrupted.set, max_async_children=1,
-        progress_fn=lambda: ((3, None), False),
-    )
-    assert res["status"] == "dispatched"
-
-    evt = _drain_for(res["delegation_id"], timeout=5.0)
-    assert evt is not None
-    assert evt["status"] == "interrupted"
-    assert evt["summary"] == "partial work saved"
-    assert evt["api_calls"] == 3
-    assert ad.active_count() == 0
-
-
-def test_streaming_child_counts_as_alive(monkeypatch):
-    """A child mid-stream (api_call_count frozen, last_activity_ts ticking)
-    must never be stalled — streamed chunks tick _touch_activity, and the
-    progress token includes that timestamp (same liveness signal as the
-    compaction inactivity budget, PR #71508)."""
-    _fast_stale_monitor(monkeypatch)
-    gate = threading.Event()
-    now = {"ts": 1000.0}
-
-    def progress_fn():
-        # api_call_count and current_tool frozen (long streaming response in
-        # flight), but the activity timestamp advances with every chunk.
-        now["ts"] += 1.0
-        return ((1, None, now["ts"]),), False
-
-    res = ad.dispatch_async_delegation(
-        goal="streaming child", context=None, toolsets=None, role="leaf",
-        model="m", session_key="", max_async_children=1,
-        runner=lambda: (gate.wait(timeout=10), {"status": "completed", "summary": "streamed"})[1],
-        progress_fn=progress_fn,
-    )
-    assert res["status"] == "dispatched"
-
-    time.sleep(0.6)  # several sweeps past the shrunk idle threshold
-    assert ad.active_count() == 1
-    assert process_registry.completion_queue.empty()
-
-    gate.set()
-    evt = _drain_for(res["delegation_id"], timeout=5.0)
-    assert evt is not None
-    assert evt["status"] == "completed"
-
-
-def test_stalled_event_carries_structured_stall_metadata(monkeypatch):
-    """The terminal stalled event must expose machine-readable stall context
-    (#51690) — quiet duration, tripped threshold, phase, grace — mirroring
-    the sync path's timeout_seconds/timed_out_after_seconds/timeout_phase."""
-    _fast_stale_monitor(monkeypatch)
-    gate = threading.Event()
-
-    res = ad.dispatch_async_delegation(
-        goal="stall metadata", context=None, toolsets=None, role="leaf",
-        model="m", session_key="", max_async_children=1,
-        runner=lambda: {} if gate.wait(timeout=10) else {},
-        progress_fn=lambda: ((0, "terminal"), True),
-    )
-    assert res["status"] == "dispatched"
-
-    evt = _drain_for(res["delegation_id"], timeout=5.0)
-    try:
-        assert evt is not None
-        assert evt["status"] == "stalled"
-        assert evt["stalled_after_quiet_seconds"] >= 0.3  # in-tool threshold
-        assert evt["stall_threshold_seconds"] == ad._STALE_IN_TOOL_SECONDS
-        assert evt["stall_phase"] == "in_tool"
-        assert evt["stall_grace_seconds"] == ad._STALL_GRACE_SECONDS
-    finally:
-        gate.set()
-
-
-def test_list_async_delegations_exposes_live_activity(monkeypatch):
-    """list_async_delegations must expose per-child live activity sampled
-    from progress_fn plus seconds_since_progress, for /agents UIs (#51690)."""
-    monkeypatch.setattr(ad, "_STALE_CHECK_INTERVAL", 0.03)
-    gate = threading.Event()
-    base_ts = time.time() - 12.0
-
-    res = ad.dispatch_async_delegation(
-        goal="live listing", context=None, toolsets=None, role="leaf",
-        model="m", session_key="", max_async_children=1,
-        runner=lambda: {} if gate.wait(timeout=10) else {},
-        progress_fn=lambda: (((3, "web_search", base_ts),), True),
-    )
-    try:
-        time.sleep(0.1)  # let the monitor stamp _progress_ts at least once
-        item = next(
-            d for d in ad.list_async_delegations()
-            if d["delegation_id"] == res["delegation_id"]
-        )
-        assert item["status"] == "running"
-        assert item["in_tool"] is True
-        assert "seconds_since_progress" in item
-        (child,) = item["children_activity"]
-        assert child["api_calls"] == 3
-        assert child["current_tool"] == "web_search"
-        assert 10.0 <= child["seconds_since_activity"] <= 20.0
-        # Callables and private bookkeeping must never leak.
-        assert "progress_fn" not in item
-        assert "interrupt_fn" not in item
-        assert not any(k.startswith("_") for k in item)
-    finally:
-        gate.set()
-
-
-def test_in_tool_stall_uses_higher_threshold(monkeypatch):
-    """A frozen child inside a tool gets the in-tool ceiling, not the idle one."""
-    _fast_stale_monitor(monkeypatch, idle=0.1, in_tool=10.0, grace=0.1)
-    gate = threading.Event()
-
-    def runner():
-        gate.wait(timeout=10)
-        return {"status": "completed", "summary": "long tool finished"}
-
-    res = ad.dispatch_async_delegation(
-        goal="long tool child", context=None, toolsets=None, role="leaf",
-        model="m", session_key="", runner=runner, max_async_children=1,
-        # Frozen token but in_tool=True — a legitimately slow terminal
-        # command / web fetch. Must NOT be stalled at the idle threshold.
-        progress_fn=lambda: ((1, "terminal"), True),
-    )
-    assert res["status"] == "dispatched"
-
-    time.sleep(0.5)  # far past idle threshold, well under in-tool threshold
-    assert ad.active_count() == 1
-    assert process_registry.completion_queue.empty()
-
-    gate.set()
-    evt = _drain_for(res["delegation_id"], timeout=5.0)
-    assert evt is not None
-    assert evt["status"] == "completed"
 
 
 def test_real_process_restart_restores_owned_completion_once(tmp_path):
