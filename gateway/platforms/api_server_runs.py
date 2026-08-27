@@ -978,7 +978,15 @@ async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
             return
         protected = getattr(run, "protected_execution", None)
         if protected is not None:
-            from tools.delegation_scope import attempt_scope_registry, configure_protected_attempt_environment
+            from tools.delegation_scope import (
+                attempt_scope_registry, configure_protected_attempt_environment,
+                format_effective_scope_context,
+            )
+            scope_context = format_effective_scope_context(protected.invocation_scope)
+            instructions = run.agent_kwargs.get("ephemeral_system_prompt")
+            run.agent_kwargs["ephemeral_system_prompt"] = (
+                f"{instructions}\n\n{scope_context}" if instructions else scope_context
+            )
             authority = attempt_scope_registry.reserve(protected.invocation_scope, run_id, attempt_id=f"runs_root_{run_id}", backing_registry=protected.backing_registry)
             run.protected_attempt_id = authority.attempt_id
             attempt_scope_registry.prepare_idmapped_reveals(authority.attempt_id)

@@ -26,6 +26,8 @@ from agent.delegation_policy import (
 
 logger = logging.getLogger(__name__)
 
+_CANONICAL_PATH_REVISION = "canonical-path"
+
 
 @dataclass(frozen=True)
 class RevealRequest:
@@ -100,6 +102,7 @@ class BackingObjectRegistry:
                 path = Path(record.backing.identity)
                 try:
                     current = path.lstat()
+                    resolved = path.resolve(strict=True)
                 except OSError:
                     return None
                 expected_type = (
@@ -111,10 +114,9 @@ class BackingObjectRegistry:
                 )
                 if (
                     path.is_symlink()
+                    or resolved != path
                     or record.backing.kind != "host_path"
                     or not expected_type
-                    or record.backing.revision
-                    != f"{current.st_dev}:{current.st_ino}"
                 ):
                     return None
             return record
@@ -804,6 +806,27 @@ def log_delegation_authority_event(
     return payload
 
 
+def execution_profile_admits_toolset(
+    profile: ExecutionProfile,
+    toolset_name: str,
+) -> bool:
+    """Match dispatch admission for whole-toolset and exact-tool grants."""
+
+    if toolset_name in profile.allowed_toolsets:
+        return True
+    from toolsets import TOOLSETS
+
+    definition = TOOLSETS.get(toolset_name)
+    tools = definition.get("tools") if isinstance(definition, Mapping) else None
+    if not isinstance(tools, (list, tuple, set, frozenset)):
+        return False
+    return bool(
+        {name for name in tools if isinstance(name, str)}.intersection(
+            profile.allowed_tools
+        )
+    )
+
+
 def deserialize_delegation_authority(
     raw: Mapping[str, Any],
     *,
@@ -902,7 +925,10 @@ def deserialize_delegation_authority(
         value = tools_raw.get(key)
         if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
             raise ValueError("protected authority tool snapshot is malformed")
-    if not set(tools_raw["enabled_toolsets"]).issubset(profile.allowed_toolsets):
+    if not all(
+        execution_profile_admits_toolset(profile, toolset_name)
+        for toolset_name in tools_raw["enabled_toolsets"]
+    ):
         raise ValueError("protected authority tool snapshot exceeds the profile")
 
     try:
@@ -933,6 +959,28 @@ def deserialize_delegation_authority(
             if backing_registry is None:
                 raise ValueError("protected authority backing registry is unavailable")
             record = backing_registry.get(backing.object_id)
+            if (
+                record is None
+                and isinstance(expected_policy, DelegationSessionPolicy)
+                and expected_policy.visible_objects is None
+            ):
+                # The logical authority pins the selected canonical path, mode,
+                # and object type. Resume resolves a fresh registry record from
+                # that portable contract after process-local state is lost.
+                rehydrated_grant, rehydrated_record = _admit_unbounded_host_grant(
+                    RevealRequest(
+                        normalize_visible_path(item["path"]),
+                        AccessMode(item["mode"]).value,
+                    )
+                )
+                if rehydrated_grant.object_type != grant.object_type:
+                    raise ValueError(
+                        "protected authority backing object is missing or stale"
+                    )
+                backing_registry.register_admitted(rehydrated_record)
+                grant = rehydrated_grant
+                backing = rehydrated_grant.backing
+                record = backing_registry.get(backing.object_id)
             if (
                 record is None
                 or not record.exists
@@ -1037,7 +1085,7 @@ def admit_trusted_run_execution(
 
     requests = _parse_reveal(execution.get("reveal"))
     if not requests:
-        raise ValueError("Runs execution reveal must contain at least one directory")
+        raise ValueError("Runs execution reveal must contain at least one file or directory")
 
     grants: list[VisibleObjectGrant] = []
     records: dict[str, BackingObjectRecord] = {}
@@ -1048,30 +1096,37 @@ def admit_trusted_run_execution(
             resolved = host_path.resolve(strict=True)
         except OSError as exc:
             raise ValueError(f"Runs execution reveal path is unavailable: {request.path}") from exc
-        if host_path.is_symlink() or resolved != host_path or not host_path.is_dir():
+        if host_path.is_symlink() or resolved != host_path:
             raise ValueError(
-                f"Runs execution reveal must be a real canonical directory: {request.path}"
+                f"Runs execution reveal must be a real canonical host path: {request.path}"
             )
-        revision = f"{stat_result.st_dev}:{stat_result.st_ino}"
+        if stat.S_ISDIR(stat_result.st_mode):
+            object_type = "directory"
+        elif stat.S_ISREG(stat_result.st_mode):
+            object_type = "file"
+        else:
+            raise ValueError(
+                f"Runs execution reveal must be a regular file or directory: {request.path}"
+            )
         object_id = "run_host_" + hashlib.sha256(
-            f"{request.path}\0{revision}".encode("utf-8")
+            f"{request.path}\0{object_type}".encode("utf-8")
         ).hexdigest()
         backing = BackingObjectRef(
             object_id=object_id,
             kind="host_path",
             identity=str(request.path),
-            revision=revision,
+            revision=_CANONICAL_PATH_REVISION,
         )
         grant = VisibleObjectGrant(
             visible_path=request.path,
             mode=AccessMode(request.mode),
             backing=backing,
-            object_type="directory",
+            object_type=object_type,
         )
         grants.append(grant)
         records[object_id] = BackingObjectRecord(
             backing=backing,
-            object_type="directory",
+            object_type=object_type,
             trusted_host_path=True,
         )
 
@@ -1137,7 +1192,6 @@ def _derive_host_descendant_grant(
     relative = request.path.relative_to(normalize_visible_path(ceiling.visible_path))
     host_path = Path(parent_record.backing.identity).joinpath(*relative.parts)
     try:
-        stat_result = host_path.lstat()
         resolved = host_path.resolve(strict=True)
         parent_resolved = Path(parent_record.backing.identity).resolve(strict=True)
     except OSError as exc:
@@ -1154,18 +1208,17 @@ def _derive_host_descendant_grant(
             f"delegate_task: descendant reveal must be a real directory below its parent: {request.path}."
         )
 
-    revision = f"{stat_result.st_dev}:{stat_result.st_ino}"
     object_id = "derived_host_" + hashlib.sha256(
         (
             f"{ceiling.backing.object_id}\0{request.path}\0"
-            f"{host_path}\0{revision}"
+            f"{host_path}\0directory"
         ).encode("utf-8")
     ).hexdigest()
     backing = BackingObjectRef(
         object_id=object_id,
         kind="host_path",
         identity=str(host_path),
-        revision=revision,
+        revision=_CANONICAL_PATH_REVISION,
     )
     record = BackingObjectRecord(
         backing=backing,
@@ -1205,15 +1258,14 @@ def _admit_unbounded_host_grant(
             f"delegate_task: reveal path {request.path} must be a regular file or directory."
         )
 
-    revision = f"{stat_result.st_dev}:{stat_result.st_ino}"
     object_id = "unbounded_host_" + hashlib.sha256(
-        f"{request.path}\0{object_type}\0{revision}".encode("utf-8")
+        f"{request.path}\0{object_type}".encode("utf-8")
     ).hexdigest()
     backing = BackingObjectRef(
         object_id=object_id,
         kind="host_path",
         identity=str(request.path),
-        revision=revision,
+        revision=_CANONICAL_PATH_REVISION,
     )
     record = BackingObjectRecord(
         backing=backing,

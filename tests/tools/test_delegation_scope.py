@@ -163,6 +163,30 @@ def test_trusted_run_execution_admits_real_directory_as_root_scope(tmp_path):
     assert admitted.invocation_scope.all_skills is False
 
 
+def test_trusted_run_execution_admits_exact_regular_file(tmp_path):
+    readme = tmp_path / "README.md"
+    readme.write_text("project context", encoding="utf-8")
+
+    admitted = admit_trusted_run_execution(
+        _policy(profiles=("isolated",)),
+        {
+            "profile": "isolated",
+            "workdir": "/workspace",
+            "reveal": [{"path": str(readme), "mode": "ro"}],
+        },
+    )
+
+    grant = admitted.invocation_scope.visible_objects[0]
+    assert grant.visible_path == PurePosixPath(str(readme))
+    assert grant.mode is AccessMode.RO
+    assert grant.object_type == "file"
+    record = admitted.backing_registry.get(grant.backing.object_id)
+    assert record is not None
+    assert record.object_type == "file"
+    assert record.backing == grant.backing
+    assert admitted.invocation_scope.workdir == PurePosixPath("/workspace")
+
+
 def test_trusted_run_execution_admits_specific_skill_names(tmp_path, monkeypatch):
     repository = tmp_path / "repository"
     repository.mkdir()
@@ -377,7 +401,7 @@ def test_trusted_run_execution_admits_operator_selected_named_directory(
     assert admitted.invocation_scope.workdir == PurePosixPath(str(selected))
 
 
-def test_trusted_run_backing_detects_root_replacement(tmp_path):
+def test_trusted_run_backing_tracks_canonical_path_after_directory_replacement(tmp_path):
     repository = tmp_path / "repository"
     repository.mkdir()
     admitted = admit_trusted_run_execution(
@@ -392,7 +416,7 @@ def test_trusted_run_backing_detects_root_replacement(tmp_path):
     repository.rename(tmp_path / "original")
     repository.mkdir()
 
-    assert admitted.backing_registry.get(grant.backing.object_id) is None
+    assert admitted.backing_registry.get(grant.backing.object_id) is not None
 
 
 def test_trusted_root_can_attenuate_to_existing_child_directory(tmp_path):
@@ -908,6 +932,36 @@ def test_profile_parser_builds_immutable_snapshot_with_stable_canonical_hash():
         parsed["other"] = _profile("other")  # type: ignore[index]
 
 
+def test_authority_round_trip_accepts_toolset_admitted_by_exact_profile_tools():
+    profile = ExecutionProfile(
+        name="isolated",
+        backend="docker",
+        image="example@sha256:abc",
+        default_workdir="/workspace",
+        allowed_toolsets={"terminal", "file"},
+        allowed_tools={"skills_list", "skill_view"},
+    )
+    scope = ResolvedInvocationScope(
+        profile.name,
+        execution_profile_hash(profile),
+        profile,
+        PurePosixPath("/workspace"),
+        (),
+        (),
+    )
+    authority = serialize_delegation_authority(
+        scope,
+        enabled_toolsets=("file", "skills"),
+        disabled_toolsets=(),
+        scope_id="scope-exact-tools",
+        attempt_id="attempt-exact-tools",
+    )
+
+    restored = deserialize_delegation_authority(authority, backing_registry=None)
+
+    assert restored.profile == profile
+
+
 def test_runtime_identity_is_optional_hashed_and_operator_supplied():
     base = {
         "backend": "docker",
@@ -1113,12 +1167,8 @@ def test_rejected_unbounded_multi_reveal_does_not_publish_partial_backing(tmp_pa
             backing_registry=registry,
         )
 
-    selected_stat = selected.stat()
     selected_object_id = "unbounded_host_" + hashlib.sha256(
-        (
-            f"{selected}\0directory\0"
-            f"{selected_stat.st_dev}:{selected_stat.st_ino}"
-        ).encode("utf-8")
+        f"{selected}\0directory".encode("utf-8")
     ).hexdigest()
     assert registry.get(selected_object_id) is None
 

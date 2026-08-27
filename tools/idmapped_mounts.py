@@ -26,43 +26,58 @@ def prepare_idmapped_reveals(
     *,
     register_cleanup: Callable[[Callable[[], None]], None],
 ) -> dict[str, str]:
-    """Prepare one private mapped directory per grant under registered cleanup."""
+    """Prepare one private type-preserving mapped path per grant."""
 
     for grant in grants:
-        if grant.backing.kind != "host_path" or grant.object_type != "directory":
-            raise ValueError("runtime_identity supports host-path directories only")
-        source = Path(grant.backing.identity)
-        if source.is_symlink() or not source.is_dir():
+        if grant.backing.kind != "host_path" or grant.object_type not in {
+            "file",
+            "directory",
+        }:
             raise ValueError(
-                f"runtime_identity backing must remain a directory: {grant.backing.object_id}"
+                "runtime_identity supports regular host-path files and directories only"
+            )
+        source = Path(grant.backing.identity)
+        type_matches = (
+            source.is_file() if grant.object_type == "file" else source.is_dir()
+        )
+        if source.is_symlink() or not type_matches:
+            raise ValueError(
+                "runtime_identity backing type changed: "
+                f"{grant.backing.object_id}"
             )
 
     host_uid = os.getuid()
     host_gid = os.getgid()
     target_uid, target_gid = runtime_identity
     staging_root = Path(tempfile.mkdtemp(prefix=f"hermes-idmap-{attempt_id}-"))
-    mounted: list[Path] = []
+    mounted: list[tuple[Path, str]] = []
     prepared: dict[str, str] = {}
 
     def cleanup() -> None:
         if not staging_root.exists():
             return
         errors: list[Exception] = []
-        for target in reversed(tuple(mounted)):
+        for target, object_type in reversed(tuple(mounted)):
             try:
                 _run(["sudo", "-n", "--", "/usr/bin/umount", str(target)])
             except Exception as exc:
                 errors.append(exc)
             else:
-                mounted.remove(target)
-                target.rmdir()
+                mounted.remove((target, object_type))
+                if object_type == "file":
+                    target.unlink()
+                else:
+                    target.rmdir()
         if errors:
             raise RuntimeError(
                 "idmapped reveal cleanup failed: "
                 + "; ".join(str(error) for error in errors)
             )
         for child in tuple(staging_root.iterdir()):
-            child.rmdir()
+            if child.is_dir():
+                child.rmdir()
+            else:
+                child.unlink()
         staging_root.rmdir()
 
     try:
@@ -73,7 +88,10 @@ def prepare_idmapped_reveals(
         )
         for index, grant in enumerate(grants):
             target = staging_root / str(index)
-            target.mkdir()
+            if grant.object_type == "file":
+                target.touch()
+            else:
+                target.mkdir()
             _run(
                 [
                     "sudo",
@@ -87,7 +105,7 @@ def prepare_idmapped_reveals(
                     str(target),
                 ]
             )
-            mounted.append(target)
+            mounted.append((target, grant.object_type))
             prepared[grant.backing.object_id] = str(target)
     except Exception as setup_error:
         try:
