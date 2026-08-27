@@ -32,8 +32,8 @@ grant = VisibleObjectGrant(
     backing=BackingObjectRef(
         object_id="dataset-2026-08",
         kind="host_path",
-        identity="/operator/approved/dataset",  # daemon-side only
-        revision="<pinned identity/revision>",
+        identity="/operator/approved/dataset",  # daemon-side canonical path
+        revision="canonical-path",
     ),
 )
 
@@ -47,7 +47,7 @@ policy = DelegationSessionPolicy(
 )
 ```
 
-The backing object must also be registered in the trusted `BackingObjectRegistry` with matching identity, revision, and object type. Protected dispatch fails closed if the profile or backing is unknown, stale, missing, replaced, malformed, or outside the session ceiling.
+The backing object must also be registered in the trusted `BackingObjectRegistry` with matching canonical path and object type. Protected dispatch fails closed if the profile or backing is unknown, missing, symlinked, malformed, or outside the session ceiling.
 
 ## Enabling profiles for standard CLI and gateway sessions
 
@@ -124,7 +124,7 @@ Trusted `/v1/runs` execution may establish its initial root scope from exact can
 
 ## Runtime properties
 
-Each protected physical attempt receives a fresh container and private writable root. Strict materialization suppresses ambient Docker volumes, host CWD, credentials, skills, caches, forwarded environment, arbitrary Docker arguments, persistence, and the Docker socket. Only typed, registry-validated reveals are mounted. Backing identity is validated during acquisition and again immediately before `docker run`.
+Each protected physical attempt receives a fresh container and private writable root. Strict materialization suppresses ambient Docker volumes, host CWD, credentials, skills, caches, forwarded environment, arbitrary Docker arguments, persistence, and the Docker socket. Only typed, registry-validated reveals are mounted. Canonical path, non-symlink status, and object type are validated during acquisition and again immediately before `docker run`.
 
 Tool authority is a positive, admission-time snapshot. Later plugin or MCP registration cannot widen it. File, code, terminal, image/vision, and stored web-extract paths route through the physical attempt environment. Host-launched `browser_*` and `computer_use` are not admitted; browser-capable protected profiles use the pinned Playwright image under `containers/delegation-browser/` and save screenshots/traces/downloads inside the private workspace or an explicit `rw` reveal.
 
