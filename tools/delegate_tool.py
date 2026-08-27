@@ -222,8 +222,11 @@ def _build_child_agent(
     child_delegation_policy = delegation_policy_override
     if resolved_scope is not None:
         from agent.delegation_policy import derive_child_policy
-        import model_tools
-        child_toolsets = [name for name in child_toolsets if name in resolved_scope.profile.allowed_toolsets or any(model_tools.get_toolset_for_tool(tool) == name for tool in resolved_scope.profile.allowed_tools)]
+        from tools.delegation_scope import execution_profile_admits_toolset
+        child_toolsets = [
+            name for name in child_toolsets
+            if execution_profile_admits_toolset(resolved_scope.profile, name)
+        ]
         effective_policy = delegation_policy_override if delegation_policy_override is not None else parent_agent.delegation_policy
         child_delegation_policy = derive_child_policy(effective_policy, None if effective_policy.visible_objects is None and not resolved_scope.reveal and not resolved_scope.visible_objects else resolved_scope.visible_objects, allowed_profiles={resolved_scope.profile_name})
     scope_context = None
