@@ -119,6 +119,38 @@ def auth_adapter():
     return _make_adapter(api_key="sk-secret")
 
 
+def test_run_event_callback_preserves_complete_tool_items(adapter):
+    queue = asyncio.Queue()
+    adapter._run_streams["run-tool-detail"] = queue
+    loop = MagicMock()
+    loop.call_soon_threadsafe.side_effect = lambda callback, *args: callback(*args)
+    callback = adapter._make_run_event_callback("run-tool-detail", loop)
+
+    callback(
+        "tool.started",
+        "web_search",
+        "archive interaction patterns",
+        {"query": "archive interaction patterns", "limit": 5},
+    )
+    callback(
+        "tool.completed",
+        "web_search",
+        None,
+        None,
+        duration=1.234,
+        is_error=False,
+        result='{"success":true,"count":5}',
+    )
+
+    started = queue.get_nowait()
+    completed = queue.get_nowait()
+    assert started["args"] == {
+        "query": "archive interaction patterns",
+        "limit": 5,
+    }
+    assert completed["result"] == '{"success":true,"count":5}'
+
+
 # ---------------------------------------------------------------------------
 # POST /v1/runs — start a run
 # ---------------------------------------------------------------------------

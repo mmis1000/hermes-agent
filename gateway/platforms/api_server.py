@@ -6613,6 +6613,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     "timestamp": ts,
                     "tool": tool_name,
                     "preview": preview,
+                    "args": args,
                 })
             elif event_type == "tool.completed":
                 _push({
@@ -6622,6 +6623,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     "tool": tool_name,
                     "duration": round(kwargs.get("duration", 0), 3),
                     "error": kwargs.get("is_error", False),
+                    "result": kwargs.get("result"),
                 })
             elif event_type == "reasoning.available":
                 _push({
