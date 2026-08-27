@@ -784,6 +784,27 @@ def log_delegation_authority_event(
     return payload
 
 
+def execution_profile_admits_toolset(
+    profile: ExecutionProfile,
+    toolset_name: str,
+) -> bool:
+    """Match dispatch admission for whole-toolset and exact-tool grants."""
+
+    if toolset_name in profile.allowed_toolsets:
+        return True
+    from toolsets import TOOLSETS
+
+    definition = TOOLSETS.get(toolset_name)
+    tools = definition.get("tools") if isinstance(definition, Mapping) else None
+    if not isinstance(tools, (list, tuple, set, frozenset)):
+        return False
+    return bool(
+        {name for name in tools if isinstance(name, str)}.intersection(
+            profile.allowed_tools
+        )
+    )
+
+
 def deserialize_delegation_authority(
     raw: Mapping[str, Any],
     *,
@@ -882,7 +903,10 @@ def deserialize_delegation_authority(
         value = tools_raw.get(key)
         if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
             raise ValueError("protected authority tool snapshot is malformed")
-    if not set(tools_raw["enabled_toolsets"]).issubset(profile.allowed_toolsets):
+    if not all(
+        execution_profile_admits_toolset(profile, toolset_name)
+        for toolset_name in tools_raw["enabled_toolsets"]
+    ):
         raise ValueError("protected authority tool snapshot exceeds the profile")
 
     try:

@@ -771,6 +771,36 @@ def test_profile_parser_builds_immutable_snapshot_with_stable_canonical_hash():
         parsed["other"] = _profile("other")  # type: ignore[index]
 
 
+def test_authority_round_trip_accepts_toolset_admitted_by_exact_profile_tools():
+    profile = ExecutionProfile(
+        name="isolated",
+        backend="docker",
+        image="example@sha256:abc",
+        default_workdir="/workspace",
+        allowed_toolsets={"terminal", "file"},
+        allowed_tools={"skills_list", "skill_view"},
+    )
+    scope = ResolvedInvocationScope(
+        profile.name,
+        execution_profile_hash(profile),
+        profile,
+        PurePosixPath("/workspace"),
+        (),
+        (),
+    )
+    authority = serialize_delegation_authority(
+        scope,
+        enabled_toolsets=("file", "skills"),
+        disabled_toolsets=(),
+        scope_id="scope-exact-tools",
+        attempt_id="attempt-exact-tools",
+    )
+
+    restored = deserialize_delegation_authority(authority, backing_registry=None)
+
+    assert restored.profile == profile
+
+
 def test_runtime_identity_is_optional_hashed_and_operator_supplied():
     base = {
         "backend": "docker",

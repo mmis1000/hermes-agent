@@ -2052,7 +2052,10 @@ def _build_child_agent(
     child_delegation_policy = None
     protected_profile_toolsets = None
     protected_profile_tools = None
-    from tools.delegation_scope import ResolvedInvocationScope
+    from tools.delegation_scope import (
+        ResolvedInvocationScope,
+        execution_profile_admits_toolset,
+    )
 
     if isinstance(resolved_scope, ResolvedInvocationScope):
         from agent.delegation_policy import DelegationSessionPolicy, derive_child_policy
@@ -2067,11 +2070,7 @@ def _build_child_agent(
         child_toolsets = [
             name
             for name in child_toolsets
-            if name in protected_profile_toolsets
-            or bool(
-                set(_toolset_tool_names(TOOLSETS.get(name)))
-                .intersection(protected_profile_tools)
-            )
+            if execution_profile_admits_toolset(resolved_scope.profile, name)
         ]
         child_visible_objects = (
             None
