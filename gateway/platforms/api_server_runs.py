@@ -324,13 +324,29 @@ def _make_run_event_callback(self, run_id: str, loop: "asyncio.AbstractEventLoop
             with suppress(Exception):
                 loop.call_soon_threadsafe(q.put_nowait, event)
 
+    def _redact_detail(value):
+        if isinstance(value, str):
+            return redact_sensitive_text(value, force=True)
+        if isinstance(value, dict):
+            # Keep credential-key context and redact keys as well as values,
+            # then restore the structured wire representation.
+            return json.loads(redact_sensitive_text(
+                json.dumps(value, ensure_ascii=False, default=str), force=True,
+            ))
+        if isinstance(value, (list, tuple)):
+            return [_redact_detail(item) for item in value]
+        return value
+
     def _callback(event_type: str, tool_name: str = None, preview: str = None, args=None, **kwargs):
         # _thinking / subagent.tool / subagent_progress are deliberately dropped (UI noise);
         # lifecycle boundaries must land so clients can observe delegate_task failures.
         fields = _FIXED_EVENT_FIELDS.get(event_type)
         if fields is not None:
             event_fields = fields(tool_name, preview, kwargs)
-            if event_type == "tool.completed":
+            if event_type == "tool.started":
+                event_fields["args"] = _redact_detail(args)
+            elif event_type == "tool.completed":
+                event_fields["result"] = _redact_detail(kwargs.get("result"))
                 event_fields["preview"] = _tool_completed_preview(
                     kwargs.get("result"), redact_sensitive_text)
             _push(_run_event(run_id, event_type, **event_fields))
