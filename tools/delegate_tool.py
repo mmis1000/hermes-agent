@@ -4394,23 +4394,25 @@ def delegate_task(
     # not blocked in the meantime. This is the contract: dispatch N subagents,
     # keep chatting, get the combined summaries back together at the end.
     if background:
-        from tools.async_delegation import dispatch_async_delegation_batch
+        from tools.async_delegation import (
+            _current_origin_session_id,
+            dispatch_async_delegation_batch,
+        )
         from tools.approval import get_current_session_key
 
-        # Stateless request/response sessions (the API server / WebUI path)
-        # cannot route a detached subagent result back to the agent after the
-        # turn ends — there is no persistent channel and the adapter's send()
-        # is a no-op, so a background dispatch would silently never re-enter the
-        # conversation (issue #10760). Fall back to SYNCHRONOUS execution: the
-        # work still runs and its result returns in this same response, which is
-        # strictly better than a handle that never resolves. Mirrors the
-        # pool-at-capacity inline fallback below.
+        _origin_session_id = _current_origin_session_id()
+
+        # A sessionless request/response turn cannot route a detached result
+        # after it ends, so it must run synchronously. An API-server turn with a
+        # raw session id is continuable: its completion wakes that same session
+        # through gateway/wake.py's authenticated self-post path even though the
+        # adapter itself is not push-capable.
         try:
             from gateway.session_context import async_delivery_supported
             _async_ok = async_delivery_supported()
         except Exception:
             _async_ok = True
-        if not _async_ok:
+        if not _async_ok and not _origin_session_id:
             logger.info(
                 "delegate_task: async delivery unsupported on this session "
                 "(stateless HTTP API); running the batch synchronously instead."
@@ -4526,6 +4528,7 @@ def delegate_task(
             model=creds["model"],
             session_key=_session_key,
             origin_ui_session_id=_origin_ui_session_id,
+            origin_session_id=_origin_session_id,
             parent_session_id=_parent_session_id,
             runner=_batch_runner,
             interrupt_fn=_batch_interrupt,

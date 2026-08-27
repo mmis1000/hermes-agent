@@ -6298,11 +6298,11 @@ class APIServerAdapter(BasePlatformAdapter):
 
         This is the SINGLE structural chokepoint every API-server agent-entry
         path must use to seed session context — it hardwires
-        ``platform="api_server"`` and ``async_delivery=False`` so a new route
-        physically cannot reintroduce the silent-no-op bug (#10760) by
-        forgetting to mark the channel as non-delivering. There is no
-        ``async_delivery`` parameter to get wrong; the stateless HTTP path can
-        never wake the agent after the turn ends, on ANY route.
+        ``platform="api_server"`` and ``async_delivery=False`` because the
+        adapter is not directly push-capable. ID-bound turns may still receive
+        detached completions through gateway/wake.py's authenticated self-post;
+        sessionless requests retain synchronous fallbacks. There is no
+        ``async_delivery`` parameter for individual routes to get wrong.
 
         Returns reset tokens; pass them to ``clear_session_vars`` in a
         ``finally`` block (the binding is request-scoped and must not outlive

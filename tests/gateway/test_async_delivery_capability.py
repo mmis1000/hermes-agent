@@ -1,11 +1,10 @@
 """Tests for the async-delivery capability gate (issue #10760).
 
-Stateless request/response adapters (the API server / WebUI path) cannot route
-a background completion back to the agent after a turn ends — there is no
-persistent channel and ``APIServerAdapter.send()`` is a no-op stub. So tools
-that promise async delivery (``terminal`` notify_on_complete / watch_patterns,
-``delegate_task`` background=True) must refuse the promise on that path instead
-of silently registering a watcher that never fires.
+Stateless request/response adapters cannot route a background completion after
+a sessionless turn ends. The API server remains non-push-capable, but an
+ID-bound turn can receive a delegated completion through its authenticated
+self-post wake path. Sessionless delegation and terminal watcher promises still
+fall back or refuse rather than creating an orphaned completion.
 
 This is wired through:
   - ``BasePlatformAdapter.supports_async_delivery`` (default True)

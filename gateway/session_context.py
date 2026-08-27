@@ -483,13 +483,15 @@ def async_delivery_supported() -> bool:
     """Whether the current session can deliver a background completion later.
 
     Returns ``False`` for finite runtimes that can end before a detached result
-    is delivered: sessions explicitly bound by a stateless channel — an adapter
-    that cannot route a notification back after the turn ends (the API server),
-    or a one-shot runner that exits after its final response (``hermes -z``,
-    cron — see :func:`declare_stateless_channel`) — and dispatcher-spawned
-    Kanban workers (identified by ``HERMES_KANBAN_TASK``), which are one-shot
-    ``chat -q`` subprocesses. The real gateway platforms, the interactive CLI,
-    and any other path that never bound the contextvar return ``True``.
+    is delivered: sessions explicitly bound by a non-push channel (including
+    the API server), one-shot runners that exit after their final response
+    (``hermes -z``, cron — see :func:`declare_stateless_channel`), and
+    dispatcher-spawned Kanban workers (identified by ``HERMES_KANBAN_TASK``).
+    ID-bound API-server delegation is the narrow exception: ``delegate_task``
+    carries the raw session id into the completion event and wakes that session
+    through an authenticated self-post. The real push-capable gateway
+    platforms, the interactive CLI, and any other path that never bound the
+    contextvar return ``True``.
 
     Tools that promise async delivery (``terminal`` notify_on_complete /
     watch_patterns, ``delegate_task`` background=True) consult this before
