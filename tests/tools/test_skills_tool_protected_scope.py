@@ -31,12 +31,11 @@ def _protected_authority(
     all_skills: bool = False,
     object_type: Literal["file", "directory"] = "directory",
 ):
-    stat_result = repository.lstat()
     backing = BackingObjectRef(
         object_id="repo",
         kind="host_path",
         identity=str(repository),
-        revision=f"{stat_result.st_dev}:{stat_result.st_ino}",
+        revision="canonical-path",
     )
     grant = VisibleObjectGrant(
         visible_path=PurePosixPath(str(repository)),
@@ -408,11 +407,9 @@ def test_protected_skill_tools_only_search_roots_inside_attempt_grants(
     assert categorized["success"] is True
 
 
-@pytest.mark.parametrize("replacement", ["directory", "symlink"])
-def test_protected_skill_tools_reject_replaced_backing_root(
+def test_protected_skill_tools_reject_symlinked_backing_root(
     tmp_path,
     monkeypatch,
-    replacement,
 ):
     repository = tmp_path / "repository"
     project_skills = repository / ".codex" / "skills"
@@ -421,14 +418,10 @@ def test_protected_skill_tools_reject_replaced_backing_root(
 
     original = tmp_path / "original"
     repository.rename(original)
-    if replacement == "symlink":
-        outside = tmp_path / "outside"
-        replacement_skills = outside / ".codex" / "skills"
-        _write_skill(replacement_skills, "outside", "must not be read")
-        repository.symlink_to(outside, target_is_directory=True)
-    else:
-        replacement_skills = repository / ".codex" / "skills"
-        _write_skill(replacement_skills, "outside", "must not be read")
+    outside = tmp_path / "outside"
+    replacement_skills = outside / ".codex" / "skills"
+    _write_skill(replacement_skills, "outside", "must not be read")
+    repository.symlink_to(outside, target_is_directory=True)
 
     monkeypatch.setattr(
         "tools.delegation_scope.attempt_scope_registry.get",
@@ -515,55 +508,3 @@ def test_protected_skill_view_omits_out_of_grant_linked_directory_symlink(
     assert viewed["success"] is True
     assert viewed["linked_files"] is None
     assert "secret-name.md" not in json.dumps(viewed)
-
-
-def test_protected_skill_view_rejects_root_replaced_before_link_discovery(
-    tmp_path,
-    monkeypatch,
-):
-    repository = tmp_path / "repository"
-    project_skills = repository / ".codex" / "skills"
-    _write_skill(project_skills, "project-only", "inside project")
-    authority = _protected_authority(repository)
-    monkeypatch.setattr(
-        "tools.delegation_scope.attempt_scope_registry.get",
-        lambda task_id: authority if task_id == "protected-attempt" else None,
-    )
-    monkeypatch.setattr(skills_tool, "_skills_dir", lambda: project_skills)
-    monkeypatch.setattr("agent.skill_utils.get_external_skills_dirs", lambda: [])
-    skills_tool._SKILLS_CACHE.clear()
-
-    discover = skills_tool._discover_skill_linked_files
-
-    def replace_then_discover(skill_dir, *, task_id, protected):
-        original = tmp_path / "original"
-        repository.rename(original)
-        replacement_skills = repository / ".codex" / "skills"
-        replacement_dir = _write_skill(
-            replacement_skills,
-            "project-only",
-            "replacement",
-        )
-        (replacement_dir / "references").mkdir()
-        (replacement_dir / "references" / "replacement-secret.md").write_text(
-            "must not be discovered",
-            encoding="utf-8",
-        )
-        return discover(skill_dir, task_id=task_id, protected=protected)
-
-    monkeypatch.setattr(
-        skills_tool,
-        "_discover_skill_linked_files",
-        replace_then_discover,
-    )
-
-    viewed = json.loads(
-        skills_tool.skill_view(
-            "project-only",
-            task_id="protected-attempt",
-            preprocess=False,
-        )
-    )
-
-    assert viewed["success"] is False
-    assert "replacement-secret.md" not in json.dumps(viewed)

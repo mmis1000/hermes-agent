@@ -45,7 +45,7 @@ def _authority_fixture():
     backing = BackingObjectRef(
         object_id="object-1",
         kind="host_path",
-        identity="device:inode",
+        identity="/operator/input",
         revision="revision-7",
     )
     grant = VisibleObjectGrant(
@@ -93,7 +93,7 @@ def test_authority_round_trip_is_versioned_canonical_and_credential_free():
             "backing": {
                 "object_id": "object-1",
                 "kind": "host_path",
-                "identity": "device:inode",
+                "identity": "/operator/input",
                 "revision": "revision-7",
             },
         }
@@ -110,6 +110,85 @@ def test_authority_round_trip_is_versioned_canonical_and_credential_free():
     assert authority["state"] == {"revoked": False, "cleaned": False}
     assert "api_key" not in repr(authority).lower()
     assert restored == scope
+
+
+def test_resumed_file_authority_rematerializes_exact_file(tmp_path, monkeypatch):
+    source = tmp_path / "README.md"
+    source.write_text("project context", encoding="utf-8")
+    profile = ExecutionProfile(
+        name="isolated",
+        backend="docker",
+        image="repo/image@sha256:deadbeef",
+        default_workdir="/workspace",
+        allowed_toolsets=frozenset({"terminal"}),
+        network="none",
+        runtime_identity=(10001, 10001),
+    )
+    backing = BackingObjectRef(
+        object_id="readme-object",
+        kind="host_path",
+        identity=str(source),
+        revision="canonical-path-v1",
+    )
+    grant = VisibleObjectGrant(
+        visible_path=source,
+        mode=AccessMode.RO,
+        backing=backing,
+        object_type="file",
+    )
+    scope = ResolvedInvocationScope(
+        profile_name=profile.name,
+        profile_hash=execution_profile_hash(profile),
+        profile=profile,
+        workdir=PurePosixPath("/workspace"),
+        reveal=(RevealRequest(PurePosixPath(str(source)), "ro"),),
+        visible_objects=(grant,),
+    )
+    backing_registry = BackingObjectRegistry(
+        {
+            backing.object_id: BackingObjectRecord(
+                backing=backing,
+                object_type="file",
+                trusted_host_path=True,
+            )
+        }
+    )
+    durable = serialize_delegation_authority(
+        scope,
+        enabled_toolsets=("terminal",),
+        disabled_toolsets=(),
+        scope_id="scope-file",
+        attempt_id="attempt-initial",
+    )
+    restored = deserialize_delegation_authority(
+        durable,
+        backing_registry=backing_registry,
+    )
+    prepared_source = tmp_path / "prepared-readme"
+
+    def prepare(attempt_id, grants, identity, *, register_cleanup):
+        assert attempt_id == "attempt-resumed"
+        assert grants == (grant,)
+        assert identity == (10001, 10001)
+        register_cleanup(lambda: None)
+        return {backing.object_id: str(prepared_source)}
+
+    monkeypatch.setattr("tools.idmapped_mounts.prepare_idmapped_reveals", prepare)
+    attempts = AttemptScopeRegistry()
+    attempts.reserve(
+        restored,
+        "logical-child",
+        attempt_id="attempt-resumed",
+        backing_registry=backing_registry,
+    )
+    attempts.prepare_idmapped_reveals("attempt-resumed")
+
+    authority = attempts.get("attempt-resumed")
+    assert authority is not None
+    assert authority.invocation_scope.visible_objects == (grant,)
+    assert authority.prepared_mount_sources == {
+        backing.object_id: str(prepared_source)
+    }
 
 
 @pytest.mark.parametrize(
@@ -937,3 +1016,149 @@ def test_protected_authority_reconstructs_after_local_attempt_registry_restart()
     assert fresh.attempt_id == "attempt-after-restart"
     assert fresh.scope_id != authority["lineage"]["scope_id"]
     assert fresh.invocation_scope.visible_objects == scope.visible_objects
+
+
+def test_protected_resume_rehydrates_unbounded_backing_registry_after_restart(
+    tmp_path,
+    monkeypatch,
+):
+    from tools import async_delegation as ad
+    from tools import delegate_tool
+
+    selected = tmp_path / "selected"
+    selected.mkdir()
+    profile = ExecutionProfile(
+        name="isolated",
+        backend="docker",
+        image="repo/image@sha256:deadbeef",
+        default_workdir="/workspace",
+        allowed_toolsets=frozenset({"terminal"}),
+    )
+    policy = DelegationSessionPolicy(
+        profile_required=True,
+        allow_profile_none=False,
+        allowed_profiles=frozenset({profile.name}),
+        profile_snapshots={profile.name: profile},
+        visible_objects=None,
+        protected_prefixes=(),
+    )
+    initial_registry = BackingObjectRegistry()
+    scope = resolve_invocation_scope(
+        policy,
+        profile.name,
+        None,
+        [{"path": str(selected), "mode": "ro"}],
+        backing_registry=initial_registry,
+    )
+    assert scope is not None
+    authority = serialize_delegation_authority(
+        scope,
+        enabled_toolsets=("terminal",),
+        disabled_toolsets=(),
+        scope_id="scope-before-process-restart",
+        attempt_id="attempt-before-process-restart",
+    )
+    restarted_registry = BackingObjectRegistry()
+    monkeypatch.setattr(
+        ad,
+        "get_async_delegation",
+        lambda *_args, **_kwargs: {
+            "session_key": "owner",
+            "children": {"logical": {"status": "completed", "goal": "work"}},
+        },
+    )
+    monkeypatch.setattr(
+        ad,
+        "load_subagent_resume_bundle",
+        lambda *_args, **_kwargs: {
+            "status": "ready",
+            "protected": True,
+            "authority": authority,
+            "bundle": {
+                "prior_child_session_id": "child-prior",
+                "reconstruction_metadata": {},
+            },
+        },
+    )
+    monkeypatch.setattr(
+        delegate_tool,
+        "prepare_resumed_child_session",
+        lambda _bundle: {
+            "session_id": "child-new",
+            "parent_session_id": "child-prior",
+            "delegate_from": "owner",
+        },
+    )
+    repository = MagicMock()
+    repository.reserve_resumed_attempt.return_value = {"status": "already_running"}
+    monkeypatch.setattr(ad, "_repository", lambda: repository)
+    parent = SimpleNamespace(
+        delegation_policy=policy,
+        delegation_backing_registry=restarted_registry,
+    )
+
+    result = ad.dispatch_resumed_subagent(
+        "delegation",
+        "logical",
+        session_key="owner",
+        message="continue",
+        parent_agent=parent,
+    )
+
+    assert result == {"status": "already_running"}
+    repository.reserve_resumed_attempt.assert_called_once()
+    grant = scope.visible_objects[0]
+    assert restarted_registry.get(grant.backing.object_id) is not None
+
+
+def test_restart_rehydration_refreshes_replaced_unbounded_backing(tmp_path):
+    selected = tmp_path / "selected"
+    selected.mkdir()
+    profile = ExecutionProfile(
+        name="isolated",
+        backend="docker",
+        image="repo/image@sha256:deadbeef",
+        default_workdir="/workspace",
+        allowed_toolsets=frozenset({"terminal"}),
+    )
+    policy = DelegationSessionPolicy(
+        profile_required=True,
+        allow_profile_none=False,
+        allowed_profiles=frozenset({profile.name}),
+        profile_snapshots={profile.name: profile},
+        visible_objects=None,
+        protected_prefixes=(),
+    )
+    initial_registry = BackingObjectRegistry()
+    scope = resolve_invocation_scope(
+        policy,
+        profile.name,
+        None,
+        [{"path": str(selected), "mode": "ro"}],
+        backing_registry=initial_registry,
+    )
+    assert scope is not None
+    authority = serialize_delegation_authority(
+        scope,
+        enabled_toolsets=("terminal",),
+        disabled_toolsets=(),
+        scope_id="scope-before-replacement",
+        attempt_id="attempt-before-replacement",
+    )
+    previous_backing = scope.visible_objects[0].backing
+    selected.rename(tmp_path / "original")
+    selected.mkdir()
+    restarted_registry = BackingObjectRegistry()
+
+    restored = deserialize_delegation_authority(
+        authority,
+        backing_registry=restarted_registry,
+        expected_policy=policy,
+    )
+
+    refreshed = restored.visible_objects[0]
+    assert refreshed.visible_path == PurePosixPath(str(selected))
+    assert refreshed.mode is AccessMode.RO
+    assert refreshed.object_type == "directory"
+    assert refreshed.backing == previous_backing
+    assert restarted_registry.get(refreshed.backing.object_id) is not None

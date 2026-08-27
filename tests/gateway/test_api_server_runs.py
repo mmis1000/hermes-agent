@@ -11,6 +11,7 @@ Covers:
 
 import asyncio
 import json
+from pathlib import PurePosixPath
 import threading
 import time
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -27,7 +28,7 @@ from gateway.platforms.api_server import (
     security_headers_middleware,
 )
 from tools import approval as approval_mod
-from agent.delegation_policy import DelegationSessionPolicy, ExecutionProfile
+from agent.delegation_policy import AccessMode, DelegationSessionPolicy, ExecutionProfile
 
 
 # ---------------------------------------------------------------------------
@@ -286,6 +287,91 @@ class TestStartRun:
         assert {
             item["function"]["name"] for item in mock_agent.tools
         } == expected_tool_names
+
+    @pytest.mark.asyncio
+    async def test_protected_start_admits_exact_readonly_file_reveal(
+        self,
+        adapter,
+        tmp_path,
+    ):
+        readme = tmp_path / "README.md"
+        readme.write_text("project context", encoding="utf-8")
+        profile = ExecutionProfile(
+            name="filesystem-isolated",
+            backend="docker",
+            image="example@sha256:abc",
+            default_workdir="/workspace",
+            allowed_toolsets={"terminal", "file"},
+            runtime_identity=(10001, 10001),
+        )
+        base_policy = DelegationSessionPolicy(
+            profile_required=True,
+            allow_profile_none=False,
+            allowed_profiles={profile.name},
+            profile_snapshots={profile.name: profile},
+            visible_objects=(),
+            protected_prefixes=(),
+        )
+        root_registry = MagicMock()
+        root_registry.reserve.return_value.attempt_id = "runs-file-attempt"
+        root_registry.cleanup.return_value = ()
+        mock_agent = MagicMock()
+        mock_agent.run_conversation.return_value = {"final_response": "done"}
+        mock_agent.session_prompt_tokens = 0
+        mock_agent.session_completion_tokens = 0
+        mock_agent.session_total_tokens = 0
+        mock_agent.tools = [{"function": {"name": "terminal"}}]
+        mock_agent.valid_tool_names = {"terminal"}
+
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with (
+                patch(
+                    "agent.agent_init._admit_standard_delegation_policy",
+                    return_value=base_policy,
+                ),
+                patch(
+                    "tools.delegation_scope.attempt_scope_registry",
+                    root_registry,
+                ),
+                patch(
+                    "tools.delegation_scope.configure_protected_attempt_environment"
+                ),
+                patch(
+                    "tools.terminal_tool._get_env_config",
+                    return_value={"docker_network": False},
+                ),
+                patch.object(adapter, "_create_agent", return_value=mock_agent) as create,
+            ):
+                response = await cli.post(
+                    "/v1/runs",
+                    json={
+                        "input": "read context",
+                        "execution": {
+                            "profile": profile.name,
+                            "workdir": "/workspace",
+                            "reveal": [{"path": str(readme), "mode": "ro"}],
+                        },
+                    },
+                )
+                assert response.status == 202
+                run_id = (await response.json())["run_id"]
+                for _ in range(20):
+                    if run_id not in adapter._active_run_tasks:
+                        break
+                    await asyncio.sleep(0.05)
+
+        prompt = create.call_args.kwargs["ephemeral_system_prompt"]
+        assert f'"{readme}" — file, read-only' in prompt
+        scope = root_registry.reserve.call_args.args[0]
+        assert scope.workdir == PurePosixPath("/workspace")
+        assert len(scope.visible_objects) == 1
+        assert scope.visible_objects[0].visible_path == PurePosixPath(str(readme))
+        assert scope.visible_objects[0].object_type == "file"
+        assert scope.visible_objects[0].mode is AccessMode.RO
+        root_registry.prepare_idmapped_reveals.assert_called_once_with(
+            "runs-file-attempt"
+        )
 
     @pytest.mark.asyncio
     async def test_ordinary_start_does_not_add_execution_filesystem_context(self, adapter):

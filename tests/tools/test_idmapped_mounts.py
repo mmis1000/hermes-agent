@@ -71,23 +71,57 @@ def test_prepare_uses_parent_identity_and_cleanup_unmounts(tmp_path, monkeypatch
     assert not staging.exists()
 
 
-def test_opted_in_reveal_rejects_non_directory_without_mounting(tmp_path, monkeypatch):
+def test_prepare_maps_regular_file_and_cleanup_unlinks_mountpoint(tmp_path, monkeypatch):
     source = tmp_path / "file"
     source.write_text("data")
-    called = []
-    monkeypatch.setattr(
-        "tools.idmapped_mounts.subprocess.run", lambda *args, **kwargs: called.append(args)
+    staging = tmp_path / "file-staging"
+    calls = []
+    cleanups = []
+
+    monkeypatch.setattr("tools.idmapped_mounts.os.getuid", lambda: 111)
+    monkeypatch.setattr("tools.idmapped_mounts.os.getgid", lambda: 222)
+
+    def make_staging(**_kwargs):
+        staging.mkdir()
+        return str(staging)
+
+    monkeypatch.setattr("tools.idmapped_mounts.tempfile.mkdtemp", make_staging)
+
+    def run(argv, **kwargs):
+        calls.append((argv, kwargs))
+        if argv[3] == "/usr/bin/mount":
+            target = staging / "0"
+            assert target.is_file()
+            assert not target.is_dir()
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr("tools.idmapped_mounts.subprocess.run", run)
+
+    prepared = prepare_idmapped_reveals(
+        "attempt-file",
+        (_grant(source, object_type="file"),),
+        (10001, 10002),
+        register_cleanup=cleanups.append,
     )
 
-    with pytest.raises(ValueError, match="directories"):
-        prepare_idmapped_reveals(
-            "attempt-file",
-            (_grant(source, object_type="file"),),
-            (1, 1),
-            register_cleanup=lambda _cleanup: None,
-        )
+    target = staging / "0"
+    assert prepared == {"shared": str(target)}
+    assert calls[0][0] == [
+        "sudo",
+        "-n",
+        "--",
+        "/usr/bin/mount",
+        "--bind",
+        "-o",
+        "X-mount.idmap=u:111:10001:1 g:222:10002:1",
+        str(source),
+        str(target),
+    ]
 
-    assert called == []
+    cleanups[0]()
+
+    assert calls[-1][0] == ["sudo", "-n", "--", "/usr/bin/umount", str(target)]
+    assert not staging.exists()
 
 
 def test_partial_setup_cleanup_failure_remains_retryable(tmp_path, monkeypatch):
