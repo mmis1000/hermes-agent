@@ -353,11 +353,17 @@ def _tool_search_scoped_names(agent) -> frozenset:
 
     enabled = getattr(agent, "enabled_toolsets", None)
     disabled = getattr(agent, "disabled_toolsets", None)
+    protected_deferred = getattr(
+        agent, "_protected_deferred_tool_snapshot", None
+    )
+    if protected_deferred is not None:
+        protected_deferred = frozenset(protected_deferred)
     cache_key = (
         _registry.current_scope_key(),
         getattr(_registry, "_generation", 0),
         frozenset(enabled) if enabled is not None else None,
         frozenset(disabled) if disabled is not None else None,
+        protected_deferred,
     )
     cached = getattr(agent, "_tool_search_scope_cache", None)
     if cached is not None and cached[0] == cache_key:
@@ -370,6 +376,8 @@ def _tool_search_scoped_names(agent) -> frozenset:
             skip_tool_search_assembly=True,
         ) or []
         names = _ts.scoped_deferrable_names(scoped_defs)
+        if protected_deferred is not None:
+            names = names.intersection(protected_deferred)
     except Exception:
         names = frozenset()
     try:
@@ -2387,6 +2395,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                                 tool_request_middleware_trace=list(middleware_trace),
                                 enabled_toolsets=getattr(agent, "enabled_toolsets", None),
                                 disabled_toolsets=getattr(agent, "disabled_toolsets", None),
+                                parent_agent=agent,
                             )
 
                 (
@@ -2474,6 +2483,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                                 tool_request_middleware_trace=list(middleware_trace),
                                 enabled_toolsets=getattr(agent, "enabled_toolsets", None),
                                 disabled_toolsets=getattr(agent, "disabled_toolsets", None),
+                                parent_agent=agent,
                             )
 
                 (

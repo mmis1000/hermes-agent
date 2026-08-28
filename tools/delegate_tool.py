@@ -1097,31 +1097,108 @@ def configure_protected_agent_tools(
     agent: Any,
     profile: ExecutionProfile,
 ) -> frozenset[str]:
-    """Pin a positive tool snapshot for any protected agent attempt."""
+    """Pin a positive tool snapshot for any protected agent attempt.
 
-    candidate_names = set(getattr(agent, "valid_tool_names", set()))
+    Protected agents are normally built with Tool Search's bridge replacing
+    the deferrable tools. The bridge itself is not a profile capability; it is
+    only a carrier for the profile-authorized deferred names. Rebuild the
+    model-facing view from the pre-assembly tool list so the carrier survives
+    without widening its catalog.
+    """
+
+    import model_tools
+    from tools import tool_search
+    from tools.mcp_tool import get_mcp_tool_server_qualification
+
+    enabled_toolsets = getattr(agent, "enabled_toolsets", None)
+    disabled_toolsets = getattr(agent, "disabled_toolsets", None)
+    original_defs = list(
+        model_tools.get_tool_definitions(
+            enabled_toolsets=enabled_toolsets,
+            disabled_toolsets=disabled_toolsets,
+            quiet_mode=True,
+            skip_tool_search_assembly=True,
+            delegation_policy=getattr(agent, "delegation_policy", None),
+        )
+        or []
+    )
+    current_defs = list(getattr(agent, "tools", None) or [])
+    candidate_names = {
+        item.get("function", {}).get("name")
+        for item in original_defs + current_defs
+        if isinstance(item, dict)
+        and item.get("function", {}).get("name")
+        not in tool_search.BRIDGE_TOOL_NAMES
+    }
+    candidate_names.update(
+        name
+        for name in getattr(agent, "valid_tool_names", set())
+        if name not in tool_search.BRIDGE_TOOL_NAMES
+    )
     protected_names = _qualified_protected_tool_names(
         candidate_names,
         set(profile.allowed_toolsets),
         profile.qualified_mcp_servers,
         profile.allowed_tools,
     )
-    protected_tools = [
-        item
-        for item in (getattr(agent, "tools", None) or [])
-        if item.get("function", {}).get("name") in protected_names
+
+    # Keep the authoritative unassembled schemas for deferred tools, while
+    # allowing post-build injected tools to survive when they were already in
+    # the agent's current view. A later duplicate replaces the earlier schema
+    # but keeps deterministic source order.
+    source_defs = []
+    source_by_name = {}
+    for item in original_defs + current_defs:
+        if not isinstance(item, dict):
+            continue
+        name = (item.get("function") or {}).get("name")
+        if (
+            not name
+            or name in tool_search.BRIDGE_TOOL_NAMES
+            or name not in protected_names
+        ):
+            continue
+        if name not in source_by_name:
+            source_defs.append(item)
+        source_by_name[name] = item
+    source_defs = [
+        source_by_name[item["function"]["name"]]
+        for item in source_defs
     ]
+
+    protected_deferred_names = frozenset(
+        name
+        for item in original_defs
+        for name in [(item.get("function") or {}).get("name")]
+        if name in protected_names and tool_search.is_deferrable_tool_name(name)
+    )
+    assembly = tool_search.assemble_tool_defs(
+        source_defs,
+        # Activation no longer depends on context length; using the fallback
+        # listing budget avoids a second provider metadata probe during setup.
+        context_length=None,
+        config=tool_search.load_config(),
+    )
+    protected_tools = assembly.tool_defs
+    visible_names = {
+        item["function"]["name"]
+        for item in protected_tools
+        if isinstance(item, dict) and item.get("function", {}).get("name")
+    }
     snapshot = frozenset(protected_names)
+    carriers = (
+        tool_search.BRIDGE_TOOL_NAMES if assembly.activated else frozenset()
+    )
     setattr(agent, "tools", protected_tools)
-    setattr(agent, "valid_tool_names", set(protected_names))
+    setattr(agent, "valid_tool_names", visible_names)
     setattr(agent, "_protected_tool_snapshot", snapshot)
+    setattr(agent, "_protected_deferred_tool_snapshot", protected_deferred_names)
+    setattr(agent, "_protected_bridge_tool_snapshot", carriers)
     setattr(
         agent,
         "_protected_qualified_mcp_servers",
         frozenset(profile.qualified_mcp_servers),
     )
-    from tools.mcp_tool import get_mcp_tool_server_qualification
-
     setattr(
         agent,
         "_protected_mcp_tool_provenance",
