@@ -726,6 +726,9 @@ def _dispatch_bridge_tool(function_name: str, function_args: Dict[str, Any],
                                             quiet_mode=True, skip_tool_search_assembly=True) or []
     except Exception:
         current_defs = []
+    protected = getattr(parent_agent, "_protected_deferred_tool_snapshot", None)
+    if protected is not None:
+        current_defs = [d for d in current_defs if not ts.is_deferrable_tool_name((d.get("function") or {}).get("name", "")) or (d.get("function") or {}).get("name") in protected]
     args = function_args or {}
     if function_name == ts.TOOL_SEARCH_NAME:
         return ts.dispatch_tool_search(args, current_tool_defs=current_defs), None
@@ -907,7 +910,7 @@ def handle_function_call(
     # Tool Search bridge: tool_search / tool_describe are catalog reads handled
     # inline; tool_call is unwrapped so every downstream hook (pre/post, edit
     # approval, guardrails) sees the real tool name, never the bridge.
-    bridged = _dispatch_bridge_tool(function_name, function_args, enabled_toolsets, disabled_toolsets)
+    bridged = _dispatch_bridge_tool(function_name, function_args, enabled_toolsets, disabled_toolsets, parent_agent)
     if bridged is not None:
         result, underlying = bridged
         if underlying is None:
