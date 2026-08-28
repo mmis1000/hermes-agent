@@ -363,7 +363,9 @@ def _tool_search_scoped_names(agent) -> frozenset:
 
     enabled = getattr(agent, "enabled_toolsets", None)
     disabled = getattr(agent, "disabled_toolsets", None)
+    protected_deferred = getattr(agent, "_protected_deferred_tool_snapshot", None)
     cache_key = (
+        frozenset(protected_deferred) if protected_deferred is not None else None,
         _registry.current_scope_key(),
         getattr(_registry, "_generation", 0),
         frozenset(enabled) if enabled is not None else None,
@@ -376,6 +378,8 @@ def _tool_search_scoped_names(agent) -> frozenset:
         names = _ts.scoped_deferrable_names(model_tools.get_tool_definitions(
             enabled_toolsets=enabled, disabled_toolsets=disabled, quiet_mode=True, skip_tool_search_assembly=True,
         ) or [])
+        if protected_deferred is not None:
+            names = names.intersection(protected_deferred)
     except Exception:
         names = frozenset()
     with contextlib.suppress(Exception):
@@ -1317,18 +1321,18 @@ class _ConcurrentBatch:
         # propagate_context_to_thread() at the submit site below (GHSA-qg5c-hvr5-hjgr, #13617).
         start = time.time()
         blocked = dispatched = False
+        def invoke_tracked(next_args):
+            from tools.foreground_wait import track_foreground_wait
+            with track_foreground_wait(agent, ref.call_id, ref.name, next_args):
+                return agent._invoke_tool(ref.name, next_args, ref.task_id, ref.call_id,
+                    messages=self.messages, pre_tool_block_checked=True,
+                    skip_tool_request_middleware=True, skip_tool_execution_middleware=True,
+                    tool_request_middleware_trace=list(ref.trace))
         try:
             managed = _run_agent_tool_execution_middleware(
                 agent,
                 **ref.middleware_kwargs(),
-                execute=lambda next_args: agent._invoke_tool(
-                    ref.name, next_args, ref.task_id, ref.call_id,
-                    messages=self.messages,
-                    pre_tool_block_checked=True,
-                    skip_tool_request_middleware=True,
-                    skip_tool_execution_middleware=True,
-                    tool_request_middleware_trace=list(ref.trace),
-                ),
+                execute=invoke_tracked,
                 scope_block=scope_block,
                 display_index=index + 1,
                 begin_execution=start_gate.advance,
@@ -1678,7 +1682,8 @@ def _resolve_sequential_dispatch(agent, ref: _ToolCallRef, messages: list) -> _S
     def _execute(next_args: dict) -> Any:
         import model_tools
 
-        with model_tools.suppress_post_tool_call_hook():
+        from tools.foreground_wait import track_foreground_wait
+        with track_foreground_wait(agent, tool_call_id, function_name, next_args), model_tools.suppress_post_tool_call_hook():
             return model_tools.handle_function_call(
                 function_name,
                 next_args,

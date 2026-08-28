@@ -129,6 +129,7 @@ def refresh_agent_mcp_tools(
     protected_snapshot = getattr(agent, "_protected_tool_snapshot", None)
     if protected_snapshot is not None:
         allowed_names = set(protected_snapshot)
+        allowed_names.update(getattr(agent, "_protected_bridge_tool_snapshot", frozenset()))
         qualified_servers = getattr(
             agent, "_protected_qualified_mcp_servers", frozenset()
         )
