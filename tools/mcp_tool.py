@@ -7799,6 +7799,9 @@ def refresh_agent_mcp_tools(
     protected_snapshot = getattr(agent, "_protected_tool_snapshot", None)
     if protected_snapshot is not None:
         allowed_names = set(protected_snapshot)
+        allowed_names.update(
+            getattr(agent, "_protected_bridge_tool_snapshot", frozenset())
+        )
         qualified_servers = getattr(
             agent, "_protected_qualified_mcp_servers", frozenset()
         )
@@ -7826,6 +7829,33 @@ def refresh_agent_mcp_tools(
         new_names = {
             item["function"]["name"] for item in new_defs
         }
+        protected_deferred = getattr(
+            agent, "_protected_deferred_tool_snapshot", None
+        )
+        if protected_deferred is not None:
+            # A protected bridge is a carrier, not an independently admitted
+            # tool. Refreshes normally receive a bridge assembled from the
+            # process-wide catalog, so retain only the already-filtered
+            # carrier schemas installed at protected admission. The dispatch
+            # path separately re-filters the live pre-assembly catalog.
+            from tools.tool_search import BRIDGE_TOOL_NAMES
+
+            current_bridge = {
+                item["function"]["name"]: item
+                for item in (getattr(agent, "tools", None) or [])
+                if item.get("function", {}).get("name") in BRIDGE_TOOL_NAMES
+            }
+            new_defs = [
+                current_bridge.get(
+                    item["function"]["name"], item
+                )
+                for item in new_defs
+                if item["function"]["name"] not in BRIDGE_TOOL_NAMES
+                or item["function"]["name"] in current_bridge
+            ]
+            new_names = {
+                item["function"]["name"] for item in new_defs
+            }
         staged_engine_names.intersection_update(allowed_names)
 
     # Single atomic read-diff-publish so the returned ``added`` is consistent

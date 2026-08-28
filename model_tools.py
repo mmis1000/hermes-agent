@@ -1337,6 +1337,25 @@ def handle_function_call(
                 disabled_toolsets=disabled_toolsets,
                 quiet_mode=True, skip_tool_search_assembly=True,
             ) or []
+            protected_deferred = None
+            if parent_agent is not None:
+                protected_deferred = getattr(
+                    parent_agent, "_protected_deferred_tool_snapshot", None
+                )
+            if protected_deferred is not None:
+                protected_deferred = frozenset(protected_deferred)
+                # The protected bridge is a carrier only.  Its pre-assembly
+                # catalog must be narrowed to the positive admission snapshot
+                # before search/describe/call can observe it.
+                current_defs = [
+                    item
+                    for item in current_defs
+                    if not _ts_mod.is_deferrable_tool_name(
+                        (item.get("function") or {}).get("name", "")
+                    )
+                    or (item.get("function") or {}).get("name")
+                    in protected_deferred
+                ]
         except Exception:
             current_defs = []
         if function_name == _ts_mod.TOOL_SEARCH_NAME:
