@@ -110,7 +110,9 @@ A protected child may request only admitted values:
 }
 ```
 
-The canonical visible path is identical in parent and child. A child may narrow `rw` to `ro`, but may not widen `ro` to `rw`, reveal an ancestor/sibling, escape its workdir, add another mount, or select an unapproved profile. Batch preflight is atomic: one invalid item starts zero children.
+The canonical visible path is identical in parent and child. A reveal may name an admitted regular file or directory; a revealed file is mounted by itself and does not expose its parent or siblings. Canonical ancestor and descendant directory paths may be combined. The most-specific requested path controls each nested path, every explicit mode must remain within the parent's effective mode at that exact path, and inherited parent carve-outs remain in the child's effective scope with their modes capped by the child request. For example, parent `/a rw, /a/b/c ro` plus child `/a/b rw` resolves to `/a/b rw, /a/b/c ro`; parent `/a ro, /a/b rw` requires the child to select `/a/b rw` explicitly to retain that writable exception. A child may not reveal an ancestor/sibling outside the selected ceiling, escape its workdir, add another mount, or select an unapproved profile. A workdir may be container-local or any admitted directory, including a read-only directory; the selected grant's original `ro`/`rw` mode remains authoritative for file writes. A file reveal is never a workdir. Batch preflight is atomic: one invalid item starts zero children.
+
+Trusted `/v1/runs` execution may establish its initial root scope from exact canonical regular files and directories selected by the trusted caller, including nested directory carve-outs. Later `delegate_task` calls may select or attenuate those grants but cannot turn a file grant into directory access or derive an arbitrary sibling from it.
 
 ## Runtime properties
 

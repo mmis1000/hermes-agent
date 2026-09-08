@@ -166,6 +166,7 @@ class TestStartRun:
             (set(), {"terminal"}),
         ],
     )
+    @pytest.mark.asyncio
     async def test_protected_start_uses_root_attempt_as_task_id(
         self,
         adapter,
@@ -174,7 +175,8 @@ class TestStartRun:
         expected_tool_names,
     ):
         repository = tmp_path / "repository"
-        repository.mkdir()
+        carveout = repository / "readonly"
+        carveout.mkdir(parents=True)
         profile = ExecutionProfile(
             name="filesystem-isolated",
             backend="docker",
@@ -251,7 +253,10 @@ class TestStartRun:
                         "execution": {
                             "profile": profile.name,
                             "workdir": str(repository),
-                            "reveal": [{"path": str(repository), "mode": "rw"}],
+                            "reveal": [
+                                {"path": str(repository), "mode": "rw"},
+                                {"path": str(carveout), "mode": "ro"},
+                            ],
                             "skills": ["selected"],
                         },
                     },
@@ -270,9 +275,16 @@ class TestStartRun:
         )
         assert f'Working directory: "{repository}"' in protected_prompt
         assert f'"{repository}" — directory, read-write' in protected_prompt
+        assert f'"{carveout}" — directory, read-only' in protected_prompt
+        assert "most-specific listed mode applies" in protected_prompt
         assert "Other host paths are not available in this attempt." in protected_prompt
         assert create.call_args.kwargs["delegation_policy"].visible_objects
-        assert root_registry.reserve.call_args.args[0].profile.network == "none"
+        root_scope = root_registry.reserve.call_args.args[0]
+        assert [(item.visible_path, item.mode) for item in root_scope.visible_objects] == [
+            (PurePosixPath(str(repository)), AccessMode.RW),
+            (PurePosixPath(str(carveout)), AccessMode.RO),
+        ]
+        assert root_scope.profile.network == "none"
         assert root_registry.reserve.call_args.args[0].skill_names == frozenset(
             {"selected"}
         )

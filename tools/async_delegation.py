@@ -133,6 +133,37 @@ def _persist_dispatch(record: Dict[str, Any]) -> None:
     _prune_durable_records()
 
 
+def _dispatch_identity_payload(record: Dict[str, Any]) -> Dict[str, Any]:
+    """Return the stable identities allocated before a worker is submitted.
+
+    ``subagent_id`` is the logical child identity and ``run_id`` identifies
+    this execution of the delegation.  Neither value is a provider/session or
+    container identity: those are deliberately allocated by the worker only
+    after the caller has received the dispatch receipt.  Keeping this payload
+    here also makes the single, batch, and cron dispatch paths agree on the
+    public receipt shape.
+    """
+    roots = [
+        str(value)
+        for value in (record.get("root_subagent_ids") or [])
+        if isinstance(value, str) and value
+    ]
+    run_id = record.get("run_id")
+    subagents = [
+        {
+            "subagent_id": logical_id,
+            "run_id": run_id,
+            "status": "starting",
+        }
+        for logical_id in roots
+    ]
+    return {
+        "run_id": run_id,
+        "subagent_ids": roots,
+        "subagents": subagents,
+    }
+
+
 def _delete_durable_delegation(delegation_id: str) -> None:
     if _repository().delete(delegation_id):
         _notify_state_change()
@@ -292,7 +323,11 @@ def restore_stale_wait_completions(
 
 
 def _terminal(snapshot: Dict[str, Any]) -> bool:
-    return str(snapshot.get("state") or "") not in _ACTIVE_STATES
+    """A run is terminal only after its durable producer finalization lands."""
+    return bool(
+        snapshot.get("completed_at") is not None
+        and snapshot.get("event") is not None
+    )
 
 
 def get_durable_delegation(delegation_id: str) -> Optional[Dict[str, Any]]:
@@ -987,6 +1022,21 @@ def release_wait_hold(
     )
 
 
+def _annotate_wait_snapshot(
+    snapshot: Dict[str, Any], *, claimed_delivery: Optional[bool] = None
+) -> Dict[str, Any]:
+    """Expose one stable wait result/readiness/delivery projection."""
+    ready = snapshot.get("completed_at") is not None and snapshot.get("result") is not None
+    snapshot["result_ready"] = bool(ready)
+    snapshot["result_available"] = bool(ready)
+    if claimed_delivery is not None:
+        snapshot["claimed_delivery"] = bool(claimed_delivery)
+    else:
+        snapshot["claimed_delivery"] = bool(snapshot.get("claimed_delivery", False))
+    snapshot["delivery_consumed"] = snapshot.get("delivery_state") == "consumed"
+    return snapshot
+
+
 def wait_for_delegation(
     delegation_id: str, *, session_key: str, timeout_seconds: float = 30.0,
     run_id: Optional[str] = None,
@@ -1101,7 +1151,7 @@ def wait_for_delegation(
                 _STATE_CONDITION.wait(timeout=min(remaining, _WAIT_POLL_SECONDS))
 
     try:
-        return _wait_bound()
+        return _annotate_wait_snapshot(_wait_bound())
     except BaseException:
         # A transient DB/read failure after acquisition must never strand a
         # held_by_wait run. Preserve the original exception if cleanup also
@@ -1653,7 +1703,11 @@ def dispatch_async_delegation(
         "Dispatched async delegation %s (session_key=%s): %s",
         delegation_id, session_key or "<cli>", (goal or "")[:80],
     )
-    return {"status": "dispatched", "delegation_id": delegation_id}
+    return {
+        "status": "dispatched",
+        "delegation_id": delegation_id,
+        **_dispatch_identity_payload(record),
+    }
 
 
 def _finalize(delegation_id: str, result: Dict[str, Any], status: str) -> None:
@@ -1788,6 +1842,9 @@ def dispatch_async_delegation_batch(
     delegation_id = delegation_id or _new_delegation_id()
     dispatched_at = time.time()
     n = len(goals)
+    logical_root_ids = list(root_subagent_ids or [])
+    if not logical_root_ids:
+        logical_root_ids = [f"sa-{delegation_id}-{index}" for index in range(n)]
     # A combined goal label for status listings / the completion header.
     combined_goal = (
         goals[0] if n == 1 else f"{n} parallel subagents: " + "; ".join(g[:40] for g in goals)
@@ -1808,7 +1865,7 @@ def dispatch_async_delegation_batch(
         "completed_at": None,
         "interrupt_fn": interrupt_fn,
         "_interrupt_lock": threading.Lock(),
-        "root_subagent_ids": list(root_subagent_ids or []),
+        "root_subagent_ids": logical_root_ids,
         "is_batch": True,
     }
     if attempt_ids_by_logical_id is not None:
@@ -1893,7 +1950,11 @@ def dispatch_async_delegation_batch(
         "Dispatched async delegation batch %s (%d task(s), session_key=%s)",
         delegation_id, n, session_key or "<cli>",
     )
-    return {"status": "dispatched", "delegation_id": delegation_id}
+    return {
+        "status": "dispatched",
+        "delegation_id": delegation_id,
+        **_dispatch_identity_payload(record),
+    }
 
 
 def _finalize_batch(

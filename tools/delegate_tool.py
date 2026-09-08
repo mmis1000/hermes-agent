@@ -498,11 +498,10 @@ def _handle_control_action(
             if not _owns_subagent_record(r, parent_agent):
                 continue
             started = r.get("started_at")
-            entries.append(
-                {
+            goal = redact_observable_text(str(r.get("goal") or ""))
+            entry = {
                     "subagent_id": r.get("subagent_id"),
                     "parent_id": r.get("parent_id"),
-                    "goal": r.get("goal"),
                     "model": r.get("model"),
                     "status": r.get("status"),
                     "running_seconds": (
@@ -513,7 +512,12 @@ def _handle_control_action(
                     "accepting_steer": bool(r.get("accepting_steer", False)),
                     "live_transcript": getattr(agent, "_live_transcript_path", None),
                 }
-            )
+            if len(goal) <= 180:
+                entry["goal"] = goal
+            else:
+                entry["goal_preview"] = goal[:180] + "…"
+                entry["goal_truncated"] = True
+            entries.append(entry)
         payload: Dict[str, Any] = {
             "action": "list",
             "count": len(entries),
@@ -3743,6 +3747,7 @@ def _route_delegate_control_action(
     cascade: Optional[bool] = None,
     reason: Optional[str] = None,
     force: Optional[bool] = None,
+    detail: Optional[bool] = None,
 ) -> str:
     """Route a control action to the live tree or the durable lifecycle plane."""
     has_delegation_id = bool(str(delegation_id or "").strip())
@@ -3785,6 +3790,7 @@ def _route_delegate_control_action(
         reason=reason,
         message=message,
         force=force,
+        detail=detail,
         parent_agent=parent_agent,
     )
 
@@ -3815,6 +3821,7 @@ def delegate_task(
     cascade: Optional[bool] = None,
     reason: Optional[str] = None,
     force: Optional[bool] = None,
+    detail: Optional[bool] = None,
 ) -> str:
     """
     Spawn one or more child agents to handle delegated tasks, or control
@@ -3861,6 +3868,7 @@ def delegate_task(
             cascade=cascade,
             reason=reason,
             force=force,
+            detail=detail,
         )
     if normalized_action and normalized_action != "spawn":
         return tool_error(
@@ -4650,6 +4658,9 @@ def delegate_task(
                 "goals": _goals,
                 "note": note,
             }
+            for key in ("run_id", "subagent_ids", "subagents"):
+                if key in dispatch:
+                    payload[key] = dispatch[key]
             if live_paths:
                 payload["live_transcripts"] = list(live_paths)
                 payload["live_transcripts_hint"] = (
@@ -5174,7 +5185,11 @@ DELEGATE_TASK_SCHEMA: Dict[str, Any] = {
             },
             "profile": {
                 "type": "string",
-                "description": "Execution profile selected from the profiles admitted for this agent.",
+                "description": (
+                    "Execution profile for an actual protected spawn. Existing "
+                    "control actions (list/status/tail/wait/steer/resume/interrupt/abandon) "
+                    "reuse the admitted child and do not require spawn-only profile configuration."
+                ),
             },
             "workdir": {
                 "type": "string",
@@ -5185,13 +5200,33 @@ DELEGATE_TASK_SCHEMA: Dict[str, Any] = {
                 "items": {
                     "type": "object",
                     "properties": {
-                        "path": {"type": "string"},
-                        "mode": {"type": "string", "enum": ["ro", "rw"]},
+                        "path": {
+                            "type": "string",
+                            "description": (
+                                "Canonical absolute parent-visible path; ancestor and "
+                                "descendant entries may overlap."
+                            ),
+                        },
+                        "mode": {
+                            "type": "string",
+                            "enum": ["ro", "rw"],
+                            "description": (
+                                "Requested access at this exact path. A descendant may "
+                                "differ when the parent permits it, but may not widen "
+                                "the parent's effective access."
+                            ),
+                        },
                     },
                     "required": ["path", "mode"],
                     "additionalProperties": False,
                 },
-                "description": "Visible objects explicitly requested from the parent/session ceiling.",
+                "description": (
+                    "Visible objects requested from the parent/session ceiling. "
+                    "Canonical ancestor and descendant paths may be combined; the "
+                    "most-specific request controls each nested path. Parent "
+                    "carve-outs are inherited automatically, and explicit widening "
+                    "is rejected."
+                ),
             },
             "model": {
                 "type": "string",
@@ -5340,6 +5375,14 @@ DELEGATE_TASK_SCHEMA: Dict[str, Any] = {
                     "background before delivering the guidance."
                 ),
             },
+            "detail": {
+                "type": "boolean",
+                "description": (
+                    "For list/status/wait/tail: opt into full goal, authority, "
+                    "and tail detail. Defaults to compact operational fields; "
+                    "raw lifecycle evidence remains available through tail."
+                ),
+            },
         },
         "required": [],
     },
@@ -5417,6 +5460,7 @@ registry.register(
         cascade=args.get("cascade"),
         reason=args.get("reason"),
         force=args.get("force"),
+        detail=args.get("detail"),
         parent_agent=kw.get("parent_agent"),
     ),
     check_fn=check_delegate_requirements,

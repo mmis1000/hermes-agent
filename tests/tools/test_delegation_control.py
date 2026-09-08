@@ -160,12 +160,23 @@ def test_status_projection_redacts_backing_identity_and_reports_cleanup_failure(
 
     assert "/host/private/control-input" not in raw
     assert "authority" not in child
-    assert child["authority_audit"]["visible_objects"][0]["backing"][
+    assert "authority_audit" not in child
+
+    detailed = json.loads(
+        delegation_control(
+            action="status",
+            delegation_id="deleg-control-authority",
+            session_key="owner",
+            detail=True,
+        )
+    )
+    detailed_child = detailed["subagents"][0]
+    assert detailed_child["authority_audit"]["visible_objects"][0]["backing"][
         "identity"
     ] == "[REDACTED]"
-    assert child["authority_audit"]["outcome"]["execution"] == "error"
-    assert child["authority_audit"]["outcome"]["cleanup"] == "failed"
-    assert child["authority_audit"]["state"] == {
+    assert detailed_child["authority_audit"]["outcome"]["execution"] == "error"
+    assert detailed_child["authority_audit"]["outcome"]["cleanup"] == "failed"
+    assert detailed_child["authority_audit"]["state"] == {
         "revoked": True,
         "cleaned": False,
     }
@@ -513,7 +524,7 @@ def test_steer_queues_while_starting_then_forwards_in_order_and_acks_injection()
         for text in ("first guidance", "second guidance")
     ]
     assert [item["status"] for item in responses] == ["accepted", "accepted"]
-    assert [item["steer_status"] for item in responses] == ["pending", "pending"]
+    assert [item["steer_status"] for item in responses] == ["queued", "queued"]
 
     delivered = []
     agent = MagicMock()

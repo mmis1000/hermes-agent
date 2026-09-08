@@ -8537,6 +8537,7 @@ class AIAgent:
             cascade=function_args.get("cascade"),
             reason=function_args.get("reason"),
             force=function_args.get("force"),
+            detail=function_args.get("detail"),
             parent_agent=self,
         )
 

@@ -119,6 +119,32 @@ class TestDelegateRequirements(unittest.TestCase):
         for protected in ("profile", "workdir", "reveal"):
             self.assertNotIn(protected, nested)
 
+    def test_schema_describes_nested_reveal_tree_to_model(self):
+        from tools.delegate_tool import _build_dynamic_schema_overrides
+        from tools.registry import registry
+
+        static_reveal = DELEGATE_TASK_SCHEMA["parameters"]["properties"]["reveal"]
+        dynamic_reveal = _build_dynamic_schema_overrides()["parameters"]["properties"][
+            "reveal"
+        ]
+        registry_reveal = registry.get_definitions({"delegate_task"})[0]["function"][
+            "parameters"
+        ]["properties"]["reveal"]
+
+        for reveal in (static_reveal, dynamic_reveal, registry_reveal):
+            rendered = json.dumps(reveal).lower()
+            for term in (
+                "ancestor",
+                "descendant",
+                "most-specific",
+                "inherited",
+                "parent",
+                "widen",
+            ):
+                self.assertIn(term, rendered)
+            self.assertIn("description", reveal["items"]["properties"]["path"])
+            self.assertIn("description", reveal["items"]["properties"]["mode"])
+
     def test_schema_description_allows_per_call_routing_overrides(self):
         from tools.delegate_tool import _build_dynamic_schema_overrides
 
