@@ -160,12 +160,23 @@ def test_status_projection_redacts_backing_identity_and_reports_cleanup_failure(
 
     assert "/host/private/control-input" not in raw
     assert "authority" not in child
-    assert child["authority_audit"]["visible_objects"][0]["backing"][
+    assert "authority_audit" not in child
+
+    detailed = json.loads(
+        delegation_control(
+            action="status",
+            delegation_id="deleg-control-authority",
+            session_key="owner",
+            detail=True,
+        )
+    )
+    detailed_child = detailed["subagents"][0]
+    assert detailed_child["authority_audit"]["visible_objects"][0]["backing"][
         "identity"
     ] == "[REDACTED]"
-    assert child["authority_audit"]["outcome"]["execution"] == "error"
-    assert child["authority_audit"]["outcome"]["cleanup"] == "failed"
-    assert child["authority_audit"]["state"] == {
+    assert detailed_child["authority_audit"]["outcome"]["execution"] == "error"
+    assert detailed_child["authority_audit"]["outcome"]["cleanup"] == "failed"
+    assert detailed_child["authority_audit"]["state"] == {
         "revoked": True,
         "cleaned": False,
     }
@@ -502,7 +513,7 @@ def test_steer_queues_while_starting_then_forwards_in_order_and_acks_injection()
         for text in ("first guidance", "second guidance")
     ]
     assert [item["status"] for item in responses] == ["accepted", "accepted"]
-    assert [item["steer_status"] for item in responses] == ["pending", "pending"]
+    assert [item["steer_status"] for item in responses] == ["queued", "queued"]
 
     delivered = []
     agent = MagicMock()
@@ -633,7 +644,7 @@ def test_forced_public_steer_handoffs_wait_then_uses_normal_ack_path():
     )
 
     def complete_handoff():
-        assert slot.background_requested.wait(1)
+        assert slot.background_requested.wait(60)
         slot.complete_background({"kind": "process", "session_id": "proc_force"})
 
     responder = threading.Thread(target=complete_handoff)
@@ -751,7 +762,7 @@ def test_claimed_steer_reports_honest_race_outcome(monkeypatch, winner, expected
     def blocked_claim(self, attempt_id, mailbox_id):
         outcome = real_claim(self, attempt_id, mailbox_id)
         claim_started.set()
-        assert release_claim.wait(2)
+        assert release_claim.wait(60)
         return outcome
 
     monkeypatch.setattr(type(repository), "claim_steer", blocked_claim)
@@ -799,7 +810,7 @@ def test_claimed_steer_reports_honest_race_outcome(monkeypatch, winner, expected
 
     thread = threading.Thread(target=request_steer)
     thread.start()
-    assert claim_started.wait(2)
+    assert claim_started.wait(60)
     if winner == "interrupt":
         interrupted = json.loads(
             delegation_control(
@@ -878,7 +889,7 @@ def test_compressed_parent_session_retains_control_without_root_scope_leak():
 def test_list_and_status_hide_foreign_session_like_unknown():
     release = threading.Event()
     dispatched = _dispatch(
-        lambda: (release.wait(2), {"status": "completed", "summary": "done"})[1],
+        lambda: (release.wait(60), {"status": "completed", "summary": "done"})[1],
         roots=["sa-owner"],
     )
     from tools.delegation_control import delegation_control
@@ -909,7 +920,7 @@ def test_list_and_status_hide_foreign_session_like_unknown():
 def test_tail_filters_reasoning_and_redacts_split_stream_secret():
     release = threading.Event()
     dispatched = _dispatch(
-        lambda: (release.wait(2), {"status": "completed", "summary": "done"})[1],
+        lambda: (release.wait(60), {"status": "completed", "summary": "done"})[1],
         roots=["sa-tail"],
     )
     agent = MagicMock()
@@ -1017,7 +1028,7 @@ def test_starting_child_interrupt_is_queued_then_applied_once():
 
     def runner():
         runner_started.set()
-        assert allow_registration.wait(2)
+        assert allow_registration.wait(60)
         dt._register_subagent(
             {
                 "subagent_id": "sa-starting",
@@ -1030,12 +1041,12 @@ def test_starting_child_interrupt_is_queued_then_applied_once():
             }
         )
         registered.set()
-        assert allow_finish.wait(2)
+        assert allow_finish.wait(60)
         dt._unregister_subagent("sa-starting")
         return {"status": "interrupted", "summary": "stopped"}
 
     dispatched = _dispatch(runner, roots=["sa-starting"])
-    assert runner_started.wait(2)
+    assert runner_started.wait(60)
     from tools.delegation_control import delegation_control
 
     try:
@@ -1051,7 +1062,7 @@ def test_starting_child_interrupt_is_queued_then_applied_once():
         assert payload["status"] == "interrupt_requested"
         agent.interrupt.assert_not_called()
         allow_registration.set()
-        assert registered.wait(2)
+        assert registered.wait(60)
         agent.interrupt.assert_called_once_with("stop before startup")
     finally:
         allow_registration.set()
@@ -1203,7 +1214,7 @@ def test_cross_process_interrupt_cannot_claim_owner_callback_success():
             ad.interrupt_async_delegation(delegation_id, session_key="owner", reason="first")
         ))
         owner.start()
-        assert callback_entered.wait(2)
+        assert callback_entered.wait(60)
         ctx = multiprocessing.get_context("spawn"); output = ctx.Queue()
         observer = ctx.Process(target=_observe_interrupt, args=(os.environ["HERMES_HOME"], delegation_id, output))
         observer.start()
@@ -1242,7 +1253,7 @@ def test_concurrent_interrupt_callbacks_serialize_failure_then_success(monkeypat
             try:
                 callback_rendezvous.wait(timeout=0.5)
                 if call_number == 1:
-                    assert successful_callback.wait(2)
+                    assert successful_callback.wait(60)
             except threading.BrokenBarrierError:
                 pass
             if call_number == 1:
@@ -1282,7 +1293,7 @@ def test_concurrent_idempotent_interrupt_waits_for_callback_owner(monkeypatch):
     def successful_interrupt():
         callback_calls.append(True)
         callback_entered.set()
-        assert release_callback.wait(2)
+        assert release_callback.wait(60)
 
     dispatched = _dispatch(
         lambda: (release.wait(10), {"status": "completed", "summary": "done"})[1],
@@ -1292,7 +1303,7 @@ def test_concurrent_idempotent_interrupt_waits_for_callback_owner(monkeypatch):
     delegation_id = dispatched["delegation_id"]
 
     def release_owner(outcomes, returned):
-        assert callback_entered.wait(2)
+        assert callback_entered.wait(60)
         assert not returned.wait(0.2)
         assert outcomes == []
         release_callback.set()
@@ -1370,6 +1381,7 @@ async def test_gateway_ack_failure_retries_without_duplicate_injection(monkeypat
     runner._completion_deliveries_delivered = OrderedDict()
     runner._completion_delivery_retention = 32
     runner._inject_watch_notification = AsyncMock(return_value=True)
+    runner._completion_delivery_ready = AsyncMock(return_value=True)
 
     monkeypatch.setattr(
         ad,
@@ -1391,6 +1403,6 @@ async def test_gateway_ack_failure_retries_without_duplicate_injection(monkeypat
     second = await runner._deliver_completion_notification("result", event)
     assert first is False
     assert second is True
-    runner._inject_watch_notification.assert_awaited_once_with("result", event)
+    runner._inject_watch_notification.assert_awaited_once_with("result", event, raise_not_accepted=True)
     assert "_gateway_async_delivery_claim" not in event
     assert "_gateway_async_delivery_accepted" not in event

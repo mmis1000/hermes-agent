@@ -24,12 +24,13 @@ _TOOL_FIELDS = {
     "reason",
     "message",
     "force",
+    "detail",
 }
 _ACTION_FIELDS = {
-    "list": set(),
-    "status": {"delegation_id", "subagent_id"},
-    "tail": {"delegation_id", "subagent_id", "attempt_id", "limit"},
-    "wait": {"delegation_id", "run_id", "timeout_seconds"},
+    "list": {"detail"},
+    "status": {"delegation_id", "subagent_id", "detail"},
+    "tail": {"delegation_id", "subagent_id", "attempt_id", "limit", "detail"},
+    "wait": {"delegation_id", "run_id", "timeout_seconds", "detail"},
     "steer": {"delegation_id", "subagent_id", "message", "force"},
     "resume": {"delegation_id", "subagent_id", "message"},
     "interrupt": {"delegation_id", "subagent_id", "cascade", "reason"},
@@ -86,6 +87,7 @@ def _validate(
     reason: Optional[str],
     message: Optional[str],
     force: Optional[bool],
+    detail: Optional[bool],
 ) -> Optional[str]:
     if action not in _ACTIONS:
         return f"Unknown action {action!r}; expected one of {sorted(_ACTIONS)}."
@@ -102,6 +104,7 @@ def _validate(
             "reason": reason,
             "message": message,
             "force": force,
+            "detail": detail,
         }.items()
         if value is not None
     }
@@ -155,6 +158,8 @@ def _validate(
         return "cascade must be a boolean."
     if force is not None and not isinstance(force, bool):
         return "force must be a boolean."
+    if detail is not None and not isinstance(detail, bool):
+        return "detail must be a boolean."
     if reason is not None and not isinstance(reason, str):
         return "reason must be a string."
     if reason is not None and len(reason) > _MAX_REASON_CHARS:
@@ -187,7 +192,53 @@ def _safe_activity(value: Any) -> Optional[Dict[str, Any]]:
         "budget_used",
         "budget_max",
     }
-    return {key: value.get(key) for key in allowed if value.get(key) is not None}
+    result = {key: value.get(key) for key in allowed if value.get(key) is not None}
+    description = result.get("last_activity_desc")
+    if isinstance(description, str) and len(description) > 240:
+        result["last_activity_desc"] = description[:240] + "…"
+    current_tool = result.get("current_tool")
+    if isinstance(current_tool, str) and len(current_tool) > 120:
+        result["current_tool"] = current_tool[:120] + "…"
+    return result
+
+
+_COMPACT_GOAL_CHARS = 180
+
+
+def _goal_preview(value: Any) -> tuple[Optional[str], bool]:
+    """Return a bounded, redacted goal preview without changing the archive."""
+    if value is None:
+        return None, False
+    text = _delegate.redact_observable_text(str(value))
+    if len(text) <= _COMPACT_GOAL_CHARS:
+        return text, False
+    return text[:_COMPACT_GOAL_CHARS] + "…", True
+
+
+def _public_steer_status(value: Any) -> str:
+    """Translate durable mailbox states into model-facing receipts."""
+    status = str(value or "")
+    return {
+        "pending": "queued",
+        "forwarding": "accepted",
+        "forwarded": "accepted",
+        "injected": "injected",
+        "foreground_wait": "foreground_wait",
+    }.get(status, status or "accepted")
+
+
+def _aggregate_worker_status(
+    record: Dict[str, Any], children: Optional[List[Dict[str, Any]]] = None
+) -> str:
+    """Project the authoritative run state without inferring finalization.
+
+    Child ``live`` flags are process-local observability, not lifecycle
+    authority.  A restarted worker can have zero live objects while its
+    durable run is still starting/finalizing, so list never upgrades a
+    terminal-looking child projection into a fabricated completed state.
+    """
+    record_state = str(record.get("worker_status") or record.get("state") or "")
+    return "running" if record_state == "starting" else record_state
 
 
 def _children_for_record(
@@ -196,6 +247,8 @@ def _children_for_record(
     session_key: str,
     subagent_id: Optional[str] = None,
     include_tail: bool = False,
+    detail: bool = False,
+    summary_only: bool = False,
     include_live: bool = True,
     limit: int = 20,
 ) -> List[Dict[str, Any]]:
@@ -269,7 +322,6 @@ def _children_for_record(
                 "subagent_id",
                 "parent_id",
                 "depth",
-                "goal",
                 "model",
                 "started_at",
                 "status",
@@ -286,15 +338,52 @@ def _children_for_record(
             )
             if child.get(key) is not None
         }
+        goal, goal_truncated = _goal_preview(child.get("goal"))
+        if detail:
+            if child.get("goal") is not None:
+                item["goal"] = child.get("goal")
+        elif goal is not None:
+            item["goal_preview"] = goal
+            if goal_truncated:
+                item["goal_truncated"] = True
+        for field, limit_chars in (("last_tool", 120), ("interrupt_reason", 240)):
+            value = item.get(field)
+            if isinstance(value, str):
+                value = _delegate.redact_observable_text(value)
+                item[field] = value if len(value) <= limit_chars else value[:limit_chars] + "…"
+        item["durable_active"] = str(child.get("status") or "") in _async._ACTIVE_STATES
         activity = _safe_activity(child.get("activity"))
         if activity:
             item["activity"] = activity
         authority_audit = child.get("authority_audit")
-        if isinstance(authority_audit, dict):
+        if detail and isinstance(authority_audit, dict):
             item["authority_audit"] = dict(authority_audit)
         steers = child.get("steers")
         if isinstance(steers, list) and steers:
-            item["steers"] = [dict(steer) for steer in steers[-20:] if isinstance(steer, dict)]
+            if detail:
+                item["steers"] = [dict(steer) for steer in steers[-20:] if isinstance(steer, dict)]
+            else:
+                compact_steers = []
+                for steer in steers[-20:]:
+                    if not isinstance(steer, dict):
+                        continue
+                    compact_steers.append(
+                        {
+                            key: steer.get(key)
+                            for key in (
+                                "mailbox_id",
+                                "attempt_id",
+                                "sequence_number",
+                                "status",
+                                "created_at",
+                                "forwarded_at",
+                                "resolved_at",
+                            )
+                            if steer.get(key) is not None
+                        }
+                    )
+                if compact_steers:
+                    item["steers"] = compact_steers
         if include_tail:
             item["assistant_text_tail"] = _delegate.redact_observable_text(
                 child.get("assistant_text_tail") or ""
@@ -309,6 +398,26 @@ def _children_for_record(
                 if isinstance(event, dict)
                 and event.get("type") in {"tool.started", "tool.completed"}
             ][-limit:]
+        if summary_only:
+            item = {
+                key: item[key]
+                for key in (
+                    "subagent_id",
+                    "parent_id",
+                    "depth",
+                    "status",
+                    "attempt_id",
+                    "attempt_number",
+                    "run_id",
+                    "resume_available",
+                    "suggested_action",
+                    "goal_preview",
+                    "goal_truncated",
+                    "live",
+                    "durable_active",
+                )
+                if key in item
+            }
         output.append(item)
     return output
 
@@ -333,6 +442,7 @@ def delegation_control(
     reason: Optional[str] = None,
     message: Optional[str] = None,
     force: Optional[bool] = None,
+    detail: Optional[bool] = None,
     session_key: Optional[str] = None,
     parent_agent=None,
 ) -> str:
@@ -352,11 +462,20 @@ def delegation_control(
         reason=reason,
         message=message,
         force=force,
+        detail=detail,
     )
     if error:
         return _invalid(action, error)
 
     caller_session = _resolve_session_key(session_key)
+    if not caller_session and parent_agent is not None:
+        # CLI/TUI turns may not bind the gateway approval contextvar.  The
+        # parent agent's durable session id is the same owner captured at
+        # spawn, so use it as an exact owner proof rather than falling back to
+        # an unscoped lookup.
+        parent_session = getattr(parent_agent, "session_id", None)
+        if isinstance(parent_session, str) and parent_session.strip():
+            caller_session = parent_session.strip()
     owner_candidates = _control_session_candidates(caller_session)
     origin = caller_session
     audit_reason = _redact_reason(reason)
@@ -365,20 +484,61 @@ def delegation_control(
         delegations = []
         for record in _async.list_durable_delegations(session_keys=owner_candidates):
             record_origin = str(record.get("session_key") or "")
-            delegations.append(
-                {
-                    "delegation_id": record.get("delegation_id"),
-                    "goal": record.get("goal"),
-                    "count": len(record.get("goals") or [record.get("goal")]),
-                    "worker_status": record.get("worker_status"),
-                    "delivery_disposition": record.get("delivery_disposition"),
-                    "dispatched_at": record.get("dispatched_at"),
-                    "completed_at": record.get("completed_at"),
-                    "subagents": _children_for_record(
-                        record, session_key=record_origin, include_tail=False
-                    ),
-                }
+            goal_preview, goal_truncated = _goal_preview(record.get("goal"))
+            compact_children = _children_for_record(
+                record,
+                session_key=record_origin,
+                include_tail=False,
+                detail=bool(detail),
+                summary_only=not bool(detail),
             )
+            aggregate_status = _aggregate_worker_status(record, compact_children)
+            entry = {
+                "delegation_id": record.get("delegation_id"),
+                "count": len(record.get("goals") or [record.get("goal")]),
+                "child_count": len(compact_children),
+                "live_child_count": sum(bool(child.get("live")) for child in compact_children),
+                "active_child_count": sum(
+                    str(child.get("status") or "") in _async._ACTIVE_STATES
+                    for child in compact_children
+                ),
+                "worker_status": aggregate_status,
+                "status": aggregate_status,
+                "state": aggregate_status,
+                "delivery_disposition": record.get("delivery_disposition"),
+                "result_ready": record.get("result") is not None,
+                "run_id": record.get("run_id"),
+                "latest_run_id": record.get("latest_run_id"),
+                "active_run_id": record.get("active_run_id"),
+                "pending_run_count": record.get("pending_run_count", 0),
+                "dispatched_at": record.get("dispatched_at"),
+                "completed_at": record.get("completed_at"),
+            }
+            if detail:
+                entry["subagents"] = compact_children
+                entry["goal"] = record.get("goal")
+                if record.get("goals") is not None:
+                    entry["goals"] = record.get("goals")
+            else:
+                root_ids = [
+                    str(value)
+                    for value in (record.get("root_subagent_ids") or [])
+                    if isinstance(value, str) and value
+                ]
+                if not root_ids:
+                    root_ids = [
+                        str(child.get("subagent_id"))
+                        for child in compact_children
+                        if child.get("parent_id") in {None, ""}
+                        and isinstance(child.get("subagent_id"), str)
+                    ]
+                entry["root_subagent_ids"] = root_ids
+                entry["subagent_ids"] = root_ids
+                if goal_preview is not None:
+                    entry["goal_preview"] = goal_preview
+                    if goal_truncated:
+                        entry["goal_truncated"] = True
+            delegations.append(entry)
         return json.dumps(
             {"action": action, "status": "ok", "delegations": delegations},
             ensure_ascii=False,
@@ -418,16 +578,18 @@ def delegation_control(
     if action in {"status", "tail"}:
         include_tail = action == "tail"
         event_limit = min(_MAX_TAIL_EVENTS, int(limit or 20))
+        goal_preview, goal_truncated = _goal_preview(record.get("goal"))
         payload = {
             "action": action,
             "status": record.get("worker_status"),
             "delegation_id": target,
             "worker_status": record.get("worker_status"),
             "delivery_disposition": record.get("delivery_disposition"),
-            "goal": record.get("goal"),
             "dispatched_at": record.get("dispatched_at"),
             "completed_at": record.get("completed_at"),
             "result_available": record.get("result") is not None,
+            "result_ready": record.get("result") is not None,
+            "child_count": len(record.get("children") or {}),
             "run_id": record.get("run_id"),
             "latest_run_id": record.get("latest_run_id"),
             "active_run_id": record.get("active_run_id"),
@@ -439,10 +601,19 @@ def delegation_control(
                 session_key=origin,
                 subagent_id=child_target,
                 include_tail=include_tail,
+                detail=bool(detail),
                 include_live=not bool(selected_attempt),
                 limit=event_limit,
             ),
         }
+        if detail:
+            payload["goal"] = record.get("goal")
+            if record.get("goals") is not None:
+                payload["goals"] = record.get("goals")
+        elif goal_preview is not None:
+            payload["goal_preview"] = goal_preview
+            if goal_truncated:
+                payload["goal_truncated"] = True
         return json.dumps(payload, ensure_ascii=False)
 
     if action == "wait":
@@ -460,14 +631,25 @@ def delegation_control(
             "delegation_id": target,
             "worker_status": waited.get("worker_status"),
             "delivery_disposition": waited.get("delivery_disposition"),
+            "delivery_state": waited.get("delivery_state"),
+            "delivery_consumed": waited.get("delivery_state") == "consumed",
             "claimed_delivery": bool(waited.get("claimed_delivery", False)),
             "run_id": waited.get("run_id"),
             "latest_run_id": waited.get("latest_run_id"),
             "active_run_id": waited.get("active_run_id"),
             "pending_run_count": waited.get("pending_run_count", 0),
             "result": waited.get("result"),
+            "result_ready": bool(
+                waited.get("completed_at") is not None
+                and waited.get("result") is not None
+            ),
+            "child_count": len(waited.get("children") or {}),
             "subagents": _children_for_record(
-                waited, session_key=origin, include_tail=True, limit=20
+                waited,
+                session_key=origin,
+                include_tail=bool(detail),
+                detail=bool(detail),
+                limit=20,
             ),
         }
         if isinstance(waited.get("foreground_handoff"), dict):
@@ -501,6 +683,7 @@ def delegation_control(
         )
         mailbox = _async.inspect_subagent_steer(str(queued["mailbox_id"]))
         mailbox_status = str(mailbox.get("status") or "pending")
+        receipt_status = _public_steer_status(mailbox_status)
         honest_status = (
             mailbox_status
             if mailbox_status in {
@@ -518,7 +701,8 @@ def delegation_control(
             "subagent_id": child_target,
             "attempt_id": queued.get("attempt_id"),
             "mailbox_id": queued.get("mailbox_id"),
-            "steer_status": mailbox_status,
+            "steer_status": receipt_status,
+            "mailbox_status": mailbox_status,
             "force": bool(force),
         }
         exact_outcome = steer_outcomes.get(str(queued["mailbox_id"])) or {}
@@ -526,7 +710,7 @@ def delegation_control(
             payload["wait_kinds"] = exact_outcome["wait_kinds"]
         if exact_outcome.get("errors"):
             payload["errors"] = exact_outcome["errors"]
-        if mailbox_status == "foreground_wait":
+        if receipt_status == "foreground_wait":
             payload["hint"] = (
                 "Retry this steer with force=true to move the foreground wait "
                 "to background."
@@ -642,5 +826,6 @@ def _handle_delegation_args(args: Dict[str, Any], *, parent_agent=None) -> str:
         reason=args.get("reason"),
         message=args.get("message"),
         force=args.get("force"),
+        detail=args.get("detail"),
         parent_agent=parent_agent,
     )
