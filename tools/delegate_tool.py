@@ -486,7 +486,7 @@ def delegate_task(
     output_schema: Optional[Dict[str, Any]] = None, images: Optional[List[str]] = None, action: Optional[str] = None,
     subagent_id: Optional[str] = None, message: Optional[str] = None, parent_agent=None,
     delegation_id: Optional[str] = None, attempt_id: Optional[str] = None, run_id: Optional[str] = None,
-    timeout_seconds: Optional[float] = None, limit: Optional[int] = None, cascade: Optional[bool] = None, reason: Optional[str] = None, force: Optional[bool] = None,
+    timeout_seconds: Optional[float] = None, limit: Optional[int] = None, cascade: Optional[bool] = None, reason: Optional[str] = None, force: Optional[bool] = None, detail: Optional[bool] = None,
     credentials_cfg: Optional[Dict[str, Any]] = None,
     profile: Optional[str] = None, workdir: Optional[str] = None, reveal: Optional[list] = None,
     model: Optional[str] = None, provider: Optional[str] = None, reasoning_effort: Optional[str] = None,
@@ -500,7 +500,7 @@ def delegate_task(
 
     normalized_action = (action or "").strip().lower()
     if normalized_action in _MERGED_CONTROL_ACTIONS:
-        return _route_delegate_control_action(normalized_action, parent_agent=parent_agent, subagent_id=subagent_id, message=message, delegation_id=delegation_id, attempt_id=attempt_id, run_id=run_id, timeout_seconds=timeout_seconds, limit=limit, cascade=cascade, reason=reason, force=force)
+        return _route_delegate_control_action(normalized_action, parent_agent=parent_agent, subagent_id=subagent_id, message=message, delegation_id=delegation_id, attempt_id=attempt_id, run_id=run_id, timeout_seconds=timeout_seconds, limit=limit, cascade=cascade, reason=reason, force=force, detail=detail)
     if normalized_action and normalized_action != "spawn":
         return tool_error(f"Unknown action '{action}'. Use spawn (default), list, steer, or stop.")
 
@@ -912,7 +912,7 @@ registry.register(
         background=_model_background_value(args, kw.get("parent_agent")), output_schema=args.get("output_schema"),
         images=args.get("images"), action=args.get("action"), subagent_id=args.get("subagent_id"), message=args.get("message"),
         profile=args.get("profile"), workdir=args.get("workdir"), reveal=args.get("reveal"),
-        **{key: args.get(key) for key in ("delegation_id", "attempt_id", "run_id", "timeout_seconds", "limit", "cascade", "reason", "force")},
+        **{key: args.get(key) for key in ("delegation_id", "attempt_id", "run_id", "timeout_seconds", "limit", "cascade", "reason", "force", "detail")},
         parent_agent=kw.get("parent_agent"),
     ),
     check_fn=check_delegate_requirements,
@@ -1157,6 +1157,7 @@ def _route_delegate_control_action(
     cascade: Optional[bool] = None,
     reason: Optional[str] = None,
     force: Optional[bool] = None,
+    detail: Optional[bool] = None,
 ) -> str:
     """Route a control action to the live tree or the durable lifecycle plane."""
     has_delegation_id = bool(str(delegation_id or "").strip())
@@ -1199,6 +1200,7 @@ def _route_delegate_control_action(
         reason=reason,
         message=message,
         force=force,
+        detail=detail,
         parent_agent=parent_agent,
     )
 

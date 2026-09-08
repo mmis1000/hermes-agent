@@ -745,7 +745,7 @@ def _dispatch_admitted(
         return {"status": "rejected", "error": f"Failed to schedule async delegation{label}: {exc}"}
     if progress_fn is not None:
         _ensure_stale_monitor()
-    return {"status": "dispatched", "delegation_id": delegation_id}
+    return {"status": "dispatched", "delegation_id": delegation_id, **_dispatch_identity_payload(record)}
 
 
 def dispatch_async_delegation(
@@ -1184,7 +1184,7 @@ def _persist_dispatch(record: Dict[str, Any]) -> None:
     except Exception:
         owner_started_at = None
     if not record.get("root_subagent_ids"):
-        record["root_subagent_ids"] = [f"sa-{record['delegation_id']}"]
+        record["root_subagent_ids"] = [f"sa-{record['delegation_id']}-{i}" for i in range(len(record.get("goals") or [None]))]
     outcome = _repository().register_initial_dispatch(
         record, owner_pid=os.getpid(), owner_started_at=owner_started_at
     )
@@ -1356,7 +1356,11 @@ def restore_stale_wait_completions(
     return restored
 
 def _terminal(snapshot: Dict[str, Any]) -> bool:
-    return str(snapshot.get("state") or "") not in _ACTIVE_STATES
+    """A run is terminal only after its durable producer finalization lands."""
+    return bool(
+        snapshot.get("completed_at") is not None
+        and snapshot.get("event") is not None
+    )
 
 def get_durable_delegation(delegation_id: str) -> Optional[Dict[str, Any]]:
     """Internal durable lookup. Model-facing callers must use the authorised view."""
@@ -2108,7 +2112,7 @@ def wait_for_delegation(
                 _STATE_CONDITION.wait(timeout=min(remaining, _WAIT_POLL_SECONDS))
 
     try:
-        return _wait_bound()
+        return _annotate_wait_snapshot(_wait_bound())
     except BaseException:
         # A transient DB/read failure after acquisition must never strand a
         # held_by_wait run. Preserve the original exception if cleanup also
@@ -2414,3 +2418,49 @@ def archive_subagent_tail(subagent_id: str, tail: Dict[str, Any]) -> None:
 _MAX_DURABLE_LIST = 100
 _WAIT_POLL_SECONDS = 0.05
 _STATE_CONDITION = threading.Condition()
+
+
+def _dispatch_identity_payload(record: Dict[str, Any]) -> Dict[str, Any]:
+    """Return the stable identities allocated before a worker is submitted.
+
+    ``subagent_id`` is the logical child identity and ``run_id`` identifies
+    this execution of the delegation.  Neither value is a provider/session or
+    container identity: those are deliberately allocated by the worker only
+    after the caller has received the dispatch receipt.  Keeping this payload
+    here also makes the single, batch, and cron dispatch paths agree on the
+    public receipt shape.
+    """
+    roots = [
+        str(value)
+        for value in (record.get("root_subagent_ids") or [])
+        if isinstance(value, str) and value
+    ]
+    run_id = record.get("run_id")
+    subagents = [
+        {
+            "subagent_id": logical_id,
+            "run_id": run_id,
+            "status": "starting",
+        }
+        for logical_id in roots
+    ]
+    return {
+        "run_id": run_id,
+        "subagent_ids": roots,
+        "subagents": subagents,
+    }
+
+
+def _annotate_wait_snapshot(
+    snapshot: Dict[str, Any], *, claimed_delivery: Optional[bool] = None
+) -> Dict[str, Any]:
+    """Expose one stable wait result/readiness/delivery projection."""
+    ready = snapshot.get("completed_at") is not None and snapshot.get("result") is not None
+    snapshot["result_ready"] = bool(ready)
+    snapshot["result_available"] = bool(ready)
+    if claimed_delivery is not None:
+        snapshot["claimed_delivery"] = bool(claimed_delivery)
+    else:
+        snapshot["claimed_delivery"] = bool(snapshot.get("claimed_delivery", False))
+    snapshot["delivery_consumed"] = snapshot.get("delivery_state") == "consumed"
+    return snapshot

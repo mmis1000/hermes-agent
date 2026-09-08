@@ -213,7 +213,7 @@ def _clear_tool_defs_cache() -> None:
 
 
 def _unscoped_get_tool_definitions(enabled_toolsets: Optional[List[str]] = None, disabled_toolsets: Optional[List[str]] = None,
-                         quiet_mode: bool = False, skip_tool_search_assembly: bool = False) -> List[Dict[str, Any]]:
+                         quiet_mode: bool = False, skip_tool_search_assembly: bool = False, delegation_policy=None) -> List[Dict[str, Any]]:
     """Tool definitions for model API calls, filtered by toolset.
 
     enabled_toolsets None = all; disabled_toolsets are subtracted after enabling.
@@ -222,11 +222,14 @@ def _unscoped_get_tool_definitions(enabled_toolsets: Optional[List[str]] = None,
     the tool_search bridge should use it (it reads the real, uncollapsed catalog).
     """
     def compute():
-        return _compute_tool_definitions(enabled_toolsets, disabled_toolsets, quiet_mode,
+        result = _compute_tool_definitions(enabled_toolsets, disabled_toolsets, quiet_mode,
                                          skip_tool_search_assembly=skip_tool_search_assembly)
+        return _apply_delegation_policy_schema(result, delegation_policy) if delegation_policy is not None else result
     if not quiet_mode:
         return compute()
     cache_key = _tool_defs_cache_key(enabled_toolsets, disabled_toolsets, skip_tool_search_assembly)
+    if cache_key is not None:
+        cache_key += (_delegation_policy_fingerprint(delegation_policy),)
     # Cache the freshly-computed list, but hand callers a shallow copy so downstream mutations (e.g.
     # run_agent appending memory/LCM tool schemas to self.tools) don't poison the cache. Without this, a
     # long-lived Gateway process accumulates duplicate tool names across agent inits and providers that
@@ -706,7 +709,7 @@ def _emit_post_tool_call_hook(
 
 
 def _dispatch_bridge_tool(function_name: str, function_args: Dict[str, Any],
-                          enabled_toolsets: Optional[List[str]], disabled_toolsets: Optional[List[str]]):
+                          enabled_toolsets: Optional[List[str]], disabled_toolsets: Optional[List[str]], parent_agent=None):
     """Handle a Tool Search bridge call (tool_search / tool_describe / tool_call).
 
     None when *function_name* is not a bridge tool; ``(result, None)`` for a
@@ -1024,23 +1027,34 @@ def _apply_delegation_policy_schema(
         parameters["properties"]["profile"]["enum"] = sorted(
             delegation_policy.allowed_profiles
         )
-        required = list(parameters.get("required", []))
-        if delegation_policy.profile_required:
-            if "profile" not in required:
-                required.append("profile")
-        else:
-            required = [name for name in required if name != "profile"]
+        # ``profile`` is spawn-only authority.  Making it globally required
+        # makes harmless status/wait/steer calls invalid before they reach the
+        # control plane.  Keep the base required list profile-free and express
+        # the protected-spawn requirement as a conditional schema instead.
+        required = [name for name in parameters.get("required", []) if name != "profile"]
         if required:
             parameters["required"] = required
         else:
             parameters.pop("required", None)
+        if delegation_policy.profile_required:
+            all_of = list(parameters.get("allOf", []))
+            all_of.append(
+                {
+                    "if": {
+                        "anyOf": [
+                            {"not": {"required": ["action"]}},
+                            {"properties": {"action": {"const": "spawn"}}},
+                        ]
+                    },
+                    "then": {"required": ["profile"]},
+                }
+            )
+            parameters["allOf"] = all_of
         result[index] = owned
 
         break
     return result
 
 def get_tool_definitions(enabled_toolsets=None, disabled_toolsets=None, quiet_mode=False, skip_tool_search_assembly=False, delegation_policy=None):
-    definitions = _unscoped_get_tool_definitions(enabled_toolsets, disabled_toolsets, quiet_mode, skip_tool_search_assembly)
-    if delegation_policy is not None:
-        return _apply_delegation_policy_schema(definitions, delegation_policy)
+    definitions = _unscoped_get_tool_definitions(enabled_toolsets=enabled_toolsets, disabled_toolsets=disabled_toolsets, quiet_mode=quiet_mode, skip_tool_search_assembly=skip_tool_search_assembly, delegation_policy=delegation_policy)
     return definitions

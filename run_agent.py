@@ -831,18 +831,6 @@ class AIAgent(
             str(item.get("text") or "") for item in envelopes if item.get("text")
         ) or None
 
-    def _drain_pending_steer_envelopes(self) -> list:
-        lock = getattr(self, "_pending_steer_lock", None)
-        if lock is None:
-            queue = list(self._steer_queue_unlocked())
-            self._pending_steer_envelopes = []
-            self._pending_steer = None
-            return queue
-        with lock:
-            queue = list(self._steer_queue_unlocked())
-            self._pending_steer_envelopes = []
-            self._pending_steer = None
-        return queue
 
     def request_durable_steer(
         self,
@@ -1534,7 +1522,7 @@ class AIAgent(
             max_iterations=function_args.get("max_iterations"), role=function_args.get("role"),
             background=not (getattr(self, "_delegate_depth", 0) > 0), images=function_args.get("images"),
             action=function_args.get("action"),
-            **{key: function_args.get(key) for key in ("delegation_id", "attempt_id", "run_id", "timeout_seconds", "limit", "cascade", "reason", "force")},
+            **{key: function_args.get(key) for key in ("delegation_id", "attempt_id", "run_id", "timeout_seconds", "limit", "cascade", "reason", "force", "detail")},
             subagent_id=function_args.get("subagent_id"), message=function_args.get("message"), parent_agent=self,
             profile=function_args.get("profile"), workdir=function_args.get("workdir"), reveal=function_args.get("reveal"),
             model=function_args.get("model"), provider=function_args.get("provider"), reasoning_effort=function_args.get("reasoning_effort"),
@@ -1580,6 +1568,31 @@ class AIAgent(
         except Exception:
             logger.debug("Conversation root lineage walk failed", exc_info=True)
             return start
+
+    def _steer_queue_unlocked(self) -> list:
+        queue = getattr(self, "_pending_steer_envelopes", None)
+        if isinstance(queue, list):
+            return queue
+        # object.__new__ test stubs and older restored agents may only have the
+        # legacy string slot. Materialize it once as an untracked envelope.
+        text = getattr(self, "_pending_steer", None)
+        queue = [{"text": text, "mailbox_id": None, "outcome_callback": None}] if text else []
+        self._pending_steer_envelopes = queue
+        return queue
+
+    def _sync_pending_steer_text_unlocked(self, queue: list) -> None:
+        self._pending_steer = "\n".join(
+            str(item.get("text") or "") for item in queue if item.get("text")
+        ) or None
+
+    def _clear_pending_steer(self, outcome: str) -> None:
+        envelopes = self._drain_pending_steer_envelopes()
+        self._ack_steer_envelopes(envelopes, outcome)
+
+    def _apply_pending_steer_to_tool_results(self, messages: list, num_tool_msgs: int) -> None:
+        """Forwarder — see ``agent.agent_runtime_helpers.apply_pending_steer_to_tool_results``."""
+        from agent.agent_runtime_helpers import apply_pending_steer_to_tool_results
+        return apply_pending_steer_to_tool_results(self, messages, num_tool_msgs)
 
 
 _BASIC_TOOLSETS = {"web", "terminal", "vision", "creative", "reasoning"}
