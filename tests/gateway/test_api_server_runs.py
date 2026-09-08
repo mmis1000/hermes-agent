@@ -11,6 +11,7 @@ Covers:
 
 import asyncio
 import json
+from pathlib import PurePosixPath
 import threading
 import time
 from unittest.mock import MagicMock, patch
@@ -27,7 +28,7 @@ from gateway.platforms.api_server import (
     security_headers_middleware,
 )
 from tools import approval as approval_mod
-from agent.delegation_policy import DelegationSessionPolicy, ExecutionProfile
+from agent.delegation_policy import AccessMode, DelegationSessionPolicy, ExecutionProfile
 
 
 # ---------------------------------------------------------------------------
