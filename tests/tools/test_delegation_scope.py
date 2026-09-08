@@ -119,6 +119,7 @@ def test_effective_scope_context_contains_only_agent_visible_filesystem_contract
         "- Available paths:\n"
         "  - \"/work/project\" — directory, read-write\n"
         "  - \"/references/资料`line\\nbreak.pdf\" — file, read-only\n"
+        "- For nested paths, the most-specific listed mode applies.\n"
         "- Other host paths are not available in this attempt."
     )
     for hidden in (
@@ -525,7 +526,162 @@ def test_trusted_root_allows_multiple_disjoint_child_directories(tmp_path):
     ]
 
 
-def test_trusted_root_rejects_overlapping_child_directories_even_same_mode(tmp_path):
+def test_child_rw_subtree_inherits_deeper_parent_ro_carveout(tmp_path):
+    repository = tmp_path / "repository"
+    selected = repository / "a" / "b"
+    carveout = selected / "c"
+    carveout.mkdir(parents=True)
+    admitted = admit_trusted_run_execution(
+        _policy(profiles=("isolated",)),
+        {
+            "profile": "isolated",
+            "workdir": str(repository),
+            "reveal": [
+                {"path": str(repository), "mode": "rw"},
+                {"path": str(carveout), "mode": "ro"},
+            ],
+        },
+    )
+
+    child_scope = resolve_invocation_scope(
+        admitted.policy,
+        "isolated",
+        str(selected),
+        [{"path": str(selected), "mode": "rw"}],
+        backing_registry=admitted.backing_registry,
+    )
+
+    assert child_scope is not None
+    assert [(grant.visible_path, grant.mode) for grant in child_scope.visible_objects] == [
+        (PurePosixPath(str(selected)), AccessMode.RW),
+        (PurePosixPath(str(carveout)), AccessMode.RO),
+    ]
+    assert [(request.path, request.mode) for request in child_scope.reveal] == [
+        (PurePosixPath(str(selected)), "rw"),
+        (PurePosixPath(str(carveout)), "ro"),
+    ]
+
+    child_policy = derive_child_policy(admitted.policy, child_scope.visible_objects)
+    grandchild_scope = resolve_invocation_scope(
+        child_policy,
+        "isolated",
+        str(selected),
+        [{"path": str(selected), "mode": "rw"}],
+        backing_registry=admitted.backing_registry,
+    )
+    assert grandchild_scope is not None
+    assert [(grant.visible_path, grant.mode) for grant in grandchild_scope.visible_objects] == [
+        (PurePosixPath(str(selected)), AccessMode.RW),
+        (PurePosixPath(str(carveout)), AccessMode.RO),
+    ]
+
+
+def test_reverse_rw_carveout_is_capped_or_selected_explicitly(tmp_path):
+    repository = tmp_path / "repository"
+    writable = repository / "b"
+    writable.mkdir(parents=True)
+    admitted = admit_trusted_run_execution(
+        _policy(profiles=("isolated",)),
+        {
+            "profile": "isolated",
+            "workdir": "/workspace",
+            "reveal": [
+                {"path": str(repository), "mode": "ro"},
+                {"path": str(writable), "mode": "rw"},
+            ],
+        },
+    )
+
+    capped = resolve_invocation_scope(
+        admitted.policy,
+        "isolated",
+        None,
+        [{"path": str(repository), "mode": "ro"}],
+        backing_registry=admitted.backing_registry,
+    )
+    selected = resolve_invocation_scope(
+        admitted.policy,
+        "isolated",
+        None,
+        [
+            {"path": str(repository), "mode": "ro"},
+            {"path": str(writable), "mode": "rw"},
+        ],
+        backing_registry=admitted.backing_registry,
+    )
+
+    assert capped is not None
+    assert [(grant.visible_path, grant.mode) for grant in capped.visible_objects] == [
+        (PurePosixPath(str(repository)), AccessMode.RO),
+        (PurePosixPath(str(writable)), AccessMode.RO),
+    ]
+    assert admitted.policy.visible_objects is not None
+    assert capped.visible_objects[1].backing == admitted.policy.visible_objects[1].backing
+    assert selected is not None
+    assert [(grant.visible_path, grant.mode) for grant in selected.visible_objects] == [
+        (PurePosixPath(str(repository)), AccessMode.RO),
+        (PurePosixPath(str(writable)), AccessMode.RW),
+    ]
+    with pytest.raises(ValueError, match="cannot widen"):
+        resolve_invocation_scope(
+            admitted.policy,
+            "isolated",
+            None,
+            [{"path": str(repository), "mode": "rw"}],
+            backing_registry=admitted.backing_registry,
+        )
+
+
+def test_workdir_uses_most_specific_nested_grant(tmp_path):
+    repository = tmp_path / "repository"
+    writable = repository / "b"
+    writable.mkdir(parents=True)
+    admitted = admit_trusted_run_execution(
+        _policy(profiles=("isolated",)),
+        {
+            "profile": "isolated",
+            "workdir": str(writable),
+            "reveal": [
+                {"path": str(repository), "mode": "ro"},
+                {"path": str(writable), "mode": "rw"},
+            ],
+        },
+    )
+
+    assert admitted.invocation_scope.workdir == PurePosixPath(str(writable))
+
+    readonly = repository / "readonly"
+    readonly.mkdir()
+    admitted_readonly = admit_trusted_run_execution(
+        _policy(profiles=("isolated",)),
+        {
+            "profile": "isolated",
+            "workdir": "/workspace",
+            "reveal": [
+                {"path": str(repository), "mode": "rw"},
+                {"path": str(readonly), "mode": "ro"},
+            ],
+        },
+    )
+    readonly_scope = resolve_invocation_scope(
+        admitted_readonly.policy,
+        "isolated",
+        str(readonly),
+        [
+            {"path": str(repository), "mode": "rw"},
+            {"path": str(readonly), "mode": "ro"},
+        ],
+        backing_registry=admitted_readonly.backing_registry,
+    )
+    assert readonly_scope is not None
+    assert readonly_scope.workdir == PurePosixPath(str(readonly))
+    assert next(
+        grant for grant in readonly_scope.visible_objects
+        if grant.visible_path == PurePosixPath(str(readonly))
+    ).mode is AccessMode.RO
+
+
+def test_trusted_root_allows_overlapping_child_directories_with_same_mode(tmp_path):
     repository = tmp_path / "repository"
     lanes = repository / "lanes"
     first = lanes / "first"
@@ -539,17 +695,22 @@ def test_trusted_root_rejects_overlapping_child_directories_even_same_mode(tmp_p
         },
     )
 
-    with pytest.raises(ValueError, match="overlapping reveal paths"):
-        resolve_invocation_scope(
-            admitted.policy,
-            "isolated",
-            None,
-            [
-                {"path": str(lanes), "mode": "ro"},
-                {"path": str(first), "mode": "ro"},
-            ],
-            backing_registry=admitted.backing_registry,
-        )
+    child_scope = resolve_invocation_scope(
+        admitted.policy,
+        "isolated",
+        None,
+        [
+            {"path": str(first), "mode": "ro"},
+            {"path": str(lanes), "mode": "ro"},
+        ],
+        backing_registry=admitted.backing_registry,
+    )
+
+    assert child_scope is not None
+    assert [grant.visible_path for grant in child_scope.visible_objects] == [
+        PurePosixPath(str(lanes)),
+        PurePosixPath(str(first)),
+    ]
 
 
 def test_nested_scope_cannot_restore_an_omitted_sibling():
@@ -1120,19 +1281,14 @@ def test_backing_registry_rejects_special_object_types(object_type):
         )
 
 
-@pytest.mark.parametrize("case", ["duplicate", "overlap-conflict"])
-def test_reveal_rejects_duplicate_or_conflicting_overlaps(case):
+def test_reveal_rejects_duplicate_path():
     parent = _grant("/work/tree", object_id="parent")
-    child = _grant("/work/tree/child", object_id="child")
-    policy = _policy(visible_objects=(parent, child))
+    policy = _policy(visible_objects=(parent,))
     reveal = [
         {"path": "/work/tree", "mode": "ro"},
-        {
-            "path": "/work/tree" if case == "duplicate" else "/work/tree/child",
-            "mode": "ro" if case == "duplicate" else "rw",
-        },
+        {"path": "/work/tree", "mode": "ro"},
     ]
-    with pytest.raises(ValueError, match="duplicate|overlap"):
+    with pytest.raises(ValueError, match="duplicate"):
         resolve_invocation_scope(policy, "isolated", None, reveal)
 
 
@@ -1160,7 +1316,7 @@ def test_valid_leaf_resolution_excludes_siblings_and_attenuates_mode():
 
 @pytest.mark.parametrize(
     "case",
-    ["relative", "parent-escape", "unrevealed", "revealed-ro", "revealed-file"],
+    ["relative", "parent-escape", "unrevealed", "revealed-file"],
 )
 def test_workdir_rejects_noncanonical_unrevealed_or_nonwritable_storage(case):
     grant = _grant("/work/input")
@@ -1169,12 +1325,9 @@ def test_workdir_rejects_noncanonical_unrevealed_or_nonwritable_storage(case):
         "relative": "relative/path",
         "parent-escape": "/workspace/../etc",
         "unrevealed": "/etc",
-        "revealed-ro": "/work/input/subdir",
         "revealed-file": "/work/input",
     }[case]
-    if case == "revealed-ro":
-        reveal = [{"path": "/work/input", "mode": "ro"}]
-    elif case == "revealed-file":
+    if case == "revealed-file":
         grant = VisibleObjectGrant(
             visible_path=grant.visible_path,
             mode=grant.mode,
@@ -1199,3 +1352,15 @@ def test_workdir_accepts_container_local_or_rw_revealed_directory(workdir):
     )
     assert scope is not None
     assert str(scope.workdir) == workdir
+
+
+def test_workdir_accepts_readonly_revealed_directory():
+    grant = _grant("/work/input")
+    scope = resolve_invocation_scope(
+        _policy(visible_objects=(grant,)),
+        "isolated",
+        "/work/input/subdir",
+        [{"path": "/work/input", "mode": "ro"}],
+    )
+    assert scope is not None
+    assert str(scope.workdir) == "/work/input/subdir"

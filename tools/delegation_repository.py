@@ -1190,9 +1190,9 @@ class DelegationRepository:
         ).fetchone()
         active_run = conn.execute(
             """SELECT r.run_id FROM delegation_runs r
-               WHERE r.delegation_id=? AND EXISTS (
-                 SELECT 1 FROM delegation_attempts a WHERE a.run_id=r.run_id
-                   AND a.state IN ('starting','running','finalizing','interrupt_requested'))
+               WHERE r.delegation_id=? AND r.completed_at IS NULL
+                 AND EXISTS (
+                   SELECT 1 FROM delegation_attempts a WHERE a.run_id=r.run_id)
                ORDER BY r.run_number DESC LIMIT 1""",
             (delegation_id,),
         ).fetchone()
@@ -1281,6 +1281,12 @@ class DelegationRepository:
             )
         elif run and run["completed_at"] is not None:
             state = _attempt_state(_json(run["event_json"], {}).get("status"))
+        elif run and attempts:
+            # Child attempts can reach a terminal provider state just before
+            # the producer commits event/result_json. Keep the run in the
+            # durable finalization state so wait cannot consume an incomplete
+            # hold or report a result that is not ready yet.
+            state = "finalizing"
         elif attempts:
             state = attempts[0]["state"]
         else:

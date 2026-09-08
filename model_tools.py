@@ -450,16 +450,29 @@ def _apply_delegation_policy_schema(
         parameters["properties"]["profile"]["enum"] = sorted(
             delegation_policy.allowed_profiles
         )
-        required = list(parameters.get("required", []))
-        if delegation_policy.profile_required:
-            if "profile" not in required:
-                required.append("profile")
-        else:
-            required = [name for name in required if name != "profile"]
+        # ``profile`` is spawn-only authority.  Making it globally required
+        # makes harmless status/wait/steer calls invalid before they reach the
+        # control plane.  Keep the base required list profile-free and express
+        # the protected-spawn requirement as a conditional schema instead.
+        required = [name for name in parameters.get("required", []) if name != "profile"]
         if required:
             parameters["required"] = required
         else:
             parameters.pop("required", None)
+        if delegation_policy.profile_required:
+            all_of = list(parameters.get("allOf", []))
+            all_of.append(
+                {
+                    "if": {
+                        "anyOf": [
+                            {"not": {"required": ["action"]}},
+                            {"properties": {"action": {"const": "spawn"}}},
+                        ]
+                    },
+                    "then": {"required": ["profile"]},
+                }
+            )
+            parameters["allOf"] = all_of
         result[index] = owned
 
         break

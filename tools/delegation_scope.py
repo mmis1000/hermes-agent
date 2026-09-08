@@ -81,6 +81,7 @@ def format_effective_scope_context(scope: ResolvedInvocationScope) -> str:
         f"{mode_labels[grant.mode]}"
         for grant in scope.visible_objects
     )
+    lines.append("- For nested paths, the most-specific listed mode applies.")
     lines.append("- Other host paths are not available in this attempt.")
     return "\n".join(lines)
 
@@ -454,6 +455,16 @@ def _validate_reveal_destination(
             raise ValueError(f"delegate_task: reveal path {path} is protected.")
 
 
+def _most_specific_request(
+    requests: Sequence[RevealRequest],
+    path: PurePosixPath,
+) -> RevealRequest | None:
+    candidates = [request for request in requests if _is_within(path, request.path)]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda request: len(request.path.parts))
+
+
 def _validate_workdir(
     raw_workdir: str | PurePosixPath,
     profile: ExecutionProfile,
@@ -463,14 +474,25 @@ def _validate_workdir(
         candidate = normalize_visible_path(raw_workdir)
     except (TypeError, ValueError) as exc:
         raise ValueError(f"delegate_task: invalid workdir: {exc}") from exc
-    for grant in visible_objects:
-        grant_path = normalize_visible_path(grant.visible_path)
-        if _is_within(candidate, grant_path):
-            if grant.mode is AccessMode.RW and grant.object_type == "directory":
-                return candidate
-            raise ValueError(
-                "delegate_task: workdir cannot use non-writable revealed storage."
-            )
+    matching_grants = [
+        grant
+        for grant in visible_objects
+        if _is_within(candidate, normalize_visible_path(grant.visible_path))
+    ]
+    if matching_grants:
+        grant = max(
+            matching_grants,
+            key=lambda item: len(normalize_visible_path(item.visible_path).parts),
+        )
+        # A read-only directory is a valid cwd: the process may traverse and
+        # read it, while the backend's original RO mount grant enforces writes.
+        # Do not rewrite the grant to RW merely because it is selected as cwd.
+        if grant.object_type == "directory":
+            return candidate
+        raise ValueError(
+            "delegate_task: workdir must be a revealed directory; regular file "
+            "reveals cannot be workdirs."
+        )
     local_roots = (
         normalize_visible_path(profile.default_workdir),
         PurePosixPath("/tmp"),
@@ -1307,20 +1329,16 @@ def resolve_invocation_scope(
             network="full" if inherited_network else "none",
         )
     reveal_requests = _parse_reveal(reveal)
-    for index, left in enumerate(reveal_requests):
-        for right in reveal_requests[index + 1 :]:
-            if left.path == right.path:
-                raise ValueError(f"delegate_task: duplicate reveal path {left.path}.")
-            if _is_within(left.path, right.path) or _is_within(
-                right.path, left.path
-            ):
-                raise ValueError(
-                    f"delegate_task: overlapping reveal paths {left.path} and {right.path} are forbidden."
-                )
+    seen_paths: set[PurePosixPath] = set()
+    for request in reveal_requests:
+        if request.path in seen_paths:
+            raise ValueError(f"delegate_task: duplicate reveal path {request.path}.")
+        seen_paths.add(request.path)
+
     grants_by_path = {
         grant.visible_path: grant for grant in policy.visible_objects or ()
     }
-    resolved_grants: list[VisibleObjectGrant] = []
+    resolved_by_path: dict[PurePosixPath, VisibleObjectGrant] = {}
     staged_admitted_records: dict[str, BackingObjectRecord] = {}
     for request in reveal_requests:
         _validate_reveal_destination(
@@ -1343,6 +1361,46 @@ def resolve_invocation_scope(
                     backing_registry,
                 )
         attenuate_mode(grant.mode, AccessMode(request.mode))
+        resolved_by_path[request.path] = VisibleObjectGrant(
+            visible_path=request.path,
+            mode=AccessMode(request.mode),
+            backing=grant.backing,
+            object_type=grant.object_type,
+        )
+
+    if policy.visible_objects is not None:
+        for parent_grant in policy.visible_objects:
+            parent_path = normalize_visible_path(parent_grant.visible_path)
+            covering_request = _most_specific_request(reveal_requests, parent_path)
+            if covering_request is None or parent_path in resolved_by_path:
+                continue
+            covering_grant = resolved_by_path[covering_request.path]
+            if covering_grant.object_type != "directory":
+                raise ValueError(
+                    f"delegate_task: file reveal {covering_request.path} cannot contain descendants."
+                )
+            inherited_mode = (
+                AccessMode.RO
+                if parent_grant.mode is AccessMode.RO
+                or AccessMode(covering_request.mode) is AccessMode.RO
+                else AccessMode.RW
+            )
+            resolved_by_path[parent_path] = VisibleObjectGrant(
+                visible_path=parent_path,
+                mode=inherited_mode,
+                backing=parent_grant.backing,
+                object_type=parent_grant.object_type,
+            )
+
+    resolved_grants = sorted(
+        resolved_by_path.values(),
+        key=lambda grant: (
+            len(normalize_visible_path(grant.visible_path).parts),
+            str(grant.visible_path),
+        ),
+    )
+    for grant in resolved_grants:
+        request_path = normalize_visible_path(grant.visible_path)
         record = (
             staged_admitted_records.get(grant.backing.object_id)
             or (
@@ -1354,43 +1412,43 @@ def resolve_invocation_scope(
         if backing_registry is not None:
             if record is None or not record.exists:
                 raise ValueError(
-                    f"delegate_task: backing object for {request.path} no longer exists."
+                    f"delegate_task: backing object for {request_path} no longer exists."
                 )
             if record.root_symlink:
                 raise ValueError(
-                    f"delegate_task: backing root for {request.path} is a symlink."
+                    f"delegate_task: backing root for {request_path} is a symlink."
                 )
             if record.object_type not in {"file", "directory"}:
                 raise ValueError(
-                    f"delegate_task: backing object for {request.path} must be a regular file or directory."
+                    f"delegate_task: backing object for {request_path} must be a regular file or directory."
                 )
             if record.object_type != grant.object_type:
                 raise ValueError(
-                    f"delegate_task: backing object type changed for {request.path}."
+                    f"delegate_task: backing object type changed for {request_path}."
                 )
             if record.backing.identity != grant.backing.identity:
                 raise ValueError(
-                    f"delegate_task: backing identity changed for {request.path}."
+                    f"delegate_task: backing identity changed for {request_path}."
                 )
             if record.backing.revision != grant.backing.revision:
                 raise ValueError(
-                    f"delegate_task: backing revision changed for {request.path}."
+                    f"delegate_task: backing revision changed for {request_path}."
                 )
             if (
                 record.backing.object_id != grant.backing.object_id
                 or record.backing.kind != grant.backing.kind
             ):
                 raise ValueError(
-                    f"delegate_task: backing identity changed for {request.path}."
+                    f"delegate_task: backing identity changed for {request_path}."
                 )
-        resolved_grants.append(
-            VisibleObjectGrant(
-                visible_path=request.path,
-                mode=AccessMode(request.mode),
-                backing=grant.backing,
-                object_type=grant.object_type,
-            )
+
+    effective_reveal = tuple(
+        RevealRequest(
+            normalize_visible_path(grant.visible_path),
+            grant.mode.value,
         )
+        for grant in resolved_grants
+    )
     resolved_workdir = _validate_workdir(
         workdir or selected_profile.default_workdir,
         selected_profile,
@@ -1404,7 +1462,7 @@ def resolve_invocation_scope(
         profile_hash=execution_profile_hash(selected_profile),
         profile=selected_profile,
         workdir=resolved_workdir,
-        reveal=reveal_requests,
+        reveal=effective_reveal,
         visible_objects=tuple(resolved_grants),
         profile_template_hash=(
             profile_template_hash

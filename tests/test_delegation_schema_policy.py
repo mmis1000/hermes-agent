@@ -60,7 +60,11 @@ def test_protected_schema_pins_profile_enum_and_required_without_global_mutation
     )
 
     assert schema["parameters"]["properties"]["profile"]["enum"] == ["alpha", "zeta"]
-    assert "profile" in schema["parameters"]["required"]
+    assert "profile" not in schema["parameters"].get("required", [])
+    assert any(
+        "profile" in item.get("then", {}).get("required", [])
+        for item in schema["parameters"].get("allOf", [])
+    )
     assert "enum" not in static_profile
     assert "profile" not in DELEGATE_TASK_SCHEMA["parameters"]["required"]
 
