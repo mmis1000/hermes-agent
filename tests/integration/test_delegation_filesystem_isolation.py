@@ -23,7 +23,9 @@ from tools.delegation_scope import (
     admit_trusted_run_execution,
     attempt_scope_registry,
     configure_protected_attempt_environment,
+    deserialize_delegation_authority,
     resolve_invocation_scope,
+    serialize_delegation_authority,
 )
 from tools.environments.docker import DockerEnvironment
 
@@ -501,6 +503,119 @@ def test_trusted_runs_root_materializes_exact_home_repository(protected_image):
             ) == "live-root"
         finally:
             assert attempt_scope_registry.cleanup(task_id) == ()
+
+
+def test_read_only_cwd_keeps_rw_scratch_and_survives_resume_authority_rematerialization(
+    protected_image,
+):
+    """A real protected cwd may be RO without widening nested grants."""
+    import tools.terminal_tool as terminal_tool
+
+    profile = ExecutionProfile(
+        name="isolated",
+        backend="docker",
+        image=protected_image,
+        default_workdir="/workspace",
+        allowed_toolsets=frozenset({"terminal"}),
+        network="none",
+        runtime_identity=(10001, 10001),
+    )
+    base_policy = DelegationSessionPolicy(
+        profile_required=True,
+        allow_profile_none=False,
+        allowed_profiles=frozenset({"isolated"}),
+        profile_snapshots={"isolated": profile},
+        visible_objects=(),
+        protected_prefixes=(),
+    )
+
+    with tempfile.TemporaryDirectory(
+        prefix="hermes-ro-cwd-",
+        dir=Path.home(),
+    ) as root:
+        repository = Path(root) / "repository"
+        nested = repository / "nested"
+        scratch = Path(root) / "scratch"
+        nested.mkdir(parents=True)
+        scratch.mkdir()
+        (nested / "input.txt").write_text("read-only input", encoding="utf-8")
+
+        admitted = admit_trusted_run_execution(
+            base_policy,
+            {
+                "profile": "isolated",
+                "workdir": str(repository),
+                "reveal": [
+                    {"path": str(repository), "mode": "ro"},
+                    {"path": str(scratch), "mode": "rw"},
+                ],
+            },
+            inherited_network=False,
+        )
+
+        authority_payload = serialize_delegation_authority(
+            admitted.invocation_scope,
+            enabled_toolsets=("terminal",),
+            disabled_toolsets=(),
+            scope_id="scope-ro-cwd",
+            attempt_id="attempt-ro-cwd",
+        )
+        restored_scope = deserialize_delegation_authority(
+            authority_payload,
+            backing_registry=admitted.backing_registry,
+        )
+
+        def run_attempt(scope, task_id: str, run_id: str) -> None:
+            authority = attempt_scope_registry.reserve(
+                scope,
+                "logical-ro-cwd",
+                attempt_id=task_id,
+                backing_registry=admitted.backing_registry,
+            )
+            try:
+                attempt_scope_registry.prepare_idmapped_reveals(task_id)
+                configure_protected_attempt_environment(task_id)
+                attempt_scope_registry.activate(task_id, run_id=run_id)
+                result = json.loads(
+                    terminal_tool.terminal_tool(
+                        command=(
+                            "set -eu; "
+                            f"test \"$(pwd)\" = {repository}; "
+                            "test \"$(cat nested/input.txt)\" = 'read-only input'; "
+                            "if printf blocked > nested/blocked.txt; then exit 41; fi; "
+                            "if printf blocked > blocked.txt; then exit 42; fi; "
+                            "printf scratch-write > " + str(scratch / "output.txt") + "; "
+                            "test \"$(cat " + str(scratch / "output.txt") + ")\" = scratch-write"
+                        ),
+                        task_id=task_id,
+                        timeout=30,
+                        force=True,
+                    )
+                )
+                assert result["exit_code"] == 0, result
+            finally:
+                assert attempt_scope_registry.cleanup(task_id) == ()
+            assert authority.attempt_id == task_id
+
+        run_attempt(
+            admitted.invocation_scope,
+            "integration-ro-cwd-initial",
+            "integration-ro-run-1",
+        )
+        assert not (repository / "blocked.txt").exists()
+        assert not (nested / "blocked.txt").exists()
+        assert (scratch / "output.txt").read_text(encoding="utf-8") == "scratch-write"
+
+        (scratch / "output.txt").unlink()
+        # This second physical attempt is built from serialized authority used
+        # by the resume path; no grant is widened during rematerialization.
+        run_attempt(
+            restored_scope,
+            "integration-ro-cwd-resumed",
+            "integration-ro-run-2",
+        )
+        assert not (nested / "blocked.txt").exists()
+        assert (scratch / "output.txt").read_text(encoding="utf-8") == "scratch-write"
 
 
 @pytest.mark.asyncio

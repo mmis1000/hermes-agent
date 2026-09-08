@@ -21,6 +21,7 @@ from tools.delegation_scope import (
     BackingObjectRegistry,
     RevealRequest,
     ResolvedInvocationScope,
+    admit_trusted_run_execution,
     deserialize_delegation_authority,
     execution_profile_hash,
     resolve_invocation_scope,
@@ -112,6 +113,65 @@ def test_authority_round_trip_is_versioned_canonical_and_credential_free():
     assert restored == scope
 
 
+def test_expanded_carveout_authority_round_trip_preserves_effective_tree(tmp_path):
+    root = tmp_path / "root"
+    selected = root / "a" / "b"
+    carveout = selected / "c"
+    carveout.mkdir(parents=True)
+    profile = ExecutionProfile(
+        name="isolated",
+        backend="docker",
+        image="repo/image@sha256:deadbeef",
+        default_workdir="/workspace",
+        allowed_toolsets=frozenset({"terminal", "delegation"}),
+        network="none",
+    )
+    base_policy = DelegationSessionPolicy(
+        profile_required=True,
+        allow_profile_none=False,
+        allowed_profiles={profile.name},
+        profile_snapshots={profile.name: profile},
+        visible_objects=(),
+        protected_prefixes=(),
+    )
+    admitted = admit_trusted_run_execution(
+        base_policy,
+        {
+            "profile": profile.name,
+            "workdir": str(root),
+            "reveal": [
+                {"path": str(root), "mode": "rw"},
+                {"path": str(carveout), "mode": "ro"},
+            ],
+        },
+        inherited_network=False,
+    )
+    child_scope = resolve_invocation_scope(
+        admitted.policy,
+        profile.name,
+        str(selected),
+        [{"path": str(selected), "mode": "rw"}],
+        backing_registry=admitted.backing_registry,
+    )
+    assert child_scope is not None
+    authority = serialize_delegation_authority(
+        child_scope,
+        enabled_toolsets=("terminal",),
+        disabled_toolsets=(),
+        scope_id="scope-tree",
+        attempt_id="attempt-tree",
+    )
+
+    restored = deserialize_delegation_authority(
+        authority,
+        backing_registry=admitted.backing_registry,
+    )
+
+    assert restored == child_scope
+    assert authority["reveal"] == [
+        {"path": str(selected), "mode": "rw"},
+        {"path": str(carveout), "mode": "ro"},
+    ]
 @pytest.mark.parametrize(
     ("inherited_network", "effective_network"),
     [(False, "none"), (True, "full")],
