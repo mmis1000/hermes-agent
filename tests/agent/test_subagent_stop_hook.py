@@ -16,7 +16,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from tools.delegate_tool import _summarize_tool_arguments, delegate_task
+from tools.delegate_tool import delegate_task
 from hermes_cli import plugins
 
 
@@ -199,7 +199,8 @@ class TestBatchMode:
 
 
 class TestPayloadShape:
-    def test_includes_redacted_tool_call_history(self):
+    @pytest.mark.parametrize("shared_finalizer", [False, True])
+    def test_includes_redacted_tool_call_history(self, shared_finalizer):
         captured = _register_capturing_hook()
 
         with patch("tools.delegate_tool._run_single_child") as mock_run:
@@ -226,8 +227,15 @@ class TestPayloadShape:
                     "result": "secret output",
                 }],
             }
-            delegate_task(goal="do X", parent_agent=_make_parent())
+            if shared_finalizer:
+                from tools.delegate_tool import _finalize_child_results
+                _finalize_child_results(
+                    [mock_run.return_value], [{"goal": "do X"}], [], _make_parent(),
+                )
+            else:
+                delegate_task(goal="do X", parent_agent=_make_parent())
 
+        assert len(captured) == 1
         assert captured[0]["tool_call_history"] == [{
             "tool_name": "write_file",
             "tool_input": {
