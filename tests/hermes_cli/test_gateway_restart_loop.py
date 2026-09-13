@@ -201,11 +201,19 @@ class TestGatewaySelfTargetingLifecycle:
 
     def test_stop_allows_inside_gateway(self, monkeypatch):
         monkeypatch.setenv("_HERMES_GATEWAY", "1")
-        from hermes_cli.gateway import gateway_command
+        import hermes_cli.gateway as gw
+
+        class _Reached(Exception):
+            pass
+
+        def _sentinel(*a, **k):
+            raise _Reached()
+
+        monkeypatch.setattr(gw, "_dispatch_via_service_manager_if_s6", _sentinel)
+        monkeypatch.setattr(gw, "_dispatch_all_via_service_manager_if_s6", _sentinel)
         args = Namespace(gateway_command="stop", all=False, system=False)
-        with pytest.raises(SystemExit) as exc_info:
-            gateway_command(args)
-        assert exc_info.value.code == 1
+        with pytest.raises(_Reached):
+            gw.gateway_command(args)
 
 
     def test_stop_allows_outside_gateway(self, monkeypatch):
