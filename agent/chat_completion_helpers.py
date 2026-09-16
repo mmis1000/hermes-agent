@@ -2071,7 +2071,7 @@ def _buffer_fallback_notice(agent, notice: str) -> None:
         agent._pending_fallback_notice = [str(pending), notice] if pending else [notice]
 
 
-def try_activate_fallback(agent, reason: "FailoverReason | None" = None, reset_at=None) -> bool:
+def try_activate_fallback(agent, reason: "FailoverReason | None" = None, reset_at=None, *, notification_reason=None) -> bool:
     """Switch to the next fallback model/provider in the chain; False when exhausted. Swaps client,
     model slug and provider in place so the retry loop continues on the new backend; client
     construction goes through resolve_provider_client (no duplicated provider→key mappings)."""
@@ -2180,6 +2180,12 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None, reset_a
             # provenance so the restore path only emits a recovery notice after a real fallback.
             agent._provider_fallback_active = True
             agent._provider_fallback_route = (str(fb_model), str(fb_provider))
+            callback = getattr(agent, "_delegation_fallback_callback", None)
+            if callable(callback):
+                try:
+                    callback(old_model, old_provider, fb_model, fb_provider, notification_reason if notification_reason is not None else reason)
+                except Exception:
+                    logger.debug("Delegation fallback notification failed", exc_info=True)
             _log_fallback_activated(agent, reason, old_model, old_provider, fb_model, fb_provider)
             from hermes_cli.observability.shared_metrics_events import record_fallback
             record_fallback(from_provider=old_provider, to_provider=fb_provider, reason=reason)
