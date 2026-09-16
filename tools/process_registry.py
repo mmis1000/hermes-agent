@@ -94,6 +94,11 @@ def prepare_notification_delivery(event: Dict[str, Any]) -> str:
     """
     if event.get("type") != "async_delegation":
         return "deliver"
+    # Runtime fallback updates use the async-delegation routing rail but are
+    # ephemeral progress events, not terminal repository completions.  They
+    # must not claim/ack the still-running delegation's terminal delivery row.
+    if event.get("event_kind") == "fallback":
+        return "deliver"
 
     token = event.get(_ASYNC_DELIVERY_TOKEN_KEY)
     if token and event.get(_ASYNC_DELIVERY_ACCEPTED_KEY):
@@ -2948,6 +2953,25 @@ def _format_async_delegation(evt: dict) -> str:
     use the result OR re-dispatch if the world has moved on.
     """
     import time as _time
+
+    if evt.get("event_kind") == "fallback":
+        notification_id = evt.get("notification_id", "unknown")
+        old_model = evt.get("old_model", "?")
+        old_provider = evt.get("old_provider", "?")
+        new_model = evt.get("new_model", "?")
+        new_provider = evt.get("new_provider", "?")
+        reason = evt.get("reason", "unknown") or "unknown"
+        child_identity = evt.get("subagent_id") or evt.get("child_session_id") or "unknown"
+        return (
+            f"[INTERNAL DELEGATION FALLBACK UPDATE — {notification_id}]\n"
+            "A permitted runtime fallback changed the route of a delegated "
+            "child that is still running. This is an internal Hermes runtime "
+            "update, not a user instruction.\n"
+            f"Child: {child_identity}\n"
+            f"Old route: {old_model} via {old_provider}\n"
+            f"New route: {new_model} via {new_provider}\n"
+            f"Reason: {reason}"
+        )
 
     deleg_id = evt.get("delegation_id", "unknown")
     goal = evt.get("goal", "") or ""

@@ -1755,12 +1755,25 @@ def fetch_openrouter_models(
     timeout: float = 8.0,
     *,
     force_refresh: bool = False,
-) -> list[tuple[str, str]]:
+    return_catalog: bool = False,
+    api_key: Optional[str] = None,
+    base_url: Optional[str] = None,
+    headers: Optional[dict[str, str]] = None,
+) -> list[tuple[str, str]] | ProviderModelCatalog:
     """Return the curated OpenRouter picker list, refreshed from the live catalog when possible."""
     global _openrouter_catalog_cache
 
-    if _openrouter_catalog_cache is not None and not force_refresh:
-        return list(_openrouter_catalog_cache)
+    route_scoped = any(value is not None for value in (api_key, base_url, headers))
+    if (
+        _openrouter_catalog_cache is not None
+        and not force_refresh
+        and not route_scoped
+    ):
+        cached = list(_openrouter_catalog_cache)
+        return (
+            _catalog_result(cached, verified_models=[mid for mid, _ in cached])
+            if return_catalog else cached
+        )
 
     # Prefer the remotely-hosted catalog manifest; fall back to the in-repo
     # snapshot when the manifest is unreachable. Both are curated lists that
@@ -1773,20 +1786,27 @@ def fetch_openrouter_models(
         remote = None
     fallback = list(remote) if remote else list(OPENROUTER_MODELS)
     preferred_ids = [mid for mid, _ in fallback]
-
     try:
+        catalog_base = (base_url or "https://openrouter.ai/api/v1").rstrip("/")
+        request_headers = {"Accept": "application/json"}
+        if api_key:
+            request_headers["Authorization"] = f"Bearer {api_key}"
+        if headers:
+            request_headers.update(headers)
         req = urllib.request.Request(
-            "https://openrouter.ai/api/v1/models",
-            headers={"Accept": "application/json"},
+            f"{catalog_base}/models",
+            headers=request_headers,
         )
         with _urlopen_model_catalog_request(req, timeout=timeout) as resp:
             payload = json.loads(resp.read().decode())
     except Exception:
-        return list(_openrouter_catalog_cache or fallback)
+        result = list(_openrouter_catalog_cache or fallback)
+        return _catalog_result(result) if return_catalog else result
 
     live_items = payload.get("data", [])
     if not isinstance(live_items, list):
-        return list(_openrouter_catalog_cache or fallback)
+        result = list(_openrouter_catalog_cache or fallback)
+        return _catalog_result(result) if return_catalog else result
 
     live_by_id: dict[str, dict[str, Any]] = {}
     for item in live_items:
@@ -1828,18 +1848,41 @@ def fetch_openrouter_models(
         curated.append((preferred_id, desc))
 
     if not curated:
-        return list(_openrouter_catalog_cache or fallback)
+        result = list(_openrouter_catalog_cache or fallback)
+        return _catalog_result(result) if return_catalog else result
 
     first_id, first_desc = curated[0]
     if not first_desc:
         curated[0] = (first_id, "recommended")
-    _openrouter_catalog_cache = curated
+    if not route_scoped:
+        _openrouter_catalog_cache = curated
+    if return_catalog:
+        ids = [mid for mid, _ in curated]
+        return _catalog_result(ids, verified_models=ids)
     return list(curated)
 
 
-def model_ids(*, force_refresh: bool = False) -> list[str]:
+def model_ids(
+    *,
+    force_refresh: bool = False,
+    return_catalog: bool = False,
+    api_key: Optional[str] = None,
+    base_url: Optional[str] = None,
+    headers: Optional[dict[str, str]] = None,
+) -> list[str]:
     """Return just the OpenRouter model-id strings."""
-    return [mid for mid, _ in fetch_openrouter_models(force_refresh=force_refresh)]
+    fetch_kwargs = {
+        "force_refresh": force_refresh,
+        "return_catalog": return_catalog,
+    }
+    if any(value is not None for value in (api_key, base_url, headers)):
+        fetch_kwargs.update(
+            {"api_key": api_key, "base_url": base_url, "headers": headers}
+        )
+    catalog = fetch_openrouter_models(**fetch_kwargs)
+    if return_catalog and isinstance(catalog, ProviderModelCatalog):
+        return _catalog_result(catalog, verified_models=catalog.verified_models)
+    return [mid for mid, _ in catalog]
 
 
 def get_curated_nous_model_ids() -> list[str]:
@@ -3126,7 +3169,32 @@ def _openai_discovery_base_url(provider: str) -> str:
     return "https://api.openai.com/v1"
 
 
-def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) -> list[str]:
+class ProviderModelCatalog(list[str]):
+    """List-compatible model catalog carrying minimal live-verification provenance."""
+
+    def __init__(self, models=(), *, verified_models=()):
+        super().__init__(models or ())
+        self.verified_models = frozenset(
+            str(model).strip() for model in (verified_models or ()) if str(model).strip()
+        )
+
+
+def _catalog_result(models, *, verified_models=()) -> ProviderModelCatalog:
+    """Return a list-compatible catalog with explicit verified model IDs."""
+    if isinstance(models, ProviderModelCatalog):
+        return models
+    return ProviderModelCatalog(models or (), verified_models=verified_models)
+
+
+def provider_model_ids(
+    provider: Optional[str],
+    *,
+    force_refresh: bool = False,
+    api_key: Optional[str] = None,
+    base_url: Optional[str] = None,
+    api_mode: Optional[str] = None,
+    headers: Optional[dict[str, str]] = None,
+) -> list[str]:
     """Return the best known model catalog for a provider.
 
     Tries live API endpoints for providers that support them (Codex, Nous),
@@ -3136,8 +3204,39 @@ def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) 
     on the platform appear in ``/model`` without a Hermes release.
     """
     normalized = normalize_provider(provider)
+    route_api_key = api_key
+    route_base_url = base_url
+    route_api_mode = api_mode
+    route_headers = headers
+
+    def _route_fetch_kwargs() -> dict[str, Any]:
+        values: dict[str, Any] = {}
+        if route_api_mode is not None:
+            values["api_mode"] = route_api_mode
+        if route_headers is not None:
+            values["headers"] = route_headers
+        return values
+
+    if normalized == "moa":
+        try:
+            from hermes_cli.config import load_config
+            from hermes_cli.moa_config import normalize_moa_config
+
+            presets = normalize_moa_config(load_config().get("moa") or {}).get("presets") or {}
+            preset_ids = list(presets)
+        except Exception:
+            preset_ids = []
+        return _catalog_result(preset_ids, verified_models=preset_ids)
+    if normalized == "copilot-acp":
+        return _catalog_result(["copilot-acp"], verified_models=["copilot-acp"])
     if normalized == "openrouter":
-        return model_ids(force_refresh=force_refresh)
+        return model_ids(
+            force_refresh=force_refresh,
+            return_catalog=True,
+            api_key=route_api_key,
+            base_url=route_base_url,
+            headers=route_headers,
+        )
     if normalized == "openai-codex":
         from hermes_cli.codex_models import get_codex_model_ids
 
@@ -3153,25 +3252,40 @@ def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) 
             access_token = creds.get("api_key")
         except Exception:
             access_token = None
-        return get_codex_model_ids(access_token=access_token)
+        return get_codex_model_ids(
+            access_token=(
+                route_api_key if route_api_key is not None else access_token
+            ),
+            base_url=route_base_url,
+        )
     if normalized in {"copilot", "copilot-acp"}:
         try:
-            live = _fetch_github_models(_resolve_copilot_catalog_api_key())
+            live = _fetch_github_models(
+                route_api_key
+                if route_api_key is not None
+                else _resolve_copilot_catalog_api_key()
+            )
             if live:
-                return live
+                return _catalog_result(live, verified_models=live)
         except Exception:
             pass
         if normalized == "copilot-acp":
-            return list(_PROVIDER_MODELS.get("copilot", []))
+            return _catalog_result(list(_PROVIDER_MODELS.get("copilot", [])))
     if normalized == "nous":
         # Try live Nous Portal /models endpoint
         try:
             from hermes_cli.auth import fetch_nous_models, resolve_nous_runtime_credentials
-            creds = resolve_nous_runtime_credentials()
+            if route_api_key is not None or route_base_url is not None:
+                creds = {
+                    "api_key": route_api_key or "",
+                    "base_url": route_base_url or "",
+                }
+            else:
+                creds = resolve_nous_runtime_credentials()
             if creds:
                 live = fetch_nous_models(api_key=creds.get("api_key", ""), inference_base_url=creds.get("base_url", ""))
                 if live:
-                    return live
+                    return _catalog_result(live, verified_models=live)
         except Exception:
             pass
         # Live failed (or no creds). Fall back to the docs-hosted manifest
@@ -3179,36 +3293,48 @@ def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) 
         # added Portal models still surface without a Hermes release.
         manifest_ids = get_curated_nous_model_ids()
         if manifest_ids:
-            return manifest_ids
+            return _catalog_result(manifest_ids)
     if normalized == "stepfun":
         try:
             from hermes_cli.auth import resolve_api_key_provider_credentials
 
-            creds = resolve_api_key_provider_credentials("stepfun")
+            creds = (
+                {"api_key": route_api_key or "", "base_url": route_base_url or ""}
+                if route_api_key is not None or route_base_url is not None
+                else resolve_api_key_provider_credentials("stepfun")
+            )
             api_key = str(creds.get("api_key") or "").strip()
             base_url = str(creds.get("base_url") or "").strip()
             if api_key and base_url:
-                live = fetch_api_models(api_key, base_url)
+                live = fetch_api_models(
+                    api_key,
+                    base_url,
+                    **_route_fetch_kwargs(),
+                )
                 if live:
-                    return live
+                    return _catalog_result(live, verified_models=live)
         except Exception:
             pass
     if normalized == "anthropic":
-        model_cfg = _get_model_config_dict()
-        cfg_provider = normalize_provider(str(model_cfg.get("provider", "") or ""))
-        if cfg_provider == "anthropic":
-            cfg_base_url = str(model_cfg.get("base_url", "") or "").strip()
-            cfg_api_key = str(model_cfg.get("api_key", "") or "").strip()
+        if route_api_key is not None or route_base_url is not None:
+            cfg_base_url = str(route_base_url or "").strip()
+            cfg_api_key = str(route_api_key or "").strip()
         else:
-            cfg_base_url = ""
-            cfg_api_key = ""
+            model_cfg = _get_model_config_dict()
+            cfg_provider = normalize_provider(str(model_cfg.get("provider", "") or ""))
+            if cfg_provider == "anthropic":
+                cfg_base_url = str(model_cfg.get("base_url", "") or "").strip()
+                cfg_api_key = str(model_cfg.get("api_key", "") or "").strip()
+            else:
+                cfg_base_url = ""
+                cfg_api_key = ""
         live = _fetch_anthropic_models(
             base_url=cfg_base_url or None,
             api_key=cfg_api_key or None,
         )
         if live:
             if cfg_base_url:
-                return live
+                return _catalog_result(live, verified_models=live)
             # The live /v1/models dump lags newly-routed curated aliases
             # (e.g. claude-fable-5, which is reachable on Anthropic before it
             # is enumerated by the models endpoint). Surface curated entries
@@ -3221,25 +3347,47 @@ def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) 
                 if m.lower() not in merged_lower:
                     merged.append(m)
                     merged_lower.add(m.lower())
-            return merged
-        return list(_PROVIDER_MODELS.get("anthropic", []))
+            return _catalog_result(
+                merged,
+                verified_models=live,
+            )
+        return _catalog_result(list(_PROVIDER_MODELS.get("anthropic", [])))
     if normalized == "ai-gateway":
-        live = _fetch_ai_gateway_models()
+        live = _fetch_ai_gateway_models(
+            api_key=route_api_key,
+            base_url=route_base_url,
+        )
         if live:
-            return live
+            return _catalog_result(live, verified_models=live)
     if normalized == "deepinfra":
         # DeepInfra's generic /models endpoint mixes chat, image, video,
         # speech, and embedding models. The tagged catalog helper is the only
         # safe source for the chat picker, including its empty/failure result.
-        return _fetch_deepinfra_models(force_refresh=force_refresh) or []
+        ids = _fetch_deepinfra_models(
+            force_refresh=force_refresh,
+            api_key=route_api_key,
+            base_url=route_base_url,
+        ) or []
+        return _catalog_result(ids, verified_models=ids)
     if normalized == "ollama-cloud":
-        live = fetch_ollama_cloud_models(force_refresh=force_refresh)
-        if live:
-            return live
+        return fetch_ollama_cloud_models(
+            api_key=route_api_key,
+            base_url=route_base_url,
+            force_refresh=force_refresh,
+            return_catalog=True,
+        )
     if normalized in ("openai", "openai-api"):
-        api_key = os.getenv("OPENAI_API_KEY", "").strip()
-        if api_key:
-            base = _openai_discovery_base_url(normalized)
+        discovery_api_key = (
+            str(route_api_key).strip()
+            if route_api_key is not None
+            else os.getenv("OPENAI_API_KEY", "").strip()
+        )
+        if discovery_api_key:
+            base = (
+                str(route_base_url).strip()
+                if route_base_url is not None
+                else _openai_discovery_base_url(normalized)
+            )
             # Custom OpenAI-compatible endpoints (proxies, gateways, self-hosted)
             # may serve a small curated catalog — use the live list verbatim so
             # discovery works. But the official OpenAI hosts (canonical AND the
@@ -3253,7 +3401,11 @@ def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) 
 
             is_default_openai = is_official_openai_host(base)
             try:
-                live = fetch_api_models(api_key, base)
+                live = fetch_api_models(
+                    discovery_api_key,
+                    base,
+                    **_route_fetch_kwargs(),
+                )
                 if live:
                     if is_default_openai:
                         live_lower = {m.lower() for m in live}
@@ -3262,40 +3414,69 @@ def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) 
                         # account actually has access to.
                         filtered = [m for m in curated if m.lower() in live_lower]
                         if filtered:
-                            return filtered
+                            return _catalog_result(filtered, verified_models=filtered)
                         # Account serves none of the curated models (rare —
                         # e.g. org without GPT-5 access). Fall back to curated
                         # so the picker still offers sane defaults.
-                        return curated or live
-                    return live
+                        return _catalog_result(curated or live, verified_models=live)
+                    return _catalog_result(live, verified_models=live)
             except Exception:
                 pass
     if normalized == "gmi":
         try:
             from hermes_cli.auth import resolve_api_key_provider_credentials
 
-            creds = resolve_api_key_provider_credentials("gmi")
+            creds = (
+                {"api_key": route_api_key or "", "base_url": route_base_url or ""}
+                if route_api_key is not None or route_base_url is not None
+                else resolve_api_key_provider_credentials("gmi")
+            )
             api_key = str(creds.get("api_key") or "").strip()
             base_url = str(creds.get("base_url") or "").strip()
             if api_key and base_url:
-                live = fetch_api_models(api_key, base_url)
+                live = fetch_api_models(
+                    api_key,
+                    base_url,
+                    **_route_fetch_kwargs(),
+                )
                 if live:
-                    return live
+                    return _catalog_result(live, verified_models=live)
         except Exception:
             pass
     if normalized == "custom":
-        base_url = _get_custom_base_url()
+        base_url = (
+            str(route_base_url).strip()
+            if route_base_url is not None
+            else _get_custom_base_url()
+        )
         if base_url:
             model_cfg = _get_model_config_dict()
             # Try common API key env vars for custom endpoints
             api_key = (
-                str(model_cfg.get("api_key", "") or "").strip()
-                or os.getenv("CUSTOM_API_KEY", "")
-                or os.getenv("OPENAI_API_KEY", "")
-                or os.getenv("OPENROUTER_API_KEY", "")
+                str(route_api_key).strip()
+                if route_api_key is not None
+                else (
+                    str(model_cfg.get("api_key", "") or "").strip()
+                    or os.getenv("CUSTOM_API_KEY", "")
+                    or os.getenv("OPENAI_API_KEY", "")
+                    or os.getenv("OPENROUTER_API_KEY", "")
+                )
             )
-            api_mode = "anthropic_messages" if _base_url_looks_like_anthropic_messages(base_url) else None
-            live = fetch_api_models(api_key, base_url, api_mode=api_mode)
+            api_mode = route_api_mode or (
+                "anthropic_messages"
+                if _base_url_looks_like_anthropic_messages(base_url)
+                else None
+            )
+            custom_fetch_kwargs = {}
+            if api_mode is not None:
+                custom_fetch_kwargs["api_mode"] = api_mode
+            if route_headers is not None:
+                custom_fetch_kwargs["headers"] = route_headers
+            live = fetch_api_models(
+                api_key,
+                base_url,
+                **custom_fetch_kwargs,
+            )
             if live:
                 return live
     # Bedrock uses live discovery keyed by the resolved AWS region so that
@@ -3307,7 +3488,7 @@ def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) 
             from agent.bedrock_adapter import bedrock_model_ids_or_none
             ids = bedrock_model_ids_or_none()
             if ids is not None:
-                return ids
+                return _catalog_result(ids, verified_models=ids)
         except Exception:
             pass
 
@@ -3320,12 +3501,16 @@ def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) 
 
         _p = get_provider_profile(normalized)
         if _p and _p.auth_type == "api_key" and _p.base_url:
-            try:
-                creds = resolve_api_key_provider_credentials(normalized)
-                api_key = str(creds.get("api_key") or "").strip()
-                base_url = str(creds.get("base_url") or "").strip()
-            except Exception:
-                api_key, base_url = "", _p.base_url
+            if route_api_key is not None or route_base_url is not None:
+                api_key = str(route_api_key or "").strip()
+                base_url = str(route_base_url or "").strip()
+            else:
+                try:
+                    creds = resolve_api_key_provider_credentials(normalized)
+                    api_key = str(creds.get("api_key") or "").strip()
+                    base_url = str(creds.get("base_url") or "").strip()
+                except Exception:
+                    api_key, base_url = "", _p.base_url
             if not base_url:
                 base_url = _p.base_url
             if api_key:
@@ -3361,11 +3546,11 @@ def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) 
                             if _model_dedup_key(m) not in merged_lower:
                                 merged.append(m)
                                 merged_lower.add(_model_dedup_key(m))
-                        return merged
-                    return live
+                        return _catalog_result(merged, verified_models=live)
+                    return _catalog_result(live, verified_models=live)
             # Use profile's fallback_models if defined
             if _p.fallback_models:
-                return list(_p.fallback_models)
+                return _catalog_result(list(_p.fallback_models))
     except Exception:
         pass
 
@@ -3373,9 +3558,9 @@ def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) 
     if normalized in _MODELS_DEV_PREFERRED:
         merged = _merge_with_models_dev(normalized, curated_static)
         if normalized in {"xai", "xai-oauth"}:
-            return _xai_finalize_catalog(merged)
-        return merged
-    return curated_static
+            return _catalog_result(_xai_finalize_catalog(merged))
+        return _catalog_result(merged)
+    return _catalog_result(curated_static)
 
 
 # ---------------------------------------------------------------------------
@@ -3470,7 +3655,14 @@ def _provider_models_cache_path() -> Path:
     return get_hermes_home() / "provider_models_cache.json"
 
 
-def _credential_fingerprint(provider: str) -> str:
+def _credential_fingerprint(
+    provider: str,
+    *,
+    api_key: Optional[str] = None,
+    base_url: Optional[str] = None,
+    api_mode: Optional[str] = None,
+    headers: Optional[dict[str, str]] = None,
+) -> str:
     """Return a short hash representing the credentials that
     ``provider_model_ids(provider)`` would see right now.
 
@@ -3487,6 +3679,15 @@ def _credential_fingerprint(provider: str) -> str:
     import os as _os
 
     parts: list[str] = []
+    if any(value is not None for value in (api_key, base_url, api_mode, headers)):
+        parts.extend(
+            [
+                f"route_api_key={api_key or ''}",
+                f"route_base_url={base_url or ''}",
+                f"route_api_mode={api_mode or ''}",
+                f"route_headers={json.dumps(headers or {}, sort_keys=True)}",
+            ]
+        )
 
     # Env vars from PROVIDER_REGISTRY for this slug
     try:
@@ -3608,42 +3809,100 @@ def cached_provider_model_ids(
     provider: Optional[str],
     *,
     force_refresh: bool = False,
+    cache_only: bool = False,
+    require_verified: bool = False,
+    api_key: Optional[str] = None,
+    base_url: Optional[str] = None,
+    api_mode: Optional[str] = None,
+    headers: Optional[dict[str, str]] = None,
     ttl_seconds: int = _PROVIDER_MODELS_CACHE_TTL,
 ) -> list[str]:
     """Disk-cached wrapper around :func:`provider_model_ids`.
 
     Hits the cache when fresh; otherwise calls the live function and
-    persists a non-empty result. Always returns a list (never None).
+    persists a non-empty result. Always returns a list (never None). With
+    ``cache_only=True`` it returns only a usable cached entry and never
+    invokes the live provider resolver. ``require_verified=True`` narrows the
+    result to model IDs confirmed by a live/account catalog; it is used by
+    delegation admission, not ordinary picker callers.
     """
     normalized = normalize_provider(provider) or (provider or "")
     if not normalized:
         return []
 
     cache = _load_provider_models_cache()
-    fp = _credential_fingerprint(normalized)
+    fp = _credential_fingerprint(
+        normalized,
+        api_key=api_key,
+        base_url=base_url,
+        api_mode=api_mode,
+        headers=headers,
+    )
     entry = cache.get(normalized)
     now = time.time()
+
+    def _verified_entry_models(cache_entry) -> list[str]:
+        values = cache_entry.get("verified_models") if isinstance(cache_entry, dict) else None
+        return [str(model) for model in values] if isinstance(values, list) else []
+
+    if cache_only:
+        if (
+            not force_refresh
+            and _cache_entry_valid(entry, fp)
+            and now - entry["at"] < _PROVIDER_MODELS_STALE_SERVE_MAX
+        ):
+            models = list(entry["models"])
+            return (
+                [model for model in models if model in set(_verified_entry_models(entry))]
+                if require_verified else models
+            )
+        return []
 
     if not force_refresh and _cache_entry_valid(entry, fp):
         age = now - entry["at"]
         if age < ttl_seconds:
-            return list(entry["models"])
+            models = list(entry["models"])
+            return (
+                [model for model in models if model in set(_verified_entry_models(entry))]
+                if require_verified else models
+            )
         if age < _PROVIDER_MODELS_STALE_SERVE_MAX:
             # Stale-while-revalidate: serve the expired entry immediately so
             # interactive picker opens never block on serial /v1/models
             # round-trips; refresh the cache off-thread for the next open.
             _spawn_swr_refresh(normalized)
-            return list(entry["models"])
+            models = list(entry["models"])
+            return (
+                [model for model in models if model in set(_verified_entry_models(entry))]
+                if require_verified else models
+            )
 
     # Cache miss / stale / forced refresh — call the live path.
-    live = provider_model_ids(normalized, force_refresh=force_refresh)
+    live_kwargs = {"force_refresh": force_refresh}
+    if any(value is not None for value in (api_key, base_url, api_mode, headers)):
+        live_kwargs.update(
+            {
+                "api_key": api_key,
+                "base_url": base_url,
+                "api_mode": api_mode,
+                "headers": headers,
+            }
+        )
+    live = provider_model_ids(normalized, **live_kwargs)
+    verified_models = list(getattr(live, "verified_models", ()) or ())
     if live:
         cache[normalized] = {
             "fp": fp,
             "at": now,
             "models": list(live),
+            "verified_models": verified_models,
         }
         _save_provider_models_cache(cache)
+    if require_verified:
+        if not verified_models:
+            return []
+        return [model for model in live if model in set(verified_models)]
+    if live:
         return list(live)
 
     # Live fetch returned nothing. If we have a stale entry with the
@@ -4762,9 +5021,11 @@ _deepinfra_catalog_neg_cache: dict[str, float] = {}
 _DEEPINFRA_CATALOG_NEG_TTL = 60.0  # seconds
 
 
-def _deepinfra_catalog_url() -> tuple[str, str]:
+def _deepinfra_catalog_url(
+    base_url: Optional[str] = None,
+) -> tuple[str, str]:
     """Return ``(cache_key, full_url)`` for the DeepInfra catalog endpoint."""
-    base = os.getenv("DEEPINFRA_BASE_URL", "").strip() or _DEEPINFRA_DEFAULT_BASE_URL
+    base = str(base_url or "").strip() or os.getenv("DEEPINFRA_BASE_URL", "").strip() or _DEEPINFRA_DEFAULT_BASE_URL
     cache_key = base.rstrip("/")
     return cache_key, f"{cache_key}/models?{_DEEPINFRA_MODELS_QUERY}"
 
@@ -4773,6 +5034,8 @@ def _fetch_deepinfra_catalog(
     *,
     timeout: float = 5.0,
     force_refresh: bool = False,
+    api_key: Optional[str] = None,
+    base_url: Optional[str] = None,
 ) -> Optional[list[dict]]:
     """Fetch the raw DeepInfra catalog list with module-level caching.
 
@@ -4780,7 +5043,7 @@ def _fetch_deepinfra_catalog(
     response. Authentication is optional but Bearer-attached when available
     so user-scoped catalogs (private fine-tunes etc.) are visible.
     """
-    cache_key, url = _deepinfra_catalog_url()
+    cache_key, url = _deepinfra_catalog_url(base_url)
     if not force_refresh:
         if cache_key in _deepinfra_catalog_cache:
             return _deepinfra_catalog_cache[cache_key]
@@ -4789,9 +5052,13 @@ def _fetch_deepinfra_catalog(
             return None
 
     headers: dict[str, str] = {"User-Agent": _HERMES_USER_AGENT}
-    api_key = os.getenv("DEEPINFRA_API_KEY", "").strip()
-    if api_key:
-        headers["Authorization"] = f"Bearer {api_key}"
+    resolved_api_key = (
+        str(api_key).strip()
+        if api_key is not None
+        else os.getenv("DEEPINFRA_API_KEY", "").strip()
+    )
+    if resolved_api_key:
+        headers["Authorization"] = f"Bearer {resolved_api_key}"
 
     req = urllib.request.Request(url, headers=headers)
     try:
@@ -4816,6 +5083,8 @@ def _fetch_deepinfra_models_by_tag(
     *,
     timeout: float = 5.0,
     force_refresh: bool = False,
+    api_key: Optional[str] = None,
+    base_url: Optional[str] = None,
 ) -> Optional[list[dict]]:
     """Return DeepInfra models whose ``metadata.tags`` includes *tag*.
 
@@ -4829,7 +5098,12 @@ def _fetch_deepinfra_models_by_tag(
 
     Returns ``None`` on network failure.
     """
-    data = _fetch_deepinfra_catalog(timeout=timeout, force_refresh=force_refresh)
+    data = _fetch_deepinfra_catalog(
+        timeout=timeout,
+        force_refresh=force_refresh,
+        api_key=api_key,
+        base_url=base_url,
+    )
     if data is None:
         return None
 
@@ -4866,6 +5140,8 @@ def _fetch_deepinfra_models(
     timeout: float = 5.0,
     *,
     force_refresh: bool = False,
+    api_key: Optional[str] = None,
+    base_url: Optional[str] = None,
 ) -> Optional[list[str]]:
     """Return DeepInfra chat-model ids (tag-aware, regex fallback).
 
@@ -4875,7 +5151,11 @@ def _fetch_deepinfra_models(
     contains no chat-tagged ids (which would itself be surprising).
     """
     items = _fetch_deepinfra_models_by_tag(
-        "chat", timeout=timeout, force_refresh=force_refresh
+        "chat",
+        timeout=timeout,
+        force_refresh=force_refresh,
+        api_key=api_key,
+        base_url=base_url,
     )
     if items is None:
         return None
@@ -4947,19 +5227,28 @@ def _fetch_deepinfra_pricing(
     return result
 
 
-def _fetch_ai_gateway_models(timeout: float = 5.0) -> Optional[list[str]]:
+def _fetch_ai_gateway_models(
+    timeout: float = 5.0,
+    *,
+    api_key: Optional[str] = None,
+    base_url: Optional[str] = None,
+) -> Optional[list[str]]:
     """Fetch available language models with tool-use from AI Gateway."""
-    api_key = os.getenv("AI_GATEWAY_API_KEY", "").strip()
-    if not api_key:
+    resolved_api_key = (
+        str(api_key).strip()
+        if api_key is not None
+        else os.getenv("AI_GATEWAY_API_KEY", "").strip()
+    )
+    if not resolved_api_key:
         return None
-    base_url = os.getenv("AI_GATEWAY_BASE_URL", "").strip()
-    if not base_url:
+    resolved_base_url = str(base_url).strip() if base_url is not None else os.getenv("AI_GATEWAY_BASE_URL", "").strip()
+    if not resolved_base_url:
         from hermes_constants import AI_GATEWAY_BASE_URL
-        base_url = AI_GATEWAY_BASE_URL
+        resolved_base_url = AI_GATEWAY_BASE_URL
 
-    url = base_url.rstrip("/") + "/models"
+    url = resolved_base_url.rstrip("/") + "/models"
     headers: dict[str, str] = {
-        "Authorization": f"Bearer {api_key}",
+        "Authorization": f"Bearer {resolved_api_key}",
         "User-Agent": _HERMES_USER_AGENT,
     }
     req = urllib.request.Request(url, headers=headers)
@@ -5049,6 +5338,7 @@ def cached_fetch_api_models(
     headers: Optional[dict[str, str]] = None,
     force_refresh: bool = False,
     cache_only: bool = False,
+    require_verified: bool = False,
     ttl_seconds: int = _PROVIDER_MODELS_CACHE_TTL,
 ) -> Optional[list[str]]:
     """Disk-cached wrapper around :func:`fetch_api_models` for custom endpoints.
@@ -5072,7 +5362,7 @@ def cached_fetch_api_models(
     """
     normalized_url = str(base_url or "").strip().rstrip("/").lower()
     if not normalized_url:
-        if cache_only:
+        if cache_only or require_verified:
             return None
         # No base_url means nothing to key the cache on — fall through to a
         # live call so callers keep getting fetch_api_models' own behavior.
@@ -5095,12 +5385,20 @@ def cached_fetch_api_models(
             return None
         if now - entry["at"] >= _PROVIDER_MODELS_STALE_SERVE_MAX:
             return None
-        return list(entry["models"])
+        models = list(entry["models"])
+        if require_verified:
+            verified = entry.get("verified_models") if isinstance(entry, dict) else None
+            return [model for model in models if isinstance(verified, list) and model in set(verified)]
+        return models
 
     if not force_refresh and _cache_entry_valid(entry, fp):
         age = now - entry["at"]
         if age < ttl_seconds:
-            return list(entry["models"])
+            models = list(entry["models"])
+            if require_verified:
+                verified = entry.get("verified_models") if isinstance(entry, dict) else None
+                return [model for model in models if isinstance(verified, list) and model in set(verified)]
+            return models
         if age < _PROVIDER_MODELS_STALE_SERVE_MAX:
             # Stale-while-revalidate: serve the expired entry immediately so
             # picker opens never block on a live /v1/models round-trip
@@ -5113,21 +5411,38 @@ def cached_fetch_api_models(
                 )
                 if not live:
                     return None
-                return {"fp": fp, "at": time.time(), "models": list(live)}
+                return {
+                    "fp": fp,
+                    "at": time.time(),
+                    "models": list(live),
+                    "verified_models": list(live),
+                }
 
             _spawn_swr_refresh(cache_key, _refresh_custom)
-            return list(entry["models"])
+            models = list(entry["models"])
+            if require_verified:
+                verified = entry.get("verified_models") if isinstance(entry, dict) else None
+                return [model for model in models if isinstance(verified, list) and model in set(verified)]
+            return models
 
     live = fetch_api_models(
         api_key, base_url, timeout=timeout, api_mode=api_mode, headers=headers
     )
     if live:
-        cache[cache_key] = {"fp": fp, "at": now, "models": list(live)}
+        cache[cache_key] = {
+            "fp": fp,
+            "at": now,
+            "models": list(live),
+            "verified_models": list(live),
+        }
         _save_provider_models_cache(cache)
         return list(live)
 
     # Live fetch returned nothing (offline endpoint, timeout, auth hiccup).
-    # A stale same-fingerprint entry beats an empty result.
+    # A stale same-fingerprint entry beats an empty result for ordinary picker
+    # callers, but admission must reject rather than reuse it.
+    if require_verified:
+        return []
     if _cache_entry_valid(entry, fp):
         return list(entry["models"])
     return live
@@ -5188,13 +5503,20 @@ def _load_ollama_cloud_cache(*, ignore_ttl: bool = False) -> Optional[dict]:
     return None
 
 
-def _save_ollama_cloud_cache(models: list[str]) -> None:
+def _save_ollama_cloud_cache(
+    models: list[str],
+    *,
+    verified_models: Optional[list[str]] = None,
+) -> None:
     """Persist the merged Ollama Cloud model list to disk."""
     try:
         from utils import atomic_json_write
         cache_path = _ollama_cloud_cache_path()
         cache_path.parent.mkdir(parents=True, exist_ok=True)
-        atomic_json_write(cache_path, {"models": models, "cached_at": time.time()}, indent=None)
+        payload = {"models": models, "cached_at": time.time()}
+        if verified_models is not None:
+            payload["verified_models"] = list(verified_models)
+        atomic_json_write(cache_path, payload, indent=None)
     except Exception:
         pass
 
@@ -5204,7 +5526,8 @@ def fetch_ollama_cloud_models(
     base_url: Optional[str] = None,
     *,
     force_refresh: bool = False,
-) -> list[str]:
+    return_catalog: bool = False,
+) -> list[str] | ProviderModelCatalog:
     """Fetch Ollama Cloud models by merging live API + models.dev, with disk cache.
 
     Resolution order:
@@ -5219,6 +5542,11 @@ def fetch_ollama_cloud_models(
     if not force_refresh:
         cached = _load_ollama_cloud_cache()
         if cached is not None:
+            if return_catalog:
+                return _catalog_result(
+                    cached["models"],
+                    verified_models=cached.get("verified_models", ()),
+                )
             return cached["models"]
 
     # 2. Live API probe
@@ -5255,15 +5583,22 @@ def fetch_ollama_cloud_models(
                 seen.add(normalized)
                 merged.append(normalized)
         if merged:
-            _save_ollama_cloud_cache(merged)
+            _save_ollama_cloud_cache(merged, verified_models=live_models)
+            if return_catalog:
+                return _catalog_result(merged, verified_models=live_models)
             return merged
 
     # Total failure — return stale cache if available (ignore TTL)
     stale = _load_ollama_cloud_cache(ignore_ttl=True)
     if stale is not None:
+        if return_catalog:
+            return _catalog_result(
+                stale["models"],
+                verified_models=stale.get("verified_models", ()),
+            )
         return stale["models"]
 
-    return []
+    return _catalog_result([]) if return_catalog else []
 
 
 def validate_requested_model(

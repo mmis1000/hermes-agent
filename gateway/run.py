@@ -25305,7 +25305,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return False
 
     @staticmethod
-    def _completion_delivery_identity(evt: dict) -> Optional[tuple[str, str, object]]:
+    def _completion_delivery_identity(evt: dict) -> Optional[tuple]:
         """Return a producer-stable identity when one is available.
 
         Delegation run IDs identify one producer completion; legacy events
@@ -25317,6 +25317,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         evt_type = str(evt.get("type") or "")
         if evt_type == "async_delegation":
+            if evt.get("event_kind") == "fallback":
+                notification_id = str(evt.get("notification_id") or "")
+                return (
+                    (evt_type, "fallback", notification_id)
+                    if notification_id
+                    else None
+                )
             producer_id = str(evt.get("delegation_id") or "")
             run_id = str(evt.get("run_id") or "")
             return (evt_type, producer_id, run_id) if producer_id else None
@@ -25406,13 +25413,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         bookkeeping-only and never inject the same event again.
         """
         identity = self._completion_delivery_identity(evt)
+        is_delegation_fallback = (
+            evt.get("type") == "async_delegation"
+            and evt.get("event_kind") == "fallback"
+        )
         durable_delegation_id = ""
         durable_run_id = str(evt.get("run_id") or "")
         run_scope = {"run_id": durable_run_id} if durable_run_id else {}
         durable_authoritative = False
         durable_claim_id = str(evt.get("_gateway_async_delivery_claim") or "")
 
-        if evt.get("type") == "async_delegation":
+        if evt.get("type") == "async_delegation" and not is_delegation_fallback:
             candidate_id = str(evt.get("delegation_id") or "")
             if candidate_id:
                 durable_delegation_id = candidate_id
@@ -25559,7 +25570,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if injection_result is not True:
                 return injection_result
             accepted = True
-            evt["_gateway_async_delivery_accepted"] = True
+            if durable_claim_id:
+                evt["_gateway_async_delivery_accepted"] = True
 
             if identity is not None:
                 with self._completion_delivery_lock:
@@ -25818,7 +25830,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         originating session key, the parent session the result re-enters, and
         the full gateway route. Events for different sessions never coalesce.
         """
-        return tuple(str(evt.get(field) or "") for field in (
+        base = tuple(str(evt.get(field) or "") for field in (
             "session_key",
             "parent_session_id",
             "platform",
@@ -25827,6 +25839,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             "thread_id",
             "user_id",
         ))
+        if evt.get("event_kind") == "fallback":
+            return (
+                *base,
+                "fallback",
+                str(evt.get("notification_id") or ""),
+            )
+        return base
 
     @staticmethod
     def _format_coalesced_async_delegations(blocks: list[str]) -> str:

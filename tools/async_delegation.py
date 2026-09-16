@@ -824,7 +824,10 @@ def recover_stale_wait_holds(delegation_id: Optional[str] = None) -> int:
 
 def claim_event_delivery(evt: Dict[str, Any], consumer: str) -> Optional[str]:
     """Claim a durable delegation event; non-durable events need no token."""
-    if evt.get("type") != "async_delegation":
+    if (
+        evt.get("type") != "async_delegation"
+        or evt.get("event_kind") == "fallback"
+    ):
         return ""
     if evt.get("_async_delivery_claim_token"):
         return str(evt["_async_delivery_claim_token"])

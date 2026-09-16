@@ -9632,6 +9632,10 @@ def _notification_event_dedup_key(evt: dict) -> tuple:
             evt.get("suppressed", 0),
         )
     if evt_type == "async_delegation":
+        # Runtime fallback updates are nonterminal and have their own unique
+        # identity; terminal completions use delegation_id as before.
+        if evt.get("event_kind") == "fallback":
+            return (evt.get("notification_id", ""), evt_type, "fallback")
         # Async-delegation completions have no process session_id; without
         # this the fallthrough keys every one as ("", "async_delegation")
         # and the second completion's status update is suppressed forever.

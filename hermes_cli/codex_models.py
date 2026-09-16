@@ -124,8 +124,11 @@ def _extract_chatgpt_account_id(access_token: str) -> Optional[str]:
         return None
 
 
-def _fetch_models_from_api(access_token: str) -> List[str]:
-    """Fetch available models from the Codex API. Returns visible models sorted by priority."""
+def _fetch_models_from_api(
+    access_token: str,
+    base_url: Optional[str] = None,
+) -> List[str]:
+    """Fetch available models from the selected Codex API route."""
     try:
         import httpx
         headers = {"Authorization": f"Bearer {access_token}"}
@@ -133,7 +136,11 @@ def _fetch_models_from_api(access_token: str) -> List[str]:
         if acct_id:
             headers["ChatGPT-Account-Id"] = acct_id
         resp = httpx.get(
-            "https://chatgpt.com/backend-api/codex/models?client_version=1.0.0",
+            (
+                f"{base_url.rstrip('/')}/models?client_version=1.0.0"
+                if base_url
+                else "https://chatgpt.com/backend-api/codex/models?client_version=1.0.0"
+            ),
             headers=headers,
             timeout=10,
         )
@@ -223,7 +230,20 @@ def _read_cache_models(codex_home: Path) -> List[str]:
     return deduped
 
 
-def get_codex_model_ids(access_token: Optional[str] = None) -> List[str]:
+def _catalog_result(models: List[str], *, live: bool) -> List[str]:
+    """Keep the list API while preserving whether IDs came from live discovery."""
+    try:
+        from hermes_cli.models import ProviderModelCatalog
+
+        return ProviderModelCatalog(models, verified_models=models if live else ())
+    except Exception:
+        return models
+
+
+def get_codex_model_ids(
+    access_token: Optional[str] = None,
+    base_url: Optional[str] = None,
+) -> List[str]:
     """Return available Codex model IDs, trying API first, then local sources.
     
     Resolution order: API (live, if token provided) > config.toml default >
@@ -235,9 +255,9 @@ def get_codex_model_ids(access_token: Optional[str] = None) -> List[str]:
 
     # Try live API if we have a token
     if access_token:
-        api_models = _fetch_models_from_api(access_token)
+        api_models = _fetch_models_from_api(access_token, base_url=base_url)
         if api_models:
-            return _add_forward_compat_models(api_models)
+            return _catalog_result(_add_forward_compat_models(api_models), live=True)
 
     # Fall back to local sources
     default_model = _read_default_model(codex_home)
@@ -252,4 +272,4 @@ def get_codex_model_ids(access_token: Optional[str] = None) -> List[str]:
         if model_id not in ordered:
             ordered.append(model_id)
 
-    return _add_forward_compat_models(ordered)
+    return _catalog_result(_add_forward_compat_models(ordered), live=False)

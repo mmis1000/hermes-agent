@@ -2424,7 +2424,12 @@ def _fallback_entry_unavailable_without_network(agent, fb: dict) -> Optional[str
 
 
 
-def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool:
+def try_activate_fallback(
+    agent,
+    reason: "FailoverReason | None" = None,
+    *,
+    notification_reason: "FailoverReason | str | None" = None,
+) -> bool:
     """Switch to the next fallback model/provider in the chain.
 
     Called when the current model is failing after retries.  Swaps the
@@ -2436,6 +2441,7 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
     auth resolution and client construction — no duplicated provider→key
     mappings.
     """
+    notice_reason = notification_reason if notification_reason is not None else reason
     if reason in {FailoverReason.rate_limit, FailoverReason.billing, FailoverReason.upstream_rate_limit}:
         # Only start cooldown when leaving the primary provider.  If we're
         # already on a fallback and chain-switching, the primary wasn't the
@@ -2484,11 +2490,11 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         agent._unavailable_fallback_keys = unavailable
     if fb_key in unavailable:
         logger.debug("Fallback skip: %s previously marked unavailable", fb_key)
-        return agent._try_activate_fallback(reason)
+        return agent._try_activate_fallback(reason, notification_reason=notification_reason)
     fb_provider = (fb.get("provider") or "").strip().lower()
     fb_model = (fb.get("model") or "").strip()
     if not fb_provider or not fb_model:
-        return agent._try_activate_fallback(reason)  # skip invalid, try next
+        return agent._try_activate_fallback(reason, notification_reason=notification_reason)  # skip invalid, try next
 
     local_skip_reason = _fallback_entry_unavailable_without_network(agent, fb)
     if local_skip_reason:
@@ -2499,7 +2505,7 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
             fb_model,
             local_skip_reason,
         )
-        return agent._try_activate_fallback(reason)
+        return agent._try_activate_fallback(reason, notification_reason=notification_reason)
 
     # Skip entries that resolve to the same backend that just failed —
     # falling back to it loops the failure. Identity semantics (which axes
@@ -2524,7 +2530,7 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
             "as the current one (%s)",
             fb_provider, fb_model, current_ident.base_url or current_ident.provider,
         )
-        return agent._try_activate_fallback(reason)
+        return agent._try_activate_fallback(reason, notification_reason=notification_reason)
 
     # Use centralized router for client construction.
     # raw_codex=True because the main agent needs direct responses.stream()
@@ -2581,7 +2587,7 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
                 "Fallback to %s failed: provider not configured",
                 fb_provider)
             unavailable.add(fb_key)
-            return agent._try_activate_fallback(reason)  # try next in chain
+            return agent._try_activate_fallback(reason, notification_reason=notification_reason)  # try next in chain
         try:
             from hermes_cli.model_normalize import normalize_model_for_provider
 
@@ -2824,6 +2830,27 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
             f"🔄 Switched to fallback model: {old_model} via {old_provider} "
             f"→ {fb_model} via {fb_provider}"
         )
+        # The child status path above is operator-facing.  If this agent was
+        # admitted through delegate_task, also deliver the exact route change
+        # to its orchestrating model through the runtime-only callback attached
+        # by the child builder.  Failure to notify must never alter fallback
+        # policy or turn a successful switch into an error.
+        delegation_fallback_callback = getattr(
+            agent, "_delegation_fallback_callback", None
+        )
+        if callable(delegation_fallback_callback):
+            try:
+                delegation_fallback_callback(
+                    old_model,
+                    old_provider,
+                    fb_model,
+                    fb_provider,
+                    notice_reason,
+                )
+            except Exception:
+                logger.debug(
+                    "Delegation fallback warning callback failed", exc_info=True
+                )
         logger.info(
             "Fallback activated: %s → %s (%s)",
             old_model, fb_model, fb_provider,
@@ -2838,7 +2865,7 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         if fb_provider == "nous":
             unavailable.add(fb_key)
         logger.error("Failed to activate fallback %s: %s", fb_model, e)
-        return agent._try_activate_fallback(reason)  # try next in chain
+        return agent._try_activate_fallback(reason, notification_reason=notification_reason)  # try next in chain
 
 
 

@@ -976,8 +976,10 @@ def test_delegate_task_background_routes_async_and_does_not_block(monkeypatch):
         }
 
     creds = {
-        "model": "m", "provider": None, "base_url": None, "api_key": None,
-        "api_mode": None, "command": None, "args": None,
+        "model": "m", "provider": "mock-provider",
+        "base_url": "https://mock-provider.invalid/v1",
+        "api_key": "mock-key", "api_mode": "chat_completions",
+        "command": None, "args": None,
     }
     # monkeypatch (not `with`) so patches outlive delegate_task's return and
     # remain active while the background worker runs.
@@ -1041,8 +1043,10 @@ def test_delegate_task_binds_exact_run_and_attempt_before_runner(tmp_path, monke
         }
 
     creds = {
-        "model": "m", "provider": None, "base_url": None, "api_key": None,
-        "api_mode": None, "command": None, "args": None,
+        "model": "m", "provider": "mock-provider",
+        "base_url": "https://mock-provider.invalid/v1",
+        "api_key": "mock-key", "api_mode": "chat_completions",
+        "command": None, "args": None,
     }
     monkeypatch.setattr(dt, "_build_child_agent", lambda **_kwargs: child)
     monkeypatch.setattr(dt, "_run_single_child", run_bound)
@@ -1107,8 +1111,10 @@ def test_background_child_persists_reconstruction_metadata_before_execution(
 
     child.run_conversation.side_effect = run_conversation
     creds = {
-        "model": "model-safe", "provider": None, "base_url": None,
-        "api_key": None, "api_mode": None, "command": None, "args": None,
+        "model": "model-safe", "provider": "provider-safe",
+        "base_url": "https://provider-safe.invalid/v1",
+        "api_key": "safe-key", "api_mode": "chat_completions",
+        "command": None, "args": None,
     }
     monkeypatch.setattr(dt, "_build_child_agent", lambda **_kwargs: child)
     monkeypatch.setattr(dt, "_resolve_delegation_credentials", lambda *_a, **_k: creds)
@@ -1133,6 +1139,7 @@ def test_background_child_persists_reconstruction_metadata_before_execution(
             "session_id": "child-session",
             "run_id": snapshot["run_id"],
             "attempt_id": durable_child["attempt_id"],
+            "delegation_id": payload["delegation_id"],
         }
     finally:
         release.set()
@@ -1162,8 +1169,10 @@ def test_delegate_task_background_uses_live_tui_agent_session_id(monkeypatch):
     fake_child._delegate_role = "leaf"
 
     creds = {
-        "model": "m", "provider": None, "base_url": None, "api_key": None,
-        "api_mode": None, "command": None, "args": None,
+        "model": "m", "provider": "mock-provider",
+        "base_url": "https://mock-provider.invalid/v1",
+        "api_key": "mock-key", "api_mode": "chat_completions",
+        "command": None, "args": None,
     }
     monkeypatch.setattr(dt, "_build_child_agent", lambda **kw: fake_child)
     monkeypatch.setattr(dt, "_resolve_delegation_credentials", lambda *a, **k: creds)

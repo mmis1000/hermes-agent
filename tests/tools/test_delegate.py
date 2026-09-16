@@ -802,6 +802,59 @@ class TestDelegateTask(unittest.TestCase):
             {"enabled": True, "effort": "low"},
         )
 
+    def test_resumed_fallback_notification_uses_logical_identity(self):
+        metadata = {
+            "model": "test-model",
+            "provider": "openrouter",
+            "max_iterations": 10,
+            "role": "leaf",
+            "depth": 1,
+            "enabled_toolsets": [],
+        }
+        credentials = {
+            "model": "test-model",
+            "provider": "openrouter",
+            "base_url": "https://openrouter.ai/api/v1",
+            "api_key": "resume-key",
+            "api_mode": "chat_completions",
+        }
+        parent = _make_mock_parent()
+        parent.session_id = "parent-session"
+        parent._gateway_session_key = "parent-route"
+        child = MagicMock()
+        child.session_id = "resumed-session"
+        child._session_init_model_config = {}
+
+        with (
+            patch("tools.delegate_tool._resolve_delegation_credentials", return_value=credentials),
+            patch("tools.delegate_tool._build_child_agent", return_value=child),
+            patch("tools.process_registry.process_registry.completion_queue.put") as enqueue,
+        ):
+            build_resumed_child_agent(
+                bundle={"reconstruction_metadata": metadata},
+                logical_id="logical-resumed-child",
+                goal="continue verification",
+                parent_agent=parent,
+                continuation={
+                    "session_id": "resumed-session",
+                    "parent_session_id": "prior-session",
+                    "delegate_from": "parent-session",
+                },
+            )
+            assert child._delegation_fallback_callback(
+                "old-model",
+                "old-provider",
+                "new-model",
+                "new-provider",
+                "rate_limit",
+            ) is True
+
+        event = enqueue.call_args.args[0]
+        self.assertEqual(event["subagent_id"], "logical-resumed-child")
+        self.assertEqual(event["old_model"], "old-model")
+        self.assertEqual(event["new_model"], "new-model")
+        self.assertEqual(event["reason"], "rate_limit")
+
     def test_attempt_id_is_the_runtime_task_key(self):
         from tools.delegate_tool import _run_single_child
 
@@ -862,6 +915,7 @@ class TestDelegateTask(unittest.TestCase):
         parent.api_key="***"
         parent.provider = "openai-codex"
         parent.api_mode = "codex_responses"
+        parent.model = "gpt-5.6-luna"
 
         with patch("run_agent.AIAgent") as MockAgent:
             mock_child = MagicMock()
@@ -2496,8 +2550,9 @@ class TestOrchestratorEndToEnd(unittest.TestCase):
                 m.enabled_toolsets = ["terminal", "file", "delegation"]
                 m.api_key = "***"
                 m.base_url = ""
-                m.provider = None
-                m.api_mode = None
+                m.provider = "test"
+                m.model = "test-model"
+                m.api_mode = "chat_completions"
                 m.providers_allowed = None
                 m.providers_ignored = None
                 m.providers_order = None
