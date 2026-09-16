@@ -13,6 +13,7 @@ ONLY, zero code/prompt text copied (proprietary).
 """
 
 import json
+import pytest
 import threading
 from unittest.mock import MagicMock, patch
 
@@ -26,6 +27,11 @@ from tools.delegation_output_schema import (
     build_retry_message,
     validate_output,
 )
+
+
+pytestmark = pytest.mark.usefixtures("admitted_delegate_route")
+
+
 
 ADDRESS_SCHEMA = {
     "type": "object",

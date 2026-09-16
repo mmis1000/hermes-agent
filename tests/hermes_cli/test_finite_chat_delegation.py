@@ -33,7 +33,15 @@ def test_finite_chat_joins_parallel_children_before_final_response(tmp_path, mod
 
     class Provider(http.server.BaseHTTPRequestHandler):
         def do_GET(self):
-            self.send_error(404)
+            if not self.path.rstrip("/").endswith("/models"):
+                self.send_error(404)
+                return
+            body = json.dumps({"object": "list", "data": [{"id": "test-model", "object": "model"}]}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
 
         def do_POST(self):
             try:
@@ -146,6 +154,7 @@ def test_finite_chat_joins_parallel_children_before_final_response(tmp_path, mod
     assert [r["summary"] for r in joined_results[0]["results"]] == [w + "_COMPLETE" for w in workers]
 
 
+@pytest.mark.usefixtures("admitted_delegate_route")
 @pytest.mark.parametrize("query,image", [("Delegate a task", None), (None, "image.png")])
 def test_tty_seeded_chat_keeps_background_delegation(monkeypatch, query, image):
     """A TTY -q (or image seed) still owns a later-turn completion consumer."""

@@ -8,6 +8,11 @@ from tools.delegate_tool import _build_child_agent
 from tools.delegate_tool_config import _resolve_child_fallback_chain
 from tests.tools.test_delegate import _make_mock_parent
 
+
+pytestmark = pytest.mark.usefixtures("admitted_delegate_route")
+
+
+
 PARENT_CHAIN = [
     {"provider": "openrouter", "model": "gpt-4o-mini", "api_key": "sk-or-parent"}
 ]

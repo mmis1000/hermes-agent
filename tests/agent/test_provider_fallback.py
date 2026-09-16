@@ -281,6 +281,161 @@ class TestFallbackChainAdvancement:
         assert agent.api_mode == "chat_completions"
         assert agent.client is not None
 
+    def test_actual_fallback_warns_active_orchestrator_model(self):
+        """A permitted runtime switch reaches the parent model, not only UI."""
+        parent = SimpleNamespace(
+            _executing_tools=True,
+            session_id="parent-session",
+            _gateway_session_key="active-parent-session",
+        )
+        agent = _make_agent(
+            fallback_model=[{"provider": "openai", "model": "gpt-4o"}]
+        )
+        agent.provider = "openrouter"
+        agent.model = "primary-model"
+        agent._delegation_fallback_callback = _build_delegation_fallback_callback(
+            parent,
+            subagent_id="sa-active",
+            child_session_ref={
+                "session_id": "child-session",
+                "delegation_id": "delegation-active",
+                "run_id": "run-active",
+            },
+        )
+
+        with (
+            patch.object(process_registry.completion_queue, "put") as enqueue,
+            patch(
+                "agent.auxiliary_client.resolve_provider_client",
+                return_value=(_mock_client(), "gpt-4o"),
+            ),
+        ):
+            assert agent._try_activate_fallback(reason=FailoverReason.rate_limit)
+
+        event = enqueue.call_args.args[0]
+        assert event["event_kind"] == "fallback"
+        assert event["internal"] is True
+        assert event["source"] == "hermes.delegation_runtime"
+        assert event["subagent_id"] == "sa-active"
+        assert event["child_session_id"] == "child-session"
+        assert event["delegation_id"] == "delegation-active"
+        assert event["run_id"] == "run-active"
+        assert event["old_provider"] == "openrouter"
+        assert event["new_provider"] == "openai"
+        assert event["reason"] == "rate_limit"
+    def test_notification_only_reason_preserves_fallback_eligibility(self):
+        """A trigger label for delivery must not alter fallback policy."""
+        parent = SimpleNamespace(
+            _executing_tools=True,
+            session_id="parent-session",
+            _gateway_session_key="active-parent-session",
+        )
+        agent = _make_agent(
+            fallback_model=[{"provider": "openai", "model": "gpt-4o"}]
+        )
+        agent.provider = "openrouter"
+        agent.model = "primary-model"
+        agent._delegation_fallback_callback = _build_delegation_fallback_callback(parent)
+
+        with (
+            patch.object(process_registry.completion_queue, "put") as enqueue,
+            patch(
+                "agent.auxiliary_client.resolve_provider_client",
+                return_value=(_mock_client(), "gpt-4o"),
+            ),
+        ):
+            assert agent._try_activate_fallback(notification_reason="empty_response")
+
+        event = enqueue.call_args.args[0]
+        assert event["reason"] == "empty_response"
+        assert agent._fallback_index == 1
+        assert agent._fallback_activated is True
+    def test_idle_background_fallback_uses_internal_routed_event(self):
+        """An idle parent gets a provenance-marked model-facing event."""
+        parent = SimpleNamespace(
+            _executing_tools=False,
+            session_id="parent-session",
+            _gateway_session_key="cli-parent-session",
+        )
+        agent = _make_agent(
+            fallback_model=[{"provider": "openai", "model": "gpt-4o"}]
+        )
+        agent.provider = "openrouter"
+        agent.model = "primary-model"
+        agent._delegation_fallback_callback = _build_delegation_fallback_callback(
+            parent
+        )
+
+        with (
+            patch.object(
+                process_registry.completion_queue, "put"
+            ) as enqueue,
+            patch(
+                "agent.auxiliary_client.resolve_provider_client",
+                return_value=(_mock_client(), "gpt-4o"),
+            ),
+        ):
+            assert agent._try_activate_fallback(reason=FailoverReason.auth)
+
+        event = enqueue.call_args.args[0]
+        assert event["type"] == "async_delegation"
+        assert event["event_kind"] == "fallback"
+        assert event["internal"] is True
+        assert event["source"] == "hermes.delegation_runtime"
+        assert event["session_key"] == "cli-parent-session"
+        assert event["parent_session_id"] == "parent-session"
+        assert event["old_provider"] == "openrouter"
+        assert event["new_provider"] == "openai"
+        assert event["reason"] == "auth"
+        from tools.process_registry import format_process_notification
+
+        formatted = format_process_notification(event)
+        assert "INTERNAL DELEGATION FALLBACK UPDATE" in formatted
+        assert "Child: unknown" in formatted
+        assert "Old route: " in formatted
+        assert "New route: gpt-4o via openai" in formatted
+        assert "Reason: auth" in formatted
+    def test_fallback_event_reaches_gateway_model_injection(self):
+        """The routed fallback event reaches the adapter/model-facing seam."""
+        from gateway.run import GatewayRunner
+        from unittest.mock import AsyncMock
+
+        event = {
+            "type": "async_delegation",
+            "event_kind": "fallback",
+            "notification_id": "fallback-test",
+            "session_key": "parent-session",
+            "parent_session_id": "parent-session",
+            "subagent_id": "sa-gateway",
+            "old_model": "primary-model",
+            "old_provider": "openrouter",
+            "new_model": "gpt-4o",
+            "new_provider": "openai",
+            "reason": "rate_limit",
+        }
+        runner = object.__new__(GatewayRunner)
+        runner._completion_delivery_lock = Lock()
+        runner._completion_deliveries_inflight = set()
+        runner._completion_deliveries_delivered = OrderedDict()
+        runner._completion_delivery_retention = 64
+        runner._classify_completion_target = AsyncMock(return_value="deliver")
+        runner._inject_watch_notification = AsyncMock(return_value=True)
+        runner._completion_delivery_ready = AsyncMock(return_value=True)
+
+        result = asyncio.run(
+            runner._deliver_completion_notification(
+                format_process_notification(event), event
+            )
+        )
+
+        assert result is True
+        injected = runner._inject_watch_notification.await_args.args[0]
+        assert "INTERNAL DELEGATION FALLBACK UPDATE" in injected
+        assert "Child: sa-gateway" in injected
+        assert "Old route: primary-model via openrouter" in injected
+        assert "New route: gpt-4o via openai" in injected
+        assert "Reason: rate_limit" in injected
+
 
 # ── Pool-rotation vs fallback gating (#11314) ────────────────────────────
 
@@ -545,3 +700,10 @@ class TestMoaPresetFallback:
                             fallback_model={"provider": "moa", "model": "default"})
         _assert_bound_to_moa_preset(agent)
         assert agent._fallback_activated is True
+
+from types import SimpleNamespace
+from threading import Lock
+from collections import OrderedDict
+import asyncio
+from tools.delegate_tool import _build_delegation_fallback_callback
+from tools.process_registry import process_registry, format_process_notification
