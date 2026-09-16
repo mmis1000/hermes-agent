@@ -996,3 +996,31 @@ class TestConversationStartedTwoLine:
         vol = self._volatile(agent)
         assert "Conversation started:" not in vol
         assert "as of the last context rebuild" not in vol
+
+
+def test_delegated_skill_index_uses_current_attempt_without_root_override():
+    agent = _make_agent(
+        valid_tool_names=["skill_view"],
+        platform="subagent",
+        _current_task_id="child-attempt",
+    )
+    with patch("agent.prompt_builder.build_skills_system_prompt", return_value="") as build_skills:
+        _stable_prompt(agent)
+    assert build_skills.call_args.kwargs["task_id"] == "child-attempt"
+
+
+def test_explicit_skill_scope_takes_precedence_over_current_task():
+    agent = _make_agent(
+        valid_tool_names=["skill_view"],
+        skill_scope_task_id="root-attempt",
+        _current_task_id="turn-task",
+    )
+    with patch("agent.prompt_builder.build_skills_system_prompt", return_value="") as build_skills:
+        _stable_prompt(agent)
+    assert build_skills.call_args.kwargs["task_id"] == "root-attempt"
+
+
+def test_unscoped_skill_prompt_preserves_discovery():
+    with patch("agent.prompt_builder.build_skills_system_prompt", return_value="") as build_skills:
+        _stable_prompt(_make_agent(valid_tool_names=["skill_view"]))
+    assert build_skills.call_args.kwargs["task_id"] is None
