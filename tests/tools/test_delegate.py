@@ -460,6 +460,8 @@ class TestDelegateTask(unittest.TestCase):
         self.assertNotIn("host-secret", prompt)
         self.assertNotIn("Delegated children receive", prompt)
 
+
+
     def test_resume_reuses_effective_per_call_model_provider_and_reasoning(self):
         metadata = {
             "model": "google/gemini-2.5-flash",
@@ -507,6 +509,59 @@ class TestDelegateTask(unittest.TestCase):
             {"enabled": True, "effort": "low"},
         )
 
+    def test_resumed_fallback_notification_uses_logical_identity(self):
+        metadata = {
+            "model": "test-model",
+            "provider": "openrouter",
+            "max_iterations": 10,
+            "role": "leaf",
+            "depth": 1,
+            "enabled_toolsets": [],
+        }
+        credentials = {
+            "model": "test-model",
+            "provider": "openrouter",
+            "base_url": "https://openrouter.ai/api/v1",
+            "api_key": "resume-key",
+            "api_mode": "chat_completions",
+        }
+        parent = _make_mock_parent()
+        parent.session_id = "parent-session"
+        parent._gateway_session_key = "parent-route"
+        child = MagicMock()
+        child.session_id = "resumed-session"
+        child._session_init_model_config = {}
+
+        with (
+            patch("tools.delegate_tool._resolve_delegation_credentials", return_value=credentials),
+            patch("tools.delegate_tool._build_child_agent", return_value=child),
+            patch("tools.process_registry.process_registry.completion_queue.put") as enqueue,
+        ):
+            build_resumed_child_agent(
+                bundle={"reconstruction_metadata": metadata},
+                logical_id="logical-resumed-child",
+                goal="continue verification",
+                parent_agent=parent,
+                continuation={
+                    "session_id": "resumed-session",
+                    "parent_session_id": "prior-session",
+                    "delegate_from": "parent-session",
+                },
+            )
+            assert child._delegation_fallback_callback(
+                "old-model",
+                "old-provider",
+                "new-model",
+                "new-provider",
+                "rate_limit",
+            ) is True
+
+        event = enqueue.call_args.args[0]
+        self.assertEqual(event["subagent_id"], "logical-resumed-child")
+        self.assertEqual(event["old_model"], "old-model")
+        self.assertEqual(event["new_model"], "new-model")
+        self.assertEqual(event["reason"], "rate_limit")
+
     def test_attempt_id_is_the_runtime_task_key(self):
         from tools.delegate_tool import _run_single_child
 
@@ -527,12 +582,13 @@ class TestDelegateTask(unittest.TestCase):
 
         def run_conversation(user_message, task_id=None, stream_callback=None):
             captured["task_id"] = task_id
+            captured["user_message"] = user_message
             return {"final_response": "done", "completed": True, "api_calls": 1}
 
         child.run_conversation.side_effect = run_conversation
         with (
             patch("tools.delegate_tool._register_subagent"),
-            patch("tools.delegate_tool._unregister_subagent") as unregister,
+            patch("tools.delegate_tool_child_run._unregister_subagent") as unregister,
             patch("tools.terminal_tool.get_session_cwd", return_value="/tmp"),
             patch("tools.terminal_tool.record_session_cwd"),
         ):
@@ -545,7 +601,9 @@ class TestDelegateTask(unittest.TestCase):
 
         self.assertEqual(result["status"], "completed")
         self.assertEqual(captured["task_id"], "attempt-immutable")
-        unregister.assert_called_once_with("logical-child", "attempt-immutable")
+        self.assertIn("attempt-local state", captured["user_message"])
+        unregister.assert_called_once_with("logical-child", agent=child)
+        self.assertEqual(child._delegation_attempt_id, "attempt-immutable")
 
     def test_child_inherits_runtime_credentials(self):
         parent = _make_mock_parent(depth=0)
@@ -553,6 +611,7 @@ class TestDelegateTask(unittest.TestCase):
         parent.api_key="***"
         parent.provider = "openai-codex"
         parent.api_mode = "codex_responses"
+        parent.model = "gpt-5.6-luna"
 
         with patch("run_agent.AIAgent") as MockAgent:
             mock_child = MagicMock()
@@ -1370,15 +1429,15 @@ class TestDelegationProviderIntegration(unittest.TestCase):
             {"task_index": 1, "status": "completed", "summary": "two"},
         ]
 
-        delegate_task(
-            tasks=[{"goal": "one"}, {"goal": "two"}],
+        result = delegate_task(
+            tasks=[{"goal": "complete task one"}, {"goal": "complete task two"}],
             model="google/gemini-2.5-flash",
             provider="openrouter",
             reasoning_effort="low",
             parent_agent=_make_mock_parent(),
         )
 
-        self.assertEqual(mock_build.call_count, 2)
+        self.assertEqual(mock_build.call_count, 2, result)
         for call in mock_build.call_args_list:
             self.assertEqual(call.kwargs["model"], "google/gemini-2.5-flash")
             self.assertEqual(call.kwargs["override_provider"], "openrouter")
@@ -2298,8 +2357,9 @@ class TestOrchestratorEndToEnd(unittest.TestCase):
                 m.enabled_toolsets = ["terminal", "file", "delegation"]
                 m.api_key = "***"
                 m.base_url = ""
-                m.provider = None
-                m.api_mode = None
+                m.provider = "test"
+                m.model = "test-model"
+                m.api_mode = "chat_completions"
                 m.providers_allowed = None
                 m.providers_ignored = None
                 m.providers_order = None
@@ -2586,3 +2646,5 @@ class TestAtomicChildCredentialBundle(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+from tools.delegate_tool import _build_child_system_prompt

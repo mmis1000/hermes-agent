@@ -52,7 +52,7 @@ _CLAIM_LEASE_S = 300.0
 _MAX_DURABLE_LIST = 100
 _DB_LOCK = threading.Lock()
 _STATE_CONDITION = threading.Condition()
-_ACTIVE_STATES = {"running", "finalizing", "interrupt_requested", "stalling"}
+_ACTIVE_STATES = {"starting", "running", "finalizing", "interrupt_requested", "stalling"}
 _WAIT_POLL_SECONDS = 0.05
 # Public lifecycle waits are capped at 300 seconds. Keep the durable hold lease
 # longer than that bound so a live waiter cannot be pre-empted, while a process
@@ -90,7 +90,7 @@ _monitor_thread: Optional[threading.Thread] = None
 _monitor_stop = threading.Event()
 
 _LIVE_STATES = {"running", "stalling", "finalizing"}
-_ACTIVE_STATES = ("running", "stalling")
+_ACTIVE_STATES = {"starting", "running", "finalizing", "interrupt_requested", "stalling"}
 # Routing origin persisted at dispatch so a restart-recovered completion can
 # reconstruct a full SessionSource (scope_id drives relay tenant egress).
 _ROUTING_KEYS = ("scope_id", "user_id", "user_name")
@@ -319,25 +319,32 @@ def is_interim_delegation_event(evt: Dict[str, Any]) -> bool:
 
 
 
-def defer_completion_delivery(delegation_id: str, claim_id: str) -> bool:
-    """Return an unadmitted completion to pending without spending a delivery attempt."""
-    return _update_delivery("""UPDATE async_delegations SET delivery_claim=NULL,
-                  delivery_claimed_at=NULL, delivery_attempts=MAX(0, delivery_attempts-1),
-                  updated_at=?
-           WHERE delegation_id=? AND delivery_state='pending' AND delivery_claim=?""",
-        (time.time(), delegation_id, claim_id))
+def defer_completion_delivery(delegation_id: str, claim_id: str, *, run_id: Optional[str] = None) -> bool:
+    """Return an exact unadmitted completion without spending its attempt budget."""
+    repository = _repository()
+    resolved = repository.resolve_run_id(delegation_id, run_id)
+    if resolved.get("status") != "found":
+        return False
+    with repository.write_txn() as conn:
+        return conn.execute(
+            "UPDATE delegation_runs SET delivery_state='pending', delivery_claim=NULL, "
+            "delivery_claimed_at=NULL, delivery_attempts=MAX(0,delivery_attempts-1) "
+            "WHERE run_id=? AND delivery_state='delivering' AND delivery_claim=?",
+            (resolved["run_id"], claim_id),
+        ).rowcount == 1
 
 
-def drop_completion_delivery(delegation_id: str, claim_id: str) -> bool:
-    """Terminally drop a claimed completion whose target is permanently gone (the
-    spawning session ended at an explicit user boundary such as /new or reset).
-    ``dropped`` — not ``delivered`` — keeps the ack honest; not ``pending`` keeps
-    restart recovery from replaying it into a fail-closed drop forever."""
-    return _update_delivery("""UPDATE async_delegations SET delivery_state='dropped',
-                  updated_at=?, delivery_claim=NULL,
-                  delivery_claimed_at=NULL
-           WHERE delegation_id=? AND delivery_state='pending'
-             AND delivery_claim=?""", (time.time(), delegation_id, claim_id))
+def drop_completion_delivery(
+    delegation_id: str, claim_id: str, *, run_id: Optional[str] = None
+) -> bool:
+    """Terminally suppress an exact claimed completion with no live target."""
+    inspected = _repository().inspect_delivery(delegation_id, run_id)
+    if inspected.get("status") != "found":
+        return False
+    outcome = _repository().commit_run_delivery(
+        str(inspected["run_id"]), claim_id, disposition="suppressed"
+    )
+    return _changed(outcome, "suppressed")
 
 
 
@@ -569,7 +576,7 @@ def active_task_count() -> int:
         return sum(
             len(r.get("task_indexes") or r["goals"])
             if r.get("is_batch") and isinstance(r.get("goals"), (list, tuple)) and r["goals"] else 1
-            for r in _records.values() if r.get("status") in {"running", "finalizing"})
+            for r in _records.values() if r.get("status") in _ACTIVE_STATES)
 
 
 def _session_records(statuses, session_key: str, origin_ui_session_id: str, parent_session_id: str) -> list:
@@ -753,6 +760,7 @@ def dispatch_async_delegation(
     session_key: str, parent_session_id: Optional[str] = None, runner: Callable[[], Dict[str, Any]],
     origin_ui_session_id: str = "", origin_session_id: str = "", interrupt_fn: Optional[Callable[[], None]] = None,
     max_async_children: int = _DEFAULT_MAX_ASYNC_CHILDREN, progress_fn: Optional[Callable[[], tuple]] = None,
+    root_subagent_ids: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """Spawn ``runner`` on the daemon executor and return a handle immediately.
     ``session_key``/``parent_session_id`` are captured on the parent thread (the worker carries
@@ -761,7 +769,7 @@ def dispatch_async_delegation(
     Returns ``{"status": "dispatched", "delegation_id"}`` or ``{"status": "rejected", "error"}``."""
     delegation_id = _new_delegation_id()
     handle = _dispatch(
-        delegation_id=delegation_id, goal=goal, goals=None, context=context,
+        delegation_id=delegation_id, goal=goal, goals=None, context=context, root_subagent_ids=root_subagent_ids,
         toolsets=toolsets, role=role, model=model, session_key=session_key,
         parent_session_id=parent_session_id, runner=runner,
         origin_ui_session_id=origin_ui_session_id, origin_session_id=origin_session_id,
@@ -867,7 +875,7 @@ def _push_completion_event(record: Dict[str, Any], result: Dict[str, Any], statu
             "summary": result.get("summary"), "error": result.get("error"), "api_calls": result.get("api_calls", 0),
             "duration_seconds": result.get("duration_seconds", round(completed_at - dispatched_at, 2))}
     evt = {
-        "type": "async_delegation", "delivery_managed": True, "delegation_id": record.get("delegation_id"),
+        "type": "async_delegation", "delivery_managed": True, "delegation_id": record.get("delegation_id"), "run_id": record.get("run_id"),
         # session_key routes back to the originating gateway session; "" => CLI.
         "session_key": record.get("session_key", ""),
         "origin_ui_session_id": record.get("origin_ui_session_id", ""),
@@ -881,7 +889,8 @@ def _push_completion_event(record: Dict[str, Any], result: Dict[str, Any], statu
         **{k: record[k] for k in _ROUTING_KEYS if record.get(k)},
         **{k: result[k] for k in _STALL_META_KEYS if k in result}}
     try:
-        _persist_completion(evt, result)
+        if not _persist_completion(evt, result):
+            return
     except Exception as exc:  # noqa: BLE001 — a lost durable row is recoverable; a lost result + leaked slot is not
         logger.error(f"Async delegation{label} %s: durable completion write failed; delivering in-memory "
                      "only (a restart may report this unit as unknown): %s", record.get("delegation_id"), exc)
@@ -1825,7 +1834,10 @@ def recover_stale_wait_holds(delegation_id: Optional[str] = None) -> int:
 
 def claim_event_delivery(evt: Dict[str, Any], consumer: str) -> Optional[str]:
     """Claim a durable delegation event; non-durable events need no token."""
-    if evt.get("type") != "async_delegation":
+    if (
+        evt.get("type") != "async_delegation"
+        or evt.get("event_kind") == "fallback"
+    ):
         return ""
     if evt.get("_async_delivery_claim_token"):
         return str(evt["_async_delivery_claim_token"])
@@ -2464,3 +2476,28 @@ def _annotate_wait_snapshot(
         snapshot["claimed_delivery"] = bool(snapshot.get("claimed_delivery", False))
     snapshot["delivery_consumed"] = snapshot.get("delivery_state") == "consumed"
     return snapshot
+
+_RESUME_METADATA_FIELDS = frozenset(
+    {
+        "child_session_id",
+        "parent_session_id",
+        "parent_logical_id",
+        "depth",
+        "role",
+        "model",
+        "provider",
+        "api_mode",
+        "reasoning_config",
+        "enabled_toolsets",
+        "disabled_toolsets",
+        "workdir",
+        "max_iterations",
+        "max_tokens",
+        "fallback_routes",
+        "provider_preferences",
+    }
+)
+
+
+def _finalize_batch(delegation_id, combined, status):
+    return _finalize(delegation_id, combined, status)

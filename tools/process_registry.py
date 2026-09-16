@@ -104,6 +104,8 @@ def prepare_notification_delivery(event: Dict[str, Any]) -> str:
     if event.get("type") != "async_delegation":
         return "deliver"
 
+    if event.get("event_kind") == "fallback":
+        return "deliver"
     token = event.get(_ASYNC_DELIVERY_TOKEN_KEY)
     if token and event.get(_ASYNC_DELIVERY_ACCEPTED_KEY):
         if finish_notification_delivery(event, delivered=True):
