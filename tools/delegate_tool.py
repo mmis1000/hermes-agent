@@ -1,6 +1,4 @@
 #!/usr/bin/env python3
-_UNSET = object()
-
 """
 Delegate Tool -- Subagent Architecture
 
@@ -159,6 +157,8 @@ def _apply_child_compression_cap(child, delegation_cfg: dict) -> None:
         cc._apply_threshold_tokens_cap()
 
 
+_UNSET = object()
+
 def _build_child_agent(
     task_index: int,
     goal: str,
@@ -307,6 +307,14 @@ def _build_child_agent(
     child._subagent_goal = goal
     child._parent_turn_id = getattr(parent_agent, "_current_turn_id", "") or ""
     child._delegation_session_ref = child_session_ref
+    # Runtime-only callback: a permitted fallback must reach the orchestrating
+    # model through the routed internal notification rail, not only the child
+    # status/UI callbacks. Never include this closure in persisted metadata.
+    child._delegation_fallback_callback = _build_delegation_fallback_callback(
+        parent_agent,
+        subagent_id=subagent_id,
+        child_session_ref=child_session_ref,
+    )
     # Reconstruction metadata is an explicit allowlist. Never persist API
     # keys, base URLs, request overrides, ACP commands/args, or provider
     # credential-pool state.
@@ -674,6 +682,10 @@ def delegate_task(
     except ValueError as exc:
         return tool_error(str(exc))
 
+    try:
+        _admit_delegation_route(creds, parent_agent)
+    except ValueError as exc:
+        return tool_error(str(exc))
     overall_start = time.monotonic()
     # Live transcripts: cache/delegation/live/<id>/task-<n>.log per task, a side channel with zero effect on message
     # content or prompt caching. Best-effort: on failure live_paths is empty and delegation proceeds.
@@ -1202,6 +1214,242 @@ _LIVE_CONTROL_ACTIONS = frozenset({"list", "steer", "stop"})
 _MERGED_CONTROL_ACTIONS = frozenset({"list", "status", "tail", "wait", "steer", "resume", "interrupt", "stop", "abandon"})
 
 
+def _build_delegation_fallback_callback(
+    parent_agent,
+    *,
+    subagent_id: str = "",
+    child_session_ref: Optional[Dict[str, str]] = None,
+):
+    """Build the narrow model-facing fallback notification for a child.
+
+    The existing routed async-delegation queue lets the CLI/TUI/gateway deliver
+    an internal continuation turn with explicit provenance instead of pretending
+    the update is user input.  This is intentionally the same rail for active
+    and idle parents.
+    """
+    if parent_agent is None:
+        return None
+
+    def _route_context():
+        session_key = str(
+            getattr(parent_agent, "_gateway_session_key", "") or ""
+        ).strip()
+        origin_ui_session_id = ""
+        origin_session_id = ""
+        try:
+            from gateway.session_context import get_session_env
+
+            origin_ui_session_id = str(
+                get_session_env("HERMES_UI_SESSION_ID", "") or ""
+            ).strip()
+            platform = str(
+                get_session_env("HERMES_SESSION_PLATFORM", "") or ""
+            ).strip()
+            if platform == "api_server":
+                origin_session_id = str(
+                    get_session_env("HERMES_SESSION_CHAT_ID", "") or ""
+                ).strip()
+            if not session_key:
+                from tools.approval import get_current_session_key
+
+                session_key = str(get_current_session_key(default="") or "").strip()
+        except Exception:
+            pass
+        if not session_key:
+            session_key = str(getattr(parent_agent, "session_id", "") or "").strip()
+        return {
+            "session_key": session_key,
+            "origin_ui_session_id": origin_ui_session_id,
+            "origin_session_id": origin_session_id,
+            "parent_session_id": str(
+                getattr(parent_agent, "session_id", "") or ""
+            ).strip(),
+        }
+
+    def _notify(old_model, old_provider, new_model, new_provider, reason=None):
+        reason_value = getattr(reason, "value", None) or str(reason or "unknown")
+        warning = (
+            "[Delegation runtime warning] A permitted fallback activated while "
+            "the child was running. "
+            f"Old route: {old_model} via {old_provider}. "
+            f"New route: {new_model} via {new_provider}. "
+            f"Reason: {reason_value}."
+        )
+
+        route = _route_context()
+        if not route["session_key"] and not route["origin_session_id"]:
+            logger.debug(
+                "Dropping unroutable delegation fallback warning instead of "
+                "sending it to an unrelated session"
+            )
+            return False
+        event = {
+            "type": "async_delegation",
+            "event_kind": "fallback",
+            "internal": True,
+            "source": "hermes.delegation_runtime",
+            "delivery_managed": False,
+            "notification_id": f"fallback_{uuid.uuid4().hex}",
+            **route,
+            "status": "running",
+            "old_model": str(old_model or ""),
+            "old_provider": str(old_provider or ""),
+            "new_model": str(new_model or ""),
+            "new_provider": str(new_provider or ""),
+            "reason": reason_value,
+            "message": warning,
+            "subagent_id": str(subagent_id or ""),
+            "child_session_id": str(
+                (child_session_ref or {}).get("session_id") or ""
+            ),
+            "delegation_id": str(
+                (child_session_ref or {}).get("delegation_id") or ""
+            ),
+            "run_id": str((child_session_ref or {}).get("run_id") or ""),
+        }
+        try:
+            from tools.process_registry import process_registry
+
+            process_registry.completion_queue.put(event)
+            return True
+        except Exception:
+            logger.debug(
+                "Delegation fallback warning queue delivery failed", exc_info=True
+            )
+            return False
+
+    return _notify
+
+
+def _delegation_route_for_admission(creds: dict, parent_agent) -> dict:
+    """Resolve the exact route that ``_build_child_agent`` will receive."""
+    model = str(creds.get("model") or getattr(parent_agent, "model", "") or "").strip()
+    provider = str(
+        creds.get("provider") or getattr(parent_agent, "provider", "") or ""
+    ).strip()
+    base_url = creds.get("base_url")
+    if not base_url:
+        from tools.delegate_tool_config import _inherit_parent_endpoint
+
+        base_url, _ = _inherit_parent_endpoint(
+            parent_agent, getattr(parent_agent, "base_url", None), None
+        )
+    api_key = creds.get("api_key")
+    if not api_key:
+        api_key = getattr(parent_agent, "api_key", None)
+        if not api_key:
+            client_kwargs = getattr(parent_agent, "_client_kwargs", None)
+            if isinstance(client_kwargs, dict):
+                api_key = client_kwargs.get("api_key")
+    if callable(api_key) and not isinstance(api_key, str):
+        # Runtime providers such as Entra ID and MiniMax OAuth intentionally
+        # expose a zero-argument token provider. Materialize that selected
+        # credential for the admission probe; never turn it into ``None`` or
+        # allow the catalog helper to resolve an ambient account instead.
+        try:
+            from agent.azure_identity_adapter import materialize_bearer_for_http
+
+            api_key = materialize_bearer_for_http(api_key)
+        except Exception as exc:
+            raise ValueError(
+                "Delegation admission rejected: the selected route credential "
+                f"could not be resolved ({exc}); ambient credential fallback is "
+                "not permitted."
+            ) from exc
+    elif api_key is not None and not isinstance(api_key, str):
+        raise ValueError(
+            "Delegation admission rejected: the selected route credential has an "
+            "unsupported type; ambient credential fallback is not permitted."
+        )
+    api_mode = creds.get("api_mode") or getattr(parent_agent, "api_mode", None)
+    return {
+        "model": model,
+        "provider": provider,
+        "base_url": base_url,
+        # Validation probes accept string credentials. Supported callable
+        # providers are materialized above; any unsupported value is rejected.
+        "api_key": api_key if isinstance(api_key, str) else None,
+        "api_mode": api_mode,
+    }
+
+
+def _admit_delegation_route(creds: dict, parent_agent) -> dict:
+    """Admit an exact route from the shared cache, then one live resolve."""
+    route = _delegation_route_for_admission(creds, parent_agent)
+    model = route["model"]
+    provider = route["provider"]
+    if not model or not provider:
+        raise ValueError(
+            "Delegation admission rejected: the exact provider/model route is "
+            f"unavailable (provider={provider or '<unset>'!r}, "
+            f"model={model or '<unset>'!r})."
+        )
+
+    from hermes_cli.models import normalize_provider
+
+    normalized_provider = normalize_provider(provider)
+
+    def _reject(detail: str) -> None:
+        raise ValueError(
+            f"Delegation admission rejected for model {model!r} via provider "
+            f"{provider!r}: {detail}"
+        )
+
+    def _contains(catalog) -> bool:
+        if not catalog:
+            return False
+        values = {
+            str(item).strip()
+            for item in catalog
+            if isinstance(item, str) and item.strip()
+        }
+        if normalized_provider == "gemini":
+            values = {
+                value[len("models/") :] if value.startswith("models/") else value
+                for value in values
+            }
+        return model in values or (
+            normalized_provider in {"minimax", "minimax-cn", "minimax-oauth"}
+            and model.lower() in {value.lower() for value in values}
+        )
+
+    def _resolve_catalog(*, force_refresh: bool = False, cache_only: bool = False):
+        """Resolve one provider catalog through the shared two-tier flow."""
+        from hermes_cli.models import cached_fetch_api_models, cached_provider_model_ids
+
+        if normalized_provider == "custom" or normalized_provider.startswith("custom:"):
+            return cached_fetch_api_models(
+                route["api_key"],
+                route["base_url"],
+                api_mode=route["api_mode"],
+                force_refresh=force_refresh,
+                cache_only=cache_only,
+                require_verified=True,
+            ) or []
+        return cached_provider_model_ids(
+            provider,
+            force_refresh=force_refresh,
+            cache_only=cache_only,
+            require_verified=True,
+            api_key=route["api_key"],
+            base_url=route["base_url"],
+            api_mode=route["api_mode"],
+        )
+
+    try:
+        cached = _resolve_catalog(cache_only=True)
+        if _contains(cached):
+            return route
+        live = _resolve_catalog(force_refresh=True)
+    except Exception as exc:
+        _reject(f"selected provider/account catalog verification failed ({exc}).")
+
+    if _contains(live):
+        return route
+    if live:
+        _reject("the exact model is not present in the selected provider catalog.")
+    _reject("the selected provider/account catalog is unavailable; no child was started.")
+
 
 def prepare_resumed_child_session(bundle: Dict[str, Any]) -> Dict[str, str]:
     """Validate a hydration bundle and allocate a distinct child segment.
@@ -1396,6 +1644,11 @@ def build_resumed_child_agent(
         session_ref=session_ref,
     )
     child.tool_progress_callback = child_progress_cb
+    child._delegation_fallback_callback = _build_delegation_fallback_callback(
+        runtime_parent,
+        subagent_id=logical_id,
+        child_session_ref=session_ref,
+    )
     if child_progress_cb:
         def _resumed_thinking(text: str) -> None:
             if text:
