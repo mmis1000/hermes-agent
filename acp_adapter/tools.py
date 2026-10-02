@@ -796,6 +796,11 @@ def build_tool_start(tool_call_id: str, tool_name: str, arguments: Args, *, edit
 
 def _build_tool_start(tool_call_id: str, tool_name: str, arguments: Args, *, edit_diff: Any = None) -> ToolCallStart:
     """Build the ToolCallStart event (unguarded; see ``build_tool_start``)."""
+    if tool_name == "skill_manage" and arguments.get("action") == "patch":
+        name = str(arguments.get("name") or "")
+        file_path = str(arguments.get("file_path") or "SKILL.md")
+        return acp.start_tool_call(tool_call_id, f"skill patch: {name}/{file_path}", kind="edit",
+            content=[acp.tool_diff_content(path=f"skills/{name}/{file_path}", old_text=str(arguments.get("old_string") or ""), new_text=str(arguments.get("new_string") or ""))], raw_input=None)
     raw_input = None
     if tool_name in ("patch", "write_file") and edit_diff is not None:
         content = [acp.tool_diff_content(path=edit_diff.path, old_text=edit_diff.old_text, new_text=edit_diff.new_text)]
