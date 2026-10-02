@@ -157,6 +157,25 @@ class TestBuildToolStart:
 
 
 
+    def test_build_tool_start_for_skill_manage_patch_shows_diff(self):
+        result = build_tool_start(
+            "tc-skill-manage",
+            "skill_manage",
+            {
+                "action": "patch",
+                "name": "hermes-agent-operations",
+                "file_path": "references/acp.md",
+                "old_string": "old advice",
+                "new_string": "new advice",
+            },
+        )
+        assert result.kind == "edit"
+        assert result.title == "skill patch: hermes-agent-operations/references/acp.md"
+        assert isinstance(result.content[0], FileEditToolCallContent)
+        assert result.content[0].path == "skills/hermes-agent-operations/references/acp.md"
+        assert result.content[0].old_text == "old advice"
+        assert result.content[0].new_text == "new advice"
+        assert result.raw_input is None
 
 
 
