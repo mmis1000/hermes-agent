@@ -1502,3 +1502,70 @@ def test_stalled_notice_names_exact_resume_call_for_each_unfinished_child(monkey
         assert 'action="resume"' not in format_process_notification(single_evt)
     finally:
         gate.set()
+
+
+def test_subagent_activity_maps_each_live_child_by_logical_id_and_never_guesses(monkeypatch):
+    """Observers read per-child activity by the logical id ``subagent_start`` announced: a unit's activity lands on the
+    child at the same root position, an id with no live record is reported unknown (not healthy), and a unit the stale
+    monitor flags is marked suspect."""
+    _fast_stale_monitor(monkeypatch, idle=0.2, in_tool=0.4, grace=5.0)
+    gate = threading.Event()
+    now = time.time()
+    live = {"token": ((7, "terminal", now, 7, 50), (2, None, now, 2, 50))}
+    res = ad.dispatch_async_delegation_batch(
+        goals=["crawl the docs site", "index the crawled pages"], root_subagent_ids=["sa-crawl", "sa-index"],
+        context=None, toolsets=None, role="leaf", model="m", session_key="", max_async_children=1,
+        runner=lambda: {} if gate.wait(timeout=10) else {}, progress_fn=lambda: (live["token"], True))
+    try:
+        activity = ad.subagent_activity(["sa-crawl", "sa-index", "sa-gone"])
+        assert activity["sa-gone"] == {"known": False}
+        assert (activity["sa-crawl"]["api_calls"], activity["sa-crawl"]["current_tool"]) == (7, "terminal")
+        assert (activity["sa-index"]["api_calls"], activity["sa-index"]["current_tool"]) == (2, None)
+        assert activity["sa-crawl"]["iterations_max"] == 50 and not activity["sa-crawl"]["stall_suspected"]
+        assert {a["delegation_id"] for a in (activity["sa-crawl"], activity["sa-index"])} == {res["delegation_id"]}
+
+        deadline = time.time() + 5  # a frozen token past the threshold: the monitor flags the unit
+        while time.time() < deadline and not ad.subagent_activity(["sa-crawl"])["sa-crawl"].get("stall_suspected"):
+            time.sleep(0.05)
+        assert ad.subagent_activity(["sa-crawl"])["sa-crawl"]["stall_suspected"]
+    finally:
+        gate.set()
+
+
+def test_budget_only_changes_never_count_as_progress(monkeypatch):
+    """The stale monitor decides frozen vs moving from activity alone: a child whose observer fields move (iteration
+    accounting such as a refund, tool start time) while its API calls, tool and activity time stay frozen must still be
+    flagged."""
+    _fast_stale_monitor(monkeypatch, idle=0.2, in_tool=0.4, grace=5.0)
+    gate, ticks = threading.Event(), iter(range(10**6))
+    frozen_at = time.time()
+    res = ad.dispatch_async_delegation_batch(
+        goals=["crawl the docs site"], root_subagent_ids=["sa-frozen"], context=None, toolsets=None, role="leaf",
+        model="m", session_key="", max_async_children=1, runner=lambda: {} if gate.wait(timeout=10) else {},
+        progress_fn=lambda: (((3, None, frozen_at, next(ticks), 50, next(ticks)),), False))
+    try:
+        deadline = time.time() + 5
+        while time.time() < deadline and not ad.subagent_activity(["sa-frozen"])["sa-frozen"].get("stall_suspected"):
+            time.sleep(0.05)
+        assert ad.subagent_activity(["sa-frozen"])["sa-frozen"]["stall_suspected"], res
+    finally:
+        gate.set()
+
+
+def test_subagent_activity_reports_time_in_current_tool(monkeypatch):
+    """Inside a tool, activity is heartbeated, so observers need the tool's age: ``seconds_in_tool`` follows the start
+    time the child reported, and is absent when the child is between tools."""
+    gate = threading.Event()
+    now = time.time()
+    res = ad.dispatch_async_delegation_batch(
+        goals=["run the long build", "summarize findings"], root_subagent_ids=["sa-build", "sa-idle"],
+        context=None, toolsets=None, role="leaf", model="m", session_key="", max_async_children=1,
+        runner=lambda: {} if gate.wait(timeout=10) else {},
+        progress_fn=lambda: (((4, "terminal", now, 4, 50, now - 600), (2, None, now, 2, 50, None)), True))
+    try:
+        activity = ad.subagent_activity(["sa-build", "sa-idle"])
+        assert 599 <= activity["sa-build"]["seconds_in_tool"] <= 660, (res, activity)
+        assert activity["sa-build"]["seconds_since_activity"] < 60  # heartbeated: says nothing about the tool's age
+        assert "seconds_in_tool" not in activity["sa-idle"]
+    finally:
+        gate.set()

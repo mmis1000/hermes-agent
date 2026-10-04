@@ -304,3 +304,32 @@ class TestSessionCompressEvent:
             assert ctx["session_id"] == agent.session_id
             assert ctx["old_session_id"] == original_sid
             assert ctx["compression_count"] == 1
+
+
+@pytest.mark.parametrize("in_place", [False, True])
+def test_plugin_session_switch_hook_follows_real_id_rotation(in_place):
+    """General plugins get ``on_session_switch(new, old)`` exactly when compression moves the conversation to a new
+    id — their per-session state would otherwise die at the boundary — and never for in-place compaction."""
+    from hermes_state import SessionDB
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        agent = TestCompressionBoundaryHook()._make_agent(SessionDB(db_path=Path(tmpdir) / "test.db"))
+        agent.compression_in_place = in_place
+        compressor = MagicMock()
+        compressor.compress.return_value = [{"role": "user", "content": "summary"},
+                                            {"role": "user", "content": "tail question"}]
+        compressor.compression_count, compressor.last_prompt_tokens, compressor.last_completion_tokens = 1, 0, 0
+        compressor._last_summary_error, compressor._last_compress_aborted = None, False
+        agent.context_compressor = compressor
+        original_sid = agent.session_id
+
+        with patch("hermes_cli.lifecycle.invoke_hook") as invoke_hook:
+            agent._compress_context([{"role": "user", "content": f"m{i}"} for i in range(10)], "sys",
+                                    approx_tokens=10_000)
+        switches = [c.kwargs for c in invoke_hook.call_args_list if c.args == ("on_session_switch",)]
+        if agent.session_id == original_sid:
+            assert switches == []
+        else:
+            assert switches == [{"session_id": agent.session_id, "parent_session_id": original_sid,
+                                 "reason": "compression"}]
+        assert (agent.session_id == original_sid) == in_place

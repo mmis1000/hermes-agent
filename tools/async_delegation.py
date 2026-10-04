@@ -978,6 +978,7 @@ def _sweep_stale_locked(now: float):
             continue  # queued behind a full pool: not stalled, but keep the monitor alive for when it starts
         try:
             token, in_tool = progress_fn()
+            token = _liveness_view(token)
         except Exception:
             # An unreadable child must not look permanently healthy —
             # keep the last timestamp running instead of refreshing it.
@@ -1064,6 +1065,14 @@ def _stalled_result(delegation_id: str, event_record: Dict[str, Any]) -> Dict[st
 
 
 # ── Observability + control ─────────────────────────────────────────────────
+def _liveness_view(token: Any) -> Any:
+    """The part of a progress token that decides frozen vs moving: each child's (api_call_count, current_tool,
+    last_activity_ts). Extra observer fields (iteration budget, which also moves on refunds) never count as progress."""
+    if not isinstance(token, (list, tuple)):
+        return token
+    return tuple(tuple(part[:3]) if isinstance(part, (list, tuple)) else part for part in token)
+
+
 def _children_activity_from_token(token: Any, now: float) -> Optional[List]:
     """Parse a progress token into per-child activity dicts (best-effort): delegate_tool
     emits one ``(api_call_count, current_tool, last_activity_ts)`` tuple per child;
@@ -1080,7 +1089,49 @@ def _children_activity_from_token(token: Any, now: float) -> Optional[List]:
         entry: Dict[str, Any] = {"api_calls": part[0], "current_tool": part[1]}
         if len(part) >= 3 and isinstance(part[2], (int, float)):
             entry["seconds_since_activity"] = round(max(0.0, now - float(part[2])), 1)
+        if len(part) >= 5 and isinstance(part[3], int) and isinstance(part[4], int):
+            entry["iterations_used"], entry["iterations_max"] = part[3], part[4]
+        if len(part) >= 6 and part[1] and isinstance(part[5], (int, float)):
+            entry["seconds_in_tool"] = round(max(0.0, now - float(part[5])), 1)
         out.append(entry)
+    return out
+
+
+def subagent_activity(subagent_ids) -> Dict[str, Dict[str, Any]]:
+    """Live activity per logical subagent id, for observers that must tell a working child from a stuck one.
+
+    A unit's progress token lists its children in ``root_subagent_ids`` order. Only units holding a requested id are
+    sampled, outside the registry lock. An id this process holds no live record for (finished, a resumed attempt,
+    another process) maps to ``{"known": False}``, and a live child whose sample failed has no activity fields —
+    absence means unknown, never healthy. Stall fields appear once the stale monitor has flagged the unit.
+    ``seconds_in_tool`` (time in the current tool) is the signal for a long or hung tool: activity is heartbeated
+    throughout a tool, so ``seconds_since_activity`` stays near zero inside one.
+    """
+    wanted = {str(sid) for sid in subagent_ids or () if sid}
+    out: Dict[str, Dict[str, Any]] = {sid: {"known": False} for sid in wanted}
+    now = time.time()
+    units = []
+    with _records_lock:
+        for r in _records.values():
+            state = r.get("status")
+            roots = r.get("root_subagent_ids") if r.get("is_batch") else [r.get("subagent_id")]
+            if state in _ACTIVE_STATES and wanted.intersection(roots or ()):
+                stall = {dst: r[src] for src, dst in _STALL_FIELD_MAP if r.get(src) is not None}
+                units.append((dict(delegation_id=r.get("delegation_id"), run_id=r.get("run_id"), unit_state=state,
+                                   stall_suspected=state == "stalling", **stall), list(roots), r.get("progress_fn")))
+    for base, roots, sampler in units:
+        activity: List = []
+        if callable(sampler):
+            try:
+                activity = _children_activity_from_token(sampler()[0], now) or []
+            except Exception:
+                activity = []
+        for index, sid in enumerate(roots):
+            if sid in wanted:
+                entry = {"known": True, **base}
+                if index < len(activity) and isinstance(activity[index], dict):
+                    entry.update(activity[index])
+                out[sid] = entry
     return out
 
 
