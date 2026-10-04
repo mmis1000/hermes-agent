@@ -1701,6 +1701,33 @@ def dispatch_resumed_subagent(
         except Exception as exc:
             return fail_before_execution(exc)
 
+    child = None
+    lifecycle_closed = threading.Event()
+
+    def close_lifecycle(result: Dict[str, Any]) -> None:
+        """Run the spawned-child host lifecycle (summary budget, memory, subagent_stop, cost rollup) exactly once on
+        every path after the child was built — building fired subagent_start. A failure here is logged and never
+        replaces the run's own result."""
+        if lifecycle_closed.is_set():
+            return
+        lifecycle_closed.set()
+        result.setdefault("task_index", 0)
+        task = {"goal": str(event_record["goal"] or "resumed subagent")}
+        try:
+            from tools.delegate_tool_results import _finalize_child_results
+            _finalize_child_results([result], [task], [(0, task, child)], parent_agent)
+        except Exception:
+            logger.warning("Resumed delegation %s/%s: host lifecycle finalization failed",
+                           delegation_id, logical_id, exc_info=True)
+
+    def fail_after_build(exc: Exception) -> Dict[str, Any]:
+        close_lifecycle({"status": "error", "summary": None, "error": f"{type(exc).__name__}: {exc}"})
+        try:
+            child.close()
+        except Exception:
+            pass
+        return fail_before_execution(exc)
+
     try:
         if loaded.get("protected"):
             # Re-resolve trusted backing identity/revision immediately before
@@ -1741,16 +1768,12 @@ def dispatch_resumed_subagent(
             "child_session_id": bundle["prior_child_session_id"],
         }
     except Exception as exc:
-        return fail_before_execution(exc)
+        return fail_after_build(exc) if child is not None else fail_before_execution(exc)
 
     try:
         executor = _get_executor(max_async_children)
     except Exception as exc:
-        try:
-            child.close()
-        except Exception:
-            pass
-        return fail_before_execution(exc)
+        return fail_after_build(exc)
 
     def worker() -> None:
         result: Dict[str, Any]
@@ -1794,6 +1817,7 @@ def dispatch_resumed_subagent(
                 "duration_seconds": round(time.time() - dispatched_at, 2),
             }
             status = "error"
+        close_lifecycle(result)
         finish(result, status)
 
     try:
@@ -1803,11 +1827,7 @@ def dispatch_resumed_subagent(
             )
         executor.submit(propagate_context_to_thread(worker))
     except Exception as exc:
-        try:
-            child.close()
-        except Exception:
-            pass
-        return fail_before_execution(exc)
+        return fail_after_build(exc)
 
     return {
         "status": "dispatched",

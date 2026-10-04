@@ -393,11 +393,18 @@ def _finalize_child_results(
     results: List[Dict[str, Any]], task_list: List[Dict[str, Any]], children: List[tuple[int, Dict[str, Any], Any]],
     parent_agent,
 ) -> None:
-    """Apply host-owned summary, memory, hook, and cost contracts once."""
+    """Apply host-owned summary, memory, hook, and cost contracts once. Each contract is isolated: a failing summary
+    budget or memory notify must not skip ``subagent_stop`` (observers would keep the child "running" forever) or leave
+    the model-hidden ``_child_*`` fields in the result."""
     with _parent_finalization_lock(parent_agent):
-        _apply_summary_budget(results, parent_agent)
         child_by_index = {index: child for index, _task, child in children}
-        _notify_memory_manager(results, task_list, child_by_index, parent_agent)
+        for step, run in (("summary budget", lambda: _apply_summary_budget(results, parent_agent)),
+                          ("memory notify", lambda: _notify_memory_manager(results, task_list, child_by_index,
+                                                                           parent_agent))):
+            try:
+                run()
+            except Exception:
+                logger.warning("Subagent %s failed; continuing child finalization", step, exc_info=True)
         _rollup_children_cost(parent_agent, _fire_subagent_stop_hooks(results, child_by_index, parent_agent))
 
 def _run_child_lifecycle(task_index: int, goal: str, child=None, parent_agent=None) -> Dict[str, Any]:
