@@ -1,0 +1,11 @@
+name: subagent-watchdog
+version: 0.1.0
+description: "Keeps an orchestrating agent aware of its live background subagents: a status note when they change, and an opt-in timed status turn while they run."
+author: "mmis1000"
+provides_tools:
+  - subagent_watchdog
+provides_hooks:
+  - subagent_start
+  - subagent_stop
+  - pre_llm_call
+  - on_session_switch
