@@ -55,6 +55,30 @@ def test_cli_running_injection_keeps_existing_interrupt_behaviour():
     assert cli._pending_input.empty()
 
 
+def test_cli_running_injection_without_interrupt_waits_for_next_turn():
+    """``interrupt=False`` gives the CLI the queue-behind semantics the TUI and gateway hosts always have, so a
+    status notice never cancels in-flight work."""
+    context, manager = _context()
+    cli = SimpleNamespace(_agent_running=True, _pending_input=SimpleQueue(), _interrupt_queue=SimpleQueue())
+    manager._cli_ref = cli
+
+    assert context.inject_message("status", interrupt=False) is True
+    assert cli._pending_input.get_nowait() == "status"
+    assert cli._interrupt_queue.empty()
+
+
+def test_current_session_key_is_the_key_inject_message_routes_by():
+    from gateway.session_context import clear_session_vars, set_session_vars
+
+    context, _manager = _context()
+    assert context.current_session_key() == ""
+    tokens = set_session_vars(session_key="agent:main:telegram:dm:1", session_id="ses-1")
+    try:
+        assert context.current_session_key() == "agent:main:telegram:dm:1"
+    finally:
+        clear_session_vars(tokens)
+
+
 def test_gateway_injection_requires_session_key(tmp_path, monkeypatch):
     _write_plugin_config(
         tmp_path,

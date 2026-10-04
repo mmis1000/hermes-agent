@@ -308,7 +308,8 @@ def _resolve_async_session_key(parent_agent: Any, origin_ui_session_id: str) -> 
 
 def _batch_progress_token(child_agents: List[Any]) -> tuple:
     """Progress token for the async registry's stale monitor: every child's (api_call_count, current_tool,
-    last_activity_ts). last_activity_ts ticks on streamed chunks, tool transitions and API-call start/completion,
+    last_activity_ts, iterations_used, iterations_max, current_tool_started_at). Only the first three decide frozen vs moving
+    (``async_delegation._liveness_view``); observers read the budget pair to see how close a child is to its cap. last_activity_ts ticks on streamed chunks, tool transitions and API-call start/completion,
     so a child streaming a long response counts as alive; a fully frozen token past the threshold means the batch
     is wedged. ``in_tool`` is True while ANY child is inside a tool so slow tools get the higher ceiling (mirrors
     the sync heartbeat)."""
@@ -323,7 +324,8 @@ def _batch_progress_token(child_agents: List[Any]) -> tuple:
         try:
             summary = c.get_activity_summary()
             tool = summary.get("current_tool")
-            parts.append((summary.get("api_call_count", 0), tool, summary.get("last_activity_ts")))
+            parts.append((summary.get("api_call_count", 0), tool, summary.get("last_activity_ts"),
+                          summary.get("budget_used"), summary.get("budget_max"), summary.get("current_tool_started_at")))
             in_tool = in_tool or bool(tool)
         except Exception:
             parts.append(None)

@@ -630,6 +630,7 @@ _TURN_STATE: Dict[str, Any] = {
     "_last_activity_provenance": ActivityProvenance.UNKNOWN,
     "_session_activity_last_persist_mono": 0.0,  # rate-limits durable SessionDB stamps
     "_current_tool": None,
+    "_current_tool_started_at": None,  # wall clock; set with _current_tool by tool_executor._set_current_tool
     "_api_call_count": 0,
     # Opt-out for the between-turns MCP refresh; set on forks that need byte-identical tools[].
     "_skip_mcp_refresh": False,

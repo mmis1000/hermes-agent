@@ -347,3 +347,29 @@ def test_sequential_timeout_does_not_cut_clarify_human_wait(
     assert "timed out" not in messages[0]["content"]
     assert messages[1]["content"] == "second result"
     assert not any(event.get("error_type") == "tool_timeout" for event in terminal_events)
+
+
+def test_activity_summary_reports_running_tool_start_and_clears_it(tmp_path):
+    """Heartbeats keep ``seconds_since_activity`` near zero for a whole tool call, so the start time is the only way
+    an observer can tell a long or hung tool from a fresh one: the activity summary carries it while the tool runs and
+    drops it once the result is committed."""
+    agent = _make_agent(tmp_path)
+    seen = {}
+
+    def _dispatch(_name, _args, _task_id, **_kwargs):
+        seen.update(agent.get_activity_summary())
+        time.sleep(0.3)  # several heartbeats: they refresh activity, never the tool's start
+        seen["later"] = agent.get_activity_summary()
+        return "done"
+
+    before = time.time()
+    with patch("model_tools.handle_function_call", side_effect=_dispatch), \
+            patch("agent.tool_executor._TOOL_ACTIVITY_HEARTBEAT_INTERVAL_S", 0.05):
+        execute_tool_calls_sequential(agent, SimpleNamespace(tool_calls=[_tool_call("one")]), [], "task")
+
+    assert seen["current_tool"] == "web_extract"
+    assert before <= seen["current_tool_started_at"] <= time.time()
+    assert seen["later"]["current_tool_started_at"] == seen["current_tool_started_at"]
+    assert seen["later"]["last_activity_ts"] > seen["current_tool_started_at"]
+    after = agent.get_activity_summary()
+    assert (after["current_tool"], after["current_tool_started_at"]) == (None, None)
