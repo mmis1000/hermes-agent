@@ -839,6 +839,22 @@ def _finalize(delegation_id: str, result: Any, status: str) -> None:
         _prune_completed_locked()
 
 
+_FINISHED_CHILD_STATES = {"completed", "success"}
+
+
+def _stalled_resume_targets(record: Dict[str, Any], result: Dict[str, Any]) -> List[str]:
+    """Logical children a force-finalized run left unfinished — the exact ``resume`` targets its notice names.
+    Built before ``complete_run`` terminalizes the attempts, so it reads the dispatch identities, not the ledger.
+    A record without real logical ids (cron's single dispatch) yields none rather than a placeholder."""
+    if record.get("is_batch"):
+        roots = record.get("root_subagent_ids") or []
+    else:
+        roots = [record["subagent_id"]] if record.get("subagent_id") else []
+    finished = {r.get("subagent_id") for r in result.get("results") or []
+                if isinstance(r, dict) and r.get("status") in _FINISHED_CHILD_STATES}
+    return [sid for sid in roots if sid not in finished]
+
+
 def _push_completion_event(record: Dict[str, Any], result: Dict[str, Any], status: str) -> None:
     """Push a type='async_delegation' event onto the shared completion queue. Batch records
     (``is_batch``) carry the per-task ``results`` list (plus live transcript paths, the
@@ -877,7 +893,8 @@ def _push_completion_event(record: Dict[str, Any], result: Dict[str, Any], statu
         "status": status, **payload, "dispatched_at": dispatched_at, "completed_at": completed_at,
         **({} if is_batch else {"exit_reason": result.get("exit_reason")}),
         **{k: record[k] for k in _ROUTING_KEYS if record.get(k)},
-        **{k: result[k] for k in _STALL_META_KEYS if k in result}}
+        **{k: result[k] for k in _STALL_META_KEYS if k in result},
+        **({"resume_subagent_ids": _stalled_resume_targets(record, result)} if status == "stalled" else {})}
     try:
         if not _persist_completion(evt, result):
             return
@@ -1276,6 +1293,11 @@ def recover_abandoned_delegations() -> int:
             "error": error,
             "dispatched_at": current["dispatched_at"],
             "completed_at": now,
+            "resume_subagent_ids": [
+                sid for sid, child in current["children"].items()
+                if child.get("run_id") == run_id and not child.get("parent_id")
+                and child.get("resume_available") and child.get("status") not in _FINISHED_CHILD_STATES
+            ],
         }
         if current.get("is_batch"):
             results = []

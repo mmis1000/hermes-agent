@@ -103,3 +103,65 @@ print(json.dumps([{"event": event, "message": format_process_notification(event)
         assert event["git_state_hint"] in item["message"]
     assert set(by_index) == ({'1'} if missing_writer else {'0', '1'} if split else {'0'})
     assert set(by_index.values()) == set(transcripts)
+
+
+def test_owner_death_notice_names_resume_call_for_each_unfinished_child(tmp_path):
+    """After the owner dies, the restored notice must offer ``resume`` for exactly the children the ledger can
+    resume — by their logical ids — so the parent continues them instead of re-dispatching from scratch."""
+    repo = str(Path(__file__).resolve().parents[2])
+    env = {**os.environ, "HERMES_HOME": str(tmp_path), "PYTHONPATH": repo}
+    producer = r'''
+import json, os, threading
+from unittest.mock import MagicMock
+import tools.delegate_tool as dt
+parent = MagicMock(_delegate_depth=0, session_id="resume-parent", _interrupt_requested=False,
+                   _active_children=[], _active_children_lock=None)
+started = threading.Barrier(3)
+def child(*a, **kw):
+    started.wait(10)
+    threading.Event().wait(60)
+built = []
+def build(**kw):
+    c = MagicMock(_delegate_role="leaf", _subagent_id=f"sa-resume-{len(built)}")
+    c._delegation_runtime_metadata = {"child_session_id": f"resume-child-session-{len(built)}"}
+    built.append(c)
+    return c
+dt._build_child_agent = build
+dt._run_single_child = child
+dt._resolve_delegation_credentials = lambda *a, **k: dict(model="m", provider=None, base_url=None, api_key=None,
+                                                          api_mode=None, command=None, args=None)
+dt._admit_delegation_route = lambda *_args: None
+handle = json.loads(dt.delegate_task(tasks=[{"goal": "crawl the docs site"}, {"goal": "index the crawled pages"}],
+                                    background=True, parent_agent=parent))
+assert handle["status"] == "dispatched", handle
+started.wait(10)
+os._exit(0)
+'''
+    first = subprocess.run([sys.executable, "-c", producer], cwd=repo, env=env, text=True, capture_output=True,
+                           timeout=60)
+    assert first.returncode == 0, first.stdout + first.stderr
+    consumer = r'''
+import json, queue
+from tools import async_delegation as ad
+from tools.process_registry import format_process_notification
+q = queue.Queue()
+events = [q.get_nowait() for _ in range(ad.restore_undelivered_completions(q))]
+ledger = {e["delegation_id"]: ad.get_durable_delegation(e["delegation_id"]) for e in events}
+print(json.dumps([{"event": e, "message": format_process_notification(e),
+                   "resumable": sorted(sid for sid, c in ledger[e["delegation_id"]]["children"].items()
+                                       if c.get("resume_available") and not c.get("parent_id"))} for e in events]))
+'''
+    second = subprocess.run([sys.executable, "-c", consumer], cwd=repo, env=env, text=True, capture_output=True,
+                            timeout=60)
+    assert second.returncode == 0, second.stdout + second.stderr
+    restored = json.loads(second.stdout.strip().splitlines()[-1])
+    assert restored and {e["event"]["status"] for e in restored} == {"unknown"}
+    named = set()
+    for item in restored:
+        event = item["event"]
+        assert sorted(event["resume_subagent_ids"]) == item["resumable"]
+        for sid in event["resume_subagent_ids"]:
+            assert (f'delegate_task(action="resume", delegation_id="{event["delegation_id"]}", '
+                    f'subagent_id="{sid}"') in item["message"]
+        named.update(event["resume_subagent_ids"])
+    assert named == {"sa-resume-0", "sa-resume-1"}

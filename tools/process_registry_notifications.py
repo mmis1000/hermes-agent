@@ -192,6 +192,18 @@ def _recovery_lines(evt: dict) -> "list[str]":
     return lines
 
 
+def _resume_lines(evt: dict) -> "list[str]":
+    """Exact ``resume`` calls for the unfinished children of a stalled/unknown run. Without them the notice only
+    says "run it again", which nudges a fresh re-dispatch that discards the child's transcript."""
+    deleg_id, targets = evt.get("delegation_id"), evt.get("resume_subagent_ids") or []
+    if not deleg_id or not targets:
+        return []
+    return ["To continue unfinished work in the same child (it keeps its own transcript), resume it instead of "
+            "re-dispatching; check what it already did first so the continuation does not repeat side effects:",
+            *(f'  delegate_task(action="resume", delegation_id="{deleg_id}", subagent_id="{sid}", '
+              'message="<what to do next>")' for sid in targets)]
+
+
 def _format_batch_delegation(evt: dict, deleg_id: str, completed_at: float) -> str:
     """Consolidated block for a delegate_task fan-out that finished as one unit."""
     results, goals = evt.get("results") or [], evt.get("goals") or []
@@ -208,7 +220,7 @@ def _format_batch_delegation(evt: dict, deleg_id: str, completed_at: float) -> s
         "on siblings, end your turn after acting on this one.",
         completed_at, with_goal=False)
     lines[-1] += f"   Total duration: {evt.get('total_duration_seconds', evt.get('duration_seconds', '?'))}s"
-    lines += _recovery_lines(evt)
+    lines += _recovery_lines(evt) + _resume_lines(evt)
     if evt.get("error") and not results:
         lines += ["--- ERROR ---", f"The batch did not complete successfully: {evt['error']}"]
         return "\n".join(lines)
@@ -312,7 +324,7 @@ def _format_async_delegation(evt: dict) -> str:
         else:  # error / timeout / failed / unknown (owner died)
             lines.append(
                 f"The subagent did not complete successfully (status={status})." + (f"\n{error}" if error else ""))
-            lines += _recovery_lines(evt)
+            lines += _recovery_lines(evt) + _resume_lines(evt)
         if summary:
             lines += ["Partial output:", summary]
     return "\n".join(lines)
