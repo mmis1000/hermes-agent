@@ -4,7 +4,7 @@ import json
 from pathlib import PurePosixPath
 from threading import Event
 from types import SimpleNamespace
-from unittest.mock import ANY, MagicMock
+from unittest.mock import ANY, MagicMock, patch
 
 import pytest
 
@@ -997,3 +997,80 @@ def test_protected_authority_reconstructs_after_local_attempt_registry_restart()
     assert fresh.attempt_id == "attempt-after-restart"
     assert fresh.scope_id != authority["lineage"]["scope_id"]
     assert fresh.invocation_scope.visible_objects == scope.visible_objects
+
+
+@pytest.mark.parametrize("fault", ["none", "child_crash", "summary_budget", "after_build"])
+def test_resumed_child_reports_its_logical_id_and_stops_like_a_spawned_child(monkeypatch, fault):
+    """A resumed child must surface under its logical id (what steer/resume take) and run the same host lifecycle as a
+    spawned child: subagent_stop fires for its session and private bookkeeping fields never reach the stored result.
+    Without it, observers keep a resumed child "running" forever."""
+    from tools import async_delegation as ad
+    from tools import delegate_tool
+
+    monkeypatch.setattr(ad, "get_async_delegation", lambda *_a, **_k: {
+        "session_key": "owner", "origin_ui_session_id": "ui", "parent_session_id": "owner",
+        "children": {"sa-logical": {"status": "completed", "goal": "crawl the docs site"}}})
+    monkeypatch.setattr(ad, "load_subagent_resume_bundle", lambda *_a, **_k: {
+        "status": "ready", "protected": False,
+        "bundle": {"prior_child_session_id": "child-prior", "parent_session_id": "owner",
+                   "history": [{"role": "user", "content": "crawl"}],
+                   "reconstruction_metadata": {"parent_session_id": "owner", "model": "m", "provider": "p"}}})
+    repository = MagicMock()
+    repository.reserve_resumed_attempt.return_value = {
+        "status": "reserved", "run_id": "run-new", "attempt_id": "attempt-new", "attempt_number": 2}
+    monkeypatch.setattr(ad, "_repository", lambda: repository)
+    monkeypatch.setattr(delegate_tool, "prepare_resumed_child_session", lambda _b: {
+        "session_id": "child-new", "parent_session_id": "child-prior", "delegate_from": "owner"})
+    started = []
+    real_build = delegate_tool._build_child_agent
+
+    def build(**kwargs):
+        with patch("run_agent.AIAgent", side_effect=lambda **kw: MagicMock(session_id=kw.get("session_id"))), \
+                patch("hermes_cli.lifecycle.invoke_hook", side_effect=lambda name, **kw: started.append((name, kw))):
+            return real_build(**kwargs)
+
+    monkeypatch.setattr(delegate_tool, "_build_child_agent", build)
+    monkeypatch.setattr(delegate_tool, "_resolve_delegation_credentials", lambda *_a, **_k: {
+        "provider": "p", "api_key": "k", "base_url": "https://example.invalid", "api_mode": "chat_completions"})
+    def run(*_a, **_k):
+        if fault == "child_crash":
+            raise RuntimeError("child blew up")
+        return {"status": "completed", "summary": "done", "api_calls": 1, "task_index": 0,
+                "_child_role": "leaf", "_child_cost_usd": 0.0}
+
+    monkeypatch.setattr(delegate_tool, "_run_single_child", run)
+    submitted, pushed = [], []
+    monkeypatch.setattr(ad, "_get_executor", lambda _limit: SimpleNamespace(submit=lambda fn: submitted.append(fn)))
+    monkeypatch.setattr(ad, "_push_completion_event", lambda record, result, status: pushed.append(result))
+    if fault == "summary_budget":  # an ancillary finalizer failure must not swallow subagent_stop
+        from tools import delegate_tool_results
+        monkeypatch.setattr(delegate_tool_results, "_apply_summary_budget",
+                            lambda *_a, **_k: (_ for _ in ()).throw(RuntimeError("budget broke")))
+    if fault == "after_build":  # the resume builder fails after _build_child_agent already fired subagent_start
+        real_callback, calls = delegate_tool._build_child_progress_callback, []
+
+        def callback(*a, **k):  # the first call is inside _build_child_agent; the rebuild afterwards fails
+            calls.append(1)
+            if len(calls) > 1:
+                raise RuntimeError("callback broke")
+            return real_callback(*a, **k)
+
+        monkeypatch.setattr(delegate_tool, "_build_child_progress_callback", callback)
+    parent = MagicMock(session_id="owner", _delegate_depth=0, delegation_policy=None, _subagent_id=None)
+    parent._active_children = []
+
+    with patch("hermes_cli.plugins.invoke_hook") as invoke_hook:
+        handle = ad.dispatch_resumed_subagent("delegation", "sa-logical", session_key="owner", message="continue",
+                                              parent_agent=parent)
+        assert handle["status"] == ("dispatch_failed" if fault == "after_build" else "dispatched"), handle
+        for job in submitted:
+            job()
+
+    starts = [kw for name, kw in started if name == "subagent_start"]
+    stops = [c.kwargs for c in invoke_hook.call_args_list if c.args == ("subagent_stop",)]
+    assert [(kw["child_subagent_id"], kw["child_session_id"], kw["parent_session_id"]) for kw in starts] == [
+        ("sa-logical", "child-new", "owner")]  # the owning conversation, not the replayed predecessor segment
+    assert [(kw["child_session_id"], kw["parent_session_id"]) for kw in stops] == [("child-new", "owner")]
+    assert stops[0]["child_status"] == ("completed" if fault in ("none", "summary_budget") else "error")
+    if fault != "after_build":
+        assert pushed and not any(key.startswith("_child_") for key in pushed[0])

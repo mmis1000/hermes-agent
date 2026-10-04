@@ -182,6 +182,9 @@ def _build_child_agent(
     provider_preferences_override: Optional[Dict[str, Any]] = None,
     session_id_override: Optional[str] = None,
     parent_session_id_override: Optional[str] = None,
+    # A resumed child keeps its logical id, so hooks, progress and the live registry name the child the
+    # parent can steer or resume — not a fresh per-build id.
+    subagent_id_override: Optional[str] = None,
     # ACP transport overrides from trusted delegation config.
     override_acp_command: Optional[str] = None,
     override_acp_args: Optional[List[str]] = None,
@@ -207,7 +210,7 @@ def _build_child_agent(
 
     # One subagent_id shared by the progress callback, spawn_requested event and
     # the live registry; parent_id is set when THIS parent is itself a subagent.
-    subagent_id = f"sa-{task_index}-{_uuid.uuid4().hex[:8]}"
+    subagent_id = subagent_id_override or f"sa-{task_index}-{_uuid.uuid4().hex[:8]}"
     parent_subagent_id = getattr(parent_agent, "_subagent_id", None)
     if not isinstance(parent_subagent_id, str):
         parent_subagent_id = None
@@ -378,8 +381,10 @@ def _build_child_agent(
     _safe_progress(child_progress_cb, "subagent.spawn_requested", preview=goal)
     with _quiet("subagent_start hook invocation failed", exc_info=True):
         from hermes_cli.lifecycle import invoke_hook as _invoke_hook
+        # The agent that owns the child at runtime, not the replay-lineage parent: a resumed child's
+        # ``parent_sid`` is its previous segment, and subagent_stop reports the owning agent too.
         _invoke_hook(
-            "subagent_start", parent_session_id=parent_sid,
+            "subagent_start", parent_session_id=getattr(parent_agent, "session_id", None) or parent_sid,
             parent_turn_id=getattr(parent_agent, "_current_turn_id", "") or "", parent_subagent_id=parent_subagent_id,
             child_session_id=getattr(child, "session_id", None), child_subagent_id=subagent_id,
             child_role=effective_role, child_goal=goal,
@@ -1482,6 +1487,14 @@ def prepare_resumed_child_session(bundle: Dict[str, Any]) -> Dict[str, str]:
     }
 
 
+def _abort_built_child(child: Any, parent_agent: Any) -> None:
+    """Match a fired ``subagent_start`` with ``subagent_stop`` (status error) for a child that will never run."""
+    from tools.delegate_tool_results import _fire_subagent_stop_hooks
+    _fire_subagent_stop_hooks([{"task_index": 0, "status": "error"}], {0: child}, parent_agent)
+    with _quiet("Could not close an aborted child agent", exc_info=True):
+        child.close()
+
+
 def build_resumed_child_agent(
     *,
     bundle: Dict[str, Any],
@@ -1592,69 +1605,75 @@ def build_resumed_child_agent(
         provider_preferences_override=metadata.get("provider_preferences"),
         session_id_override=continuation["session_id"],
         parent_session_id_override=continuation["parent_session_id"],
+        subagent_id_override=logical_id,
         role=str(metadata.get("role") or "leaf"),
         resolved_scope=resolved_scope,
         delegation_policy_override=delegation_policy_override,
     )
+    try:
+        owner = continuation["delegate_from"]
+        prior = continuation["parent_session_id"]
+        session_id = continuation["session_id"]
+        parent_logical_id = metadata.get("parent_logical_id")
+        child.session_id = session_id
+        child._parent_session_id = prior
+        child._subagent_id = logical_id
+        child._parent_subagent_id = (
+            parent_logical_id if isinstance(parent_logical_id, str) else None
+        )
+        if isinstance(metadata.get("depth"), int):
+            child._delegate_depth = metadata["depth"]
+        child._delegate_role = str(metadata.get("role") or "leaf")
+        child._subagent_goal = goal
+        session_ref = {"session_id": session_id}
+        child._delegation_session_ref = session_ref
+        child._delegation_runtime_metadata = {
+            **metadata,
+            "child_session_id": session_id,
+            "parent_session_id": owner,
+            "enabled_toolsets": list(getattr(child, "enabled_toolsets", None) or []),
+            "disabled_toolsets": list(getattr(child, "disabled_toolsets", None) or []),
+            "reasoning_config": _json_safe_copy(
+                getattr(child, "reasoning_config", metadata.get("reasoning_config"))
+            ),
+            "fallback_routes": _json_safe_copy(
+                getattr(child, "_fallback_chain", metadata.get("fallback_routes"))
+            ),
+        }
+        if getattr(child, "_session_init_model_config", None) is not None:
+            child._session_init_model_config["_delegate_from"] = owner
 
-    owner = continuation["delegate_from"]
-    prior = continuation["parent_session_id"]
-    session_id = continuation["session_id"]
-    parent_logical_id = metadata.get("parent_logical_id")
-    child.session_id = session_id
-    child._parent_session_id = prior
-    child._subagent_id = logical_id
-    child._parent_subagent_id = (
-        parent_logical_id if isinstance(parent_logical_id, str) else None
-    )
-    if isinstance(metadata.get("depth"), int):
-        child._delegate_depth = metadata["depth"]
-    child._delegate_role = str(metadata.get("role") or "leaf")
-    child._subagent_goal = goal
-    session_ref = {"session_id": session_id}
-    child._delegation_session_ref = session_ref
-    child._delegation_runtime_metadata = {
-        **metadata,
-        "child_session_id": session_id,
-        "parent_session_id": owner,
-        "enabled_toolsets": list(getattr(child, "enabled_toolsets", None) or []),
-        "disabled_toolsets": list(getattr(child, "disabled_toolsets", None) or []),
-        "reasoning_config": _json_safe_copy(
-            getattr(child, "reasoning_config", metadata.get("reasoning_config"))
-        ),
-        "fallback_routes": _json_safe_copy(
-            getattr(child, "_fallback_chain", metadata.get("fallback_routes"))
-        ),
-    }
-    if getattr(child, "_session_init_model_config", None) is not None:
-        child._session_init_model_config["_delegate_from"] = owner
+        # Rebuild the callback because the initial builder generated a throwaway
+        # logical/session identity before this exact resumed identity was known.
+        child_progress_cb = _build_child_progress_callback(
+            0,
+            goal,
+            runtime_parent,
+            1,
+            subagent_id=logical_id,
+            parent_id=child._parent_subagent_id,
+            depth=max(0, int(getattr(child, "_delegate_depth", 1)) - 1),
+            model=model,
+            toolsets=list(getattr(child, "enabled_toolsets", None) or []),
+            session_ref=session_ref,
+        )
+        child.tool_progress_callback = child_progress_cb
+        child._delegation_fallback_callback = _build_delegation_fallback_callback(
+            runtime_parent,
+            subagent_id=logical_id,
+            child_session_ref=session_ref,
+        )
+        if child_progress_cb:
+            def _resumed_thinking(text: str) -> None:
+                if text:
+                    child_progress_cb("_thinking", text)
 
-    # Rebuild the callback because the initial builder generated a throwaway
-    # logical/session identity before this exact resumed identity was known.
-    child_progress_cb = _build_child_progress_callback(
-        0,
-        goal,
-        runtime_parent,
-        1,
-        subagent_id=logical_id,
-        parent_id=child._parent_subagent_id,
-        depth=max(0, int(getattr(child, "_delegate_depth", 1)) - 1),
-        model=model,
-        toolsets=list(getattr(child, "enabled_toolsets", None) or []),
-        session_ref=session_ref,
-    )
-    child.tool_progress_callback = child_progress_cb
-    child._delegation_fallback_callback = _build_delegation_fallback_callback(
-        runtime_parent,
-        subagent_id=logical_id,
-        child_session_ref=session_ref,
-    )
-    if child_progress_cb:
-        def _resumed_thinking(text: str) -> None:
-            if text:
-                child_progress_cb("_thinking", text)
-
-        child.thinking_callback = _resumed_thinking
+            child.thinking_callback = _resumed_thinking
+    except Exception:
+        # Building fired subagent_start; the caller never receives this child, so close its lifecycle here or
+        # observers keep a phantom running child.
+        _abort_built_child(child, runtime_parent)
+        raise
     return child
 
 
