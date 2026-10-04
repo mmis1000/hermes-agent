@@ -1008,7 +1008,7 @@ def _begin_tool_execution(agent, ref: _ToolCallRef, display_index: int | None) -
         else:
             print(f"  📞 {prefix}: {function_name}({list(function_args.keys())}) - {_preview(json.dumps(display_args, ensure_ascii=False), agent.log_prefix_chars)}")
 
-    agent._current_tool = function_name
+    _set_current_tool(agent, function_name)
     agent._touch_activity(f"executing tool: {function_name}")
     _set_worker_activity_callback(agent)
 
@@ -1101,7 +1101,7 @@ def _commit_tool_result(
             _log_result = verbose_text(function_result)
             logging.debug("Tool result (%d chars): %s", len(_log_result), _log_result)
 
-    agent._current_tool = None
+    _set_current_tool(agent, None)
     _status_suffix = " (error)" if is_error else ""
     agent._touch_activity(f"tool completed: {function_name} ({tool_duration:.1f}s){_status_suffix}")
 
@@ -1578,7 +1578,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
     # Resolved before the batch is built so the start-order gate can clamp under the deadline.
     timeout_s = _resolve_concurrent_tool_timeout()
     batch = _ConcurrentBatch(agent, messages, effective_task_id, parsed_calls, timeout_s)
-    agent._current_tool = tool_names_str
+    _set_current_tool(agent, tool_names_str)
     agent._touch_activity(f"executing {num_tools} tools concurrently: {tool_names_str}")
 
     spinner = _start_quiet_tool_spinner(agent, "", {}, label=f"⚡ running {num_tools} tools concurrently")
@@ -1593,6 +1593,13 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         return
     if finalize:
         _finalize_tool_batch(agent, messages, effective_task_id, len(parsed_calls), _tool_budget)
+
+
+def _set_current_tool(agent, name: Optional[str]) -> None:
+    """Set the running tool and when it started. Activity is touched all through a long tool (heartbeat), so time since
+    activity never grows inside one; the start time is what tells a long or hung tool apart from a fresh one."""
+    agent._current_tool = name
+    agent._current_tool_started_at = time.time() if name else None
 
 
 # ── Sequential dispatch ─────────────────────────────────────────────────────

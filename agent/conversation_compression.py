@@ -1725,7 +1725,20 @@ def _adopt_live_compression_child(
             agent._memory_manager.on_session_switch(
                 child_session_id, parent_session_id=parent_session_id, reset=False, reason="compression"
             )
+    _invoke_session_switch_hook(parent_session_id, child_session_id)
     return recovered
+
+
+def _invoke_session_switch_hook(old_session_id: Any, new_session_id: Any) -> None:
+    """Tell general plugins the conversation continues under a new id. Core carries its own per-session state
+    (goal, heartbeat, loop) in ``_carry_session_state_to_child``; a plugin keyed by session id has no other
+    signal, so its state would silently die at the boundary. In-place compaction keeps the id and stays quiet."""
+    if not old_session_id or not new_session_id or old_session_id == new_session_id:
+        return
+    with _swallow('on_session_switch hook failed: %s'):
+        from hermes_cli.lifecycle import invoke_hook
+        invoke_hook("on_session_switch", session_id=str(new_session_id),
+                    parent_session_id=str(old_session_id), reason="compression")
 
 
 def _reopen_orphaned_parent(session_db: Any, session_id: str) -> None:
@@ -3495,6 +3508,7 @@ def _finish_compaction_boundary(
             agent._memory_manager.on_session_switch(
                 agent.session_id or "", parent_session_id=_boundary_parent, reset=False, reason="compression"
             )
+    _invoke_session_switch_hook(_old_sid, agent.session_id)
 
     # Route via _emit_status so the warning reaches gateway platforms; store it on
     # _compression_warning so a late-bound status_callback can replay it.

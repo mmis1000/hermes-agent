@@ -104,6 +104,8 @@ Every `ctx.*` API below is available inside a plugin's `register(ctx)` function.
 | Dispatch tools from commands | `ctx.dispatch_tool(name, args)` — invokes a registered tool with parent-agent context auto-wired |
 | Add CLI commands | `ctx.register_cli_command(name, help, setup_fn, handler_fn)` — adds `hermes <plugin> <subcommand>` |
 | Inject messages | `ctx.inject_message(content, role="user", session_key=...)` - see [Injecting Messages](#injecting-messages) |
+| Current session key | `ctx.current_session_key()` - the `session_key` of the conversation a tool or hook is running in (`""` in the classic CLI) |
+| Subagent activity | `ctx.subagent_activity(subagent_ids)` - read-only live activity of background subagents by logical id (`api_calls`, `current_tool`, `seconds_in_tool`, `seconds_since_activity`, `iterations_used`/`iterations_max`, `stall_suspected`; activity is heartbeated inside a tool, so use `seconds_in_tool` for long or hung tools); ids without live telemetry map to `{"known": False}` |
 | Ship data files | `Path(__file__).parent / "data" / "file.yaml"` |
 | Bundle skills | `ctx.register_skill(name, path)` — namespaced as `plugin:skill`, loaded via `skill_view("plugin:skill")` |
 | Gate on env vars | `requires_env: [API_KEY]` in plugin.yaml — prompted during `hermes plugins install` |
@@ -874,12 +876,13 @@ ctx.inject_message(
 )
 ```
 
-**Signature:** `ctx.inject_message(content: str, role: str = "user", *, session_key: str | None = None) -> bool`
+**Signature:** `ctx.inject_message(content: str, role: str = "user", *, session_key: str | None = None, interrupt: bool = True) -> bool`
 
 In CLI mode:
 
 - If the agent is **idle** (waiting for user input), the message is queued as the next input and starts a new turn.
 - If the agent is **mid-turn** (actively running), the message interrupts the current operation — the same as a user typing a new message and pressing Enter.
+- Pass `interrupt=False` to queue a mid-turn message as the next input instead, so a status notice never cancels in-flight work. The TUI and gateway hosts always queue, whatever this flag says.
 - For non-`"user"` roles, the content is prefixed with `[role]` (e.g. `[system] ...`).
 - Returns `True` if the message was queued successfully.
 
@@ -895,7 +898,7 @@ In gateway mode:
 - Returns `True` when the live gateway accepts the request for asynchronous dispatch. This does not confirm that the agent turn or platform delivery has completed.
 - Returns `False` when `session_key` is omitted, the permission is not granted, or no live host can accept the request. Unknown or unroutable session keys discovered after asynchronous acceptance are written to the gateway log.
 
-Ink TUI (`hermes --tui`) and the desktop / dashboard chat are a third host. They do not set the classic CLI reference and they do not register on the messaging-gateway injector — those two hosts stay separate so a live gateway cannot clobber the TUI (or the reverse). Pass the session's durable `session_key` (the `ses_…` id), not the ephemeral UI session id. Hermes queues the text on that session's prompt queue: a busy session keeps the message for the next turn, an idle session starts one. A key that is not a live TUI session is left for the messaging gateway when one is running, and is never rerouted to a different chat.
+Ink TUI (`hermes --tui`) and the desktop / dashboard chat are a third host. They do not set the classic CLI reference and they do not register on the messaging-gateway injector — those two hosts stay separate so a live gateway cannot clobber the TUI (or the reverse). Pass the session's durable `session_key` (the `ses_…` id), not the ephemeral UI session id. A tool or hook running inside the conversation can read it with `ctx.current_session_key()`. Hermes queues the text on that session's prompt queue: a busy session keeps the message for the next turn, an idle session starts one. A key that is not a live TUI session is left for the messaging gateway when one is running, and is never rerouted to a different chat.
 
 This enables plugins like remote control viewers, messaging bridges, or webhook receivers to feed messages into the conversation from external sources.
 

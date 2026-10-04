@@ -131,6 +131,9 @@ VALID_HOOKS: Set[str] = {
     # error_body may be unredacted.
     "transform_api_error_classification", "on_session_start", "on_session_end",
     "on_session_finalize", "on_session_reset",
+    # on_session_switch: the SAME conversation continues under a new session id (compression rotation).
+    # Kwargs: session_id (new), parent_session_id (old), reason ("compression"). Return values are ignored.
+    "on_session_switch",
     # on_skill_lifecycle: successful skill lifecycle facts (local skill name visible to plugins).
     "on_skill_lifecycle", "subagent_start", "subagent_stop",
     # pre_gateway_dispatch: once per incoming MessageEvent, after the internal-event guard, BEFORE
@@ -603,6 +606,7 @@ class PluginContext:
     # manager's home, never the active profile's (#65593 constraint).
     def inject_message(
         self, content: str, role: str = "user", *, session_key: str | None = None,
+        interrupt: bool = True,
     ) -> bool:
         """Inject a message into a CLI, Ink TUI/desktop, or messaging-gateway conversation.
 
@@ -611,11 +615,14 @@ class PluginContext:
         (the durable key, not the ephemeral UI session id). Non-CLI injection needs that
         ``session_key`` plus ``plugins.entries.<plugin_id>.allow_gateway_injection``.
         ``True`` means a host accepted the request, not that the turn completed.
+        ``interrupt=False`` makes a mid-turn CLI injection wait for the next turn, as the
+        TUI and gateway hosts always do, so a status notice never cancels in-flight work.
         """
         cli = self._manager._cli_ref
         msg = content if role == "user" else f"[{role}] {content}"
         if cli is not None:
-            queue_ = cli._interrupt_queue if getattr(cli, "_agent_running", False) else cli._pending_input
+            busy = interrupt and getattr(cli, "_agent_running", False)
+            queue_ = cli._interrupt_queue if busy else cli._pending_input
             queue_.put(msg)
             return True
         if not session_key:
@@ -651,6 +658,19 @@ class PluginContext:
             logger.warning("inject_message: gateway scheduling failed for plugin %s", self.plugin_id,
                            exc_info=True)
             return False
+
+    def current_session_key(self) -> str:
+        """Durable routing key of the conversation the calling tool/hook runs in — the ``session_key``
+        ``inject_message`` needs to reach it again later. ``""`` outside a gateway/TUI turn (classic CLI)."""
+        from gateway.session_context import get_session_env
+        return get_session_env("HERMES_SESSION_KEY", "")
+
+    def subagent_activity(self, subagent_ids) -> dict:
+        """Read-only live activity of background subagents by logical id (the ``child_subagent_id`` of
+        ``subagent_start``): api_calls, current_tool, seconds_in_tool, seconds_since_activity,
+        iterations_used/max, stall_suspected. An id without live telemetry maps to ``{"known": False}`` — unknown, not healthy."""
+        from tools.async_delegation import subagent_activity
+        return subagent_activity(subagent_ids)
 
     def _gateway_injection_allowed(self) -> bool:
         """Return whether this plugin may trigger gateway session turns."""
