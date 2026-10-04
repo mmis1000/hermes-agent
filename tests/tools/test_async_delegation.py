@@ -1478,3 +1478,27 @@ def test_prune_never_evicts_live_records():
 
     assert {"live-stalling", "live-finalizing", "live-running"} <= survivors
     assert "done-0" not in survivors and len(survivors - {"live-stalling", "live-finalizing", "live-running"}) == ad._MAX_RETAINED_COMPLETED
+
+
+def test_stalled_notice_names_exact_resume_call_for_each_unfinished_child(monkeypatch):
+    """A stalled unit's notice must offer ``resume`` for exactly the children it left unfinished, by their real
+    logical ids — "run it again" alone nudges a fresh re-dispatch that throws the child's transcript away. A
+    dispatch without real logical ids (cron's single unit) must not get a placeholder call it cannot execute."""
+    _fast_stale_monitor(monkeypatch)
+    gate = threading.Event()
+    frozen = {"runner": lambda: {} if gate.wait(timeout=10) else {}, "progress_fn": lambda: ((0, None), False),
+              "context": None, "toolsets": None, "role": "leaf", "model": "m", "session_key": "",
+              "max_async_children": 2}
+    batch = ad.dispatch_async_delegation_batch(goals=["crawl", "index"], root_subagent_ids=["sa-crawl", "sa-index"],
+                                               **frozen)
+    single = ad.dispatch_async_delegation(goal="cron job", **frozen)
+    try:
+        batch_evt, single_evt = _drain_for(batch["delegation_id"]), _drain_for(single["delegation_id"])
+        assert batch_evt["status"] == single_evt["status"] == "stalled"
+        text = format_process_notification(batch_evt)
+        for sid in ("sa-crawl", "sa-index"):
+            assert (f'delegate_task(action="resume", delegation_id="{batch["delegation_id"]}", '
+                    f'subagent_id="{sid}"') in text
+        assert 'action="resume"' not in format_process_notification(single_evt)
+    finally:
+        gate.set()
