@@ -100,3 +100,5 @@ class TurnContext:
     native_tool_start_callback: Optional[Callable] = None
     native_tool_complete_callback: Optional[Callable] = None
     task_intent_metadata: Optional[Dict[str, Any]] = None
+    # Explicit restart continuation this turn is designated to carry out (gateway/restart_continuation.py).
+    restart_continuation: Optional[Dict[str, Any]] = None

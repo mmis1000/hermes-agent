@@ -1017,7 +1017,9 @@ class GatewayBusySessionMixin:
 
     async def _busy_stop_command(self, event: MessageEvent, quick_key: str, source):
         # Hard-kill: a soft interrupt can't reach a truly hung executor thread.
+        from gateway import restart_continuation
         from gateway.run import _INTERRUPT_REASON_STOP
+        await restart_continuation.cancel(self, quick_key, "stop_command")
         await self._interrupt_and_clear_session(
             quick_key, source, interrupt_reason=_INTERRUPT_REASON_STOP, invalidation_reason="stop_command",
         )
