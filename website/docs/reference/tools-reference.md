@@ -8,7 +8,7 @@ description: "Authoritative reference for Hermes built-in tools, grouped by tool
 
 This page documents Hermes' built-in tools, grouped by toolset. Availability varies by platform, credentials, and enabled toolsets.
 
-**Quick counts (current registry):** ~100 tools — 10 browser tools (core) + 2 CDP-gated browser tools + 5 browser-vault tools + `browser_exec`, 4 file tools, 4 Home Assistant tools, 2 terminal tools (`terminal`, `process_manage`), 11 desktop-GUI tools (`read_terminal`, `close_terminal`, `desktop_preview`, `drive_preview`, `annotate_preview`, `read_window_below`, `focus_pane`, `react_to_message`, `gui_tour`, `show_tip`, `apply_layout` — desktop-app sessions only), 2 web tools, 5 Feishu tools, 7 Spotify tools (registered by the bundled `spotify` plugin), 5 Yuanbao tools, 14 kanban tools (registered when the kanban dispatcher spawns the agent), 1 project tool (`desktop_project`; desktop/GUI sessions), 2 Discord tools, 3 video tools (`video_generate`, `xai_video_edit`, `xai_video_extend`), and a handful of standalone tools (`memory`, `clarify`, `delegate_task`, `execute_code`, `cronjob_manage`, `session_search`, `skill_view`/`skill_manage`/`skills_list`, `text_to_speech`, `image_generate`, `vision_analyze`, `video_analyze`, `todo_list`, `computer_use`, `x_search`).
+**Quick counts (current registry):** ~100 tools — 10 browser tools (core) + 2 CDP-gated browser tools + 5 browser-vault tools + `browser_exec`, 4 file tools, 4 Home Assistant tools, 2 terminal tools (`terminal`, `process_manage`), 11 desktop-GUI tools (`read_terminal`, `close_terminal`, `desktop_preview`, `drive_preview`, `annotate_preview`, `read_window_below`, `focus_pane`, `react_to_message`, `gui_tour`, `show_tip`, `apply_layout` — desktop-app sessions only), 2 web tools, 5 Feishu tools, 7 Spotify tools (registered by the bundled `spotify` plugin), 5 Yuanbao tools, 14 kanban tools (registered when the kanban dispatcher spawns the agent), 1 project tool (`desktop_project`; desktop/GUI sessions), 1 gateway tool (`restart_continuation`; messaging-gateway sessions), 2 Discord tools, 3 video tools (`video_generate`, `xai_video_edit`, `xai_video_extend`), and a handful of standalone tools (`memory`, `clarify`, `delegate_task`, `execute_code`, `cronjob_manage`, `session_search`, `skill_view`/`skill_manage`/`skills_list`, `text_to_speech`, `image_generate`, `vision_analyze`, `video_analyze`, `todo_list`, `computer_use`, `x_search`).
 
 :::tip MCP Tools
 In addition to built-in tools, Hermes can load tools dynamically from MCP servers. MCP tools appear with the prefix `mcp__<server>__` (e.g., `mcp__github__create_issue` for the `github` MCP server). See [MCP Integration](../user-guide/features/mcp.md) for configuration.
@@ -302,6 +302,14 @@ the model's schema, so the agent is never told about a surface it isn't allowed
 to use. Like every schema change, that lands on the next session — a running
 conversation keeps the toolset it started with, and the app declines the call in
 the meantime.
+
+## `gateway_restart` toolset
+
+Messaging-gateway conversations only (every messaging-platform bundle carries it; CLI, cron, API-server and webhook sessions never do).
+
+| Tool | Description | Requires environment |
+|------|-------------|----------------------|
+| `restart_continuation` | Make the conversation continue automatically after the next gateway restart. `arm` arms a one-shot marker; `arm_and_restart` arms it and requests a graceful restart that starts after the current turn (same permission as `/restart`); `status` / `cancel` inspect or withdraw it. After the restart a continuation turn runs with the recorded task contract (the user's own wording, with any supplements) and the arming turn's request quoted — long texts are shown as labelled excerpts pointing at their transcript row, never as verbatim — plus continue-work guidance (outcomes of earlier actions are treated as unknown and verified, never blindly replayed). At most one continuation turn runs per gateway process; the marker is consumed when such a turn completes successfully and kept for the next restart if it is interrupted or fails (so a continuation can run more than once — at-least-once, never exactly-once), expires with `agent.gateway_auto_continue_freshness`, and is withdrawn by `/stop`, `/new` or `/reset`. A marker never fires in the process that armed it. | — |
 
 ## `todo` toolset
 

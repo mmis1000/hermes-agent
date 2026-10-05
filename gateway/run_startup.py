@@ -60,11 +60,15 @@ class GatewayStartupMixin:
 
     async def _run_startup_resume_event(
         self, adapter: BasePlatformAdapter, event: MessageEvent, session_key: str,
+        *, after: Optional[asyncio.Future] = None,
     ) -> None:
         """Dispatch one synthetic startup resume and wait for its agent turn (inbound stays queued
-        until it finishes, else a user message can race it)."""
+        until it finishes, else a user message can race it). ``after``: boot sends to let finish first."""
         from gateway.run import _AGENT_PENDING_SENTINEL
         try:
+            if after is not None:
+                with suppress(Exception):  # the boot-send task reports its own failures
+                    await asyncio.shield(after)
             await adapter.handle_message(event)
             session_tasks = getattr(adapter, "_session_tasks", {})
             task = session_tasks.get(session_key) if isinstance(session_tasks, dict) else None
@@ -278,6 +282,8 @@ class GatewayStartupMixin:
             await self._redeliver_claimed_obligations(claimed)
 
         boot_task = asyncio.create_task(_boot_sends())
+        # Explicit restart continuations of these sessions start after this redelivery attempt.
+        self._startup_redelivery = (boot_task, frozenset(row.get("session_key") for row in claimed))
         timeout = _startup_restore_drain_timeout_secs()
         if timeout <= 0:
             await boot_task  # unbounded: a failing send surfaces here (unlike the gate path)
@@ -531,15 +537,18 @@ class GatewayStartupMixin:
     def _resume_pending_candidates(self, platform=None) -> Optional[list]:
         """Snapshot resume-pending entries (optionally scoped to ``platform``); None when
         enumeration failed or the restart-loop breaker tripped for this boot."""
+        from gateway import restart_continuation
         try:
             with self.session_store._lock:  # noqa: SLF001 — snapshot under lock
                 self.session_store._ensure_loaded_locked()  # noqa: SLF001
                 candidates = [
                     entry for entry in self.session_store._entries.values()  # noqa: SLF001
-                    if entry.resume_pending
+                    if (
+                        (entry.resume_pending and entry.resume_reason in self._AUTO_RESUME_REASONS)
+                        or restart_continuation.has_pending_continuation(self, entry)
+                    )
                     and not entry.suspended
                     and entry.origin is not None
-                    and entry.resume_reason in self._AUTO_RESUME_REASONS
                     and (platform is None or entry.origin.platform == platform)
                 ]
         except Exception as exc:
@@ -576,7 +585,10 @@ class GatewayStartupMixin:
         """Auto-continue fresh restart-interrupted sessions: synthesize an empty-text turn (the
         ``_is_resume_pending`` injection path owns the wording). Sessions whose adapter is offline stay
         ``resume_pending`` for the reconnect watcher, which re-calls this scoped to that ``platform``;
-        sessions with a running agent are skipped so none is resumed twice."""
+        sessions with a running agent are skipped so none is resumed twice. A session armed with an
+        explicit restart continuation gets one turn here too, carrying that marker (its wording
+        replaces the legacy note; both markers on one session still yield a single turn)."""
+        from gateway import restart_continuation
         from gateway.run import (
             _AGENT_PENDING_SENTINEL, _auto_continue_freshness_window, _is_fresh_gateway_interruption,
         )
@@ -584,12 +596,18 @@ class GatewayStartupMixin:
         candidates = self._resume_pending_candidates(platform)
         if candidates is None:
             return 0
+        redelivery_task, redelivery_keys = getattr(self, "_startup_redelivery", None) or (None, frozenset())
         scheduled = 0
         for entry in candidates:
+            continuation = restart_continuation.dispatchable_marker(self, entry, clear_stale=True)
             # Epoch math: the marker was stamped naive-local by the previous process, possibly
             # on the other side of a DST change; wall-clock subtraction is off by the shift.
             marker = entry.last_resume_marked_at or entry.updated_at
-            if not _is_fresh_gateway_interruption(marker, window_secs=window):
+            legacy_due = (
+                entry.resume_pending and entry.resume_reason in self._AUTO_RESUME_REASONS
+                and _is_fresh_gateway_interruption(marker, window_secs=window)
+            )
+            if continuation is None and not legacy_due:
                 continue
             # Already being resumed (e.g. scheduled at startup, still in-flight) — no second turn.
             if self._is_session_running(entry.session_key):
@@ -612,8 +630,17 @@ class GatewayStartupMixin:
             self._persist_active_agents()
             # Empty-text internal event: the _is_resume_pending branch prepends the reason-aware note.
             event = MessageEvent(text="", message_type=MessageType.TEXT, source=source, internal=True)
+            after = None
+            if continuation is not None:
+                restart_continuation.record_designated(self, continuation)
+                restart_continuation.attach_to_event(event, continuation)
+                # The previous process's final answer for this session is being redelivered: start
+                # the continuation after that attempt (a failed attempt is retried by the ledger
+                # later, so this orders attempts, not deliveries).
+                if entry.session_key in redelivery_keys and redelivery_task is not None and not redelivery_task.done():
+                    after = redelivery_task
             task = self._retain_background_task(
-                asyncio.create_task(self._run_startup_resume_event(adapter, event, entry.session_key))
+                asyncio.create_task(self._run_startup_resume_event(adapter, event, entry.session_key, after=after))
             )
             if getattr(self, "_startup_restore_in_progress", False):
                 tasks = getattr(self, "_startup_restore_tasks", None)
