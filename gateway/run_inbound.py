@@ -741,6 +741,9 @@ class GatewayInboundMixin:
         running_agent = _ra_state.turn.agent if _ra_state else None
         if running_agent is _AGENT_PENDING_SENTINEL:  # agent still being set up
             if event.get_command() == "stop":  # force-clean the sentinel so the session is unlocked
+                from gateway import restart_continuation
+                # The pending slot may be a startup continuation dispatch: /stop withdraws it too.
+                await restart_continuation.cancel(self, _quick_key, "stop_command_pending")
                 self._release_running_agent_state(_quick_key)
                 logger.info("HARD STOP (pending) for session %s — sentinel cleared", _quick_key)
                 return EphemeralReply(t("gateway.stop.force_stopped_pending"))

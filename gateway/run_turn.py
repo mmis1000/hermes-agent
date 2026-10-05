@@ -2155,6 +2155,13 @@ class GatewayTurnMixin:
         if resolved is None:
             return
         source, session_entry, session_key = resolved
+        from gateway import restart_continuation
+        _continuation, _run_this_turn = restart_continuation.designate_turn(self, event, session_entry)
+        if not _run_this_turn:
+            return None
+        if _continuation is not None:
+            _continuation = await asyncio.to_thread(
+                restart_continuation.hydrate_task, self, session_entry, _continuation)
         prepared, _session_env_tokens = await self._hmwa_prepare_turn(
             event, source, session_entry, session_key, _quick_key, run_generation,
         )
@@ -2210,6 +2217,7 @@ class GatewayTurnMixin:
                 task_intent_metadata=(getattr(event, "metadata", None) or {}).get("task_intent_message_metadata"),
                 message_type=event.message_type,
                 scheduled_heartbeat=bool(getattr(event, "_heartbeat_session_id", None)),
+                restart_continuation=_continuation,
             )
             _turn_seconds = time.monotonic() - _turn_started_monotonic
 
@@ -2260,6 +2268,9 @@ class GatewayTurnMixin:
                 hidden_reasoning_incomplete=hidden_reasoning_incomplete,
                 is_context_overflow_failure=is_context_overflow_failure,
             )
+            # Only the designated continuation turn acknowledges its marker, and only once its
+            # transcript is persisted; the final send is the delivery ledger's job.
+            await restart_continuation.acknowledge(self, session_key, _continuation, agent_result)
             return await self._hmwa_deliver_turn_response(
                 event, source, session_entry, session_key, run_generation,
                 agent_result, agent_messages, response, _footer_line, _intentional_silence,
@@ -4239,6 +4250,7 @@ class GatewayTurnMixin:
         title_user_message: Optional[str] = None,
         task_intent_metadata: Optional[Dict[str, Any]] = None,
         persist_user_metadata: Optional[Dict[str, Any]] = None,
+        restart_continuation: Optional[Dict[str, Any]] = None,
         _continuation_depth: int = 0,
         _raw_task_goal: Optional[str] = None,
         _notify_started_at: Optional[float] = None,
@@ -4286,6 +4298,7 @@ class GatewayTurnMixin:
         )
         turn_ctx.task_intent_metadata = task_intent_metadata
         turn_ctx.persist_user_metadata = persist_user_metadata
+        turn_ctx.restart_continuation = restart_continuation
         raw_task_goal = _raw_task_goal if isinstance(_raw_task_goal, str) else str(message or "")
         _status_thread_metadata = self._run_agent_bind_turn_wiring(
             turn_ctx, turn_runner, source, event_message_id, disp._native_slack_task_cards,
