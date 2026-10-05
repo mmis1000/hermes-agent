@@ -101,6 +101,7 @@ behavior on the next access.
 | `resume_pending` | `bool` | `False` | Soft recovery marker. Set by `recover_interrupted_turns()` (crash recovery of a marked, unreplied turn) or drain timeout. On next access, preserves the existing `session_id` — the user continues on the same transcript. Cleared after the next successful turn completes. |
 | `resume_reason` | `Optional[str]` | `None` | Why resume was marked: `"restart_timeout"`, `"shutdown_timeout"`, `"restart_interrupted"`. |
 | `last_resume_marked_at` | `Optional[datetime]` | `None` | Timestamp of the last resume-pending marking. |
+| `restart_continuation` | `Optional[dict]` | `None` | Explicit one-shot continuation armed by the `restart_continuation` tool (see [Explicit restart continuation](#explicit-restart-continuation)). Independent of `resume_pending`: drain, redelivery and post-turn clears never touch it. |
 
 ### State Transition Logic (get_or_create_session)
 
@@ -174,6 +175,8 @@ SessionStore(sessions_dir: Path, config: GatewayConfig, has_active_processes_fn=
 | `suspend_session(session_key)` | Mark session as `suspended=True` (from `/stop`). Forces auto-reset on next access. |
 | `mark_resume_pending(session_key, reason)` | Mark session as `resume_pending=True` (from drain timeout). Preserves session_id on next access. Will NOT override `suspended=True`. |
 | `clear_resume_pending(session_key)` | Clear `resume_pending` after a successful resumed turn. Called from gateway after `run_conversation()` returns. |
+| `arm_restart_continuation(session_key, marker)` | Persist-then-publish the explicit restart continuation marker; a failed save raises and leaves the entry unchanged. |
+| `clear_restart_continuation(session_key, marker_id=None)` | Clear the marker; with `marker_id` only while that exact marker is armed (stale acknowledgements cannot erase a replacement). |
 | `recover_interrupted_turns(max_age_seconds)` | Crash recovery: promote durable active-turn markers the dead process left behind to `resume_pending=True` (`restart_interrupted`). Sessions without a marker finished their turn and are left alone. Called on startup after unclean shutdown. |
 | `prune_old_entries(max_age_days)` | Drop entries older than `max_age_days` (based on `updated_at`). Skips `suspended` entries and sessions with active processes. |
 | `list_sessions(active_minutes=None)` | Return all sessions, optionally filtered by recent activity. Sorted by `updated_at` descending. |
@@ -397,6 +400,47 @@ session that was mid-turn when the drain timeout fired. Reasons:
 - `"restart_interrupted"` — crash recovery of a marked, unreplied turn (from `recover_interrupted_turns`)
 
 All three reasons are in `_AUTO_RESUME_REASONS` and eligible for startup auto-resume.
+
+### Explicit restart continuation
+
+A clean, intentional restart drains the requesting turn to completion, so `resume_pending` is
+never set for it and the conversation would simply stop. When work must resume afterwards, the
+agent arms `SessionEntry.restart_continuation` with the `restart_continuation` tool
+(`gateway/restart_continuation.py`, toolset `gateway_restart` in every messaging bundle):
+
+- **Arming.** Bound to the agent the runner is running for that session right now (the inline
+  executor passes the live agent; a delegated child, cached agent, env var or caller-chosen key
+  cannot arm another conversation). The marker — UUID, boot id of the arming process, session
+  id, a snapshot of the session's active task-intent contract (`hermes_cli/task_intents.py`:
+  the user's own primary wording plus supplements, so a later "continue" never replaces it),
+  the arming turn's raw request anchored to its persisted transcript row (resolved through the
+  turn's `gateway_input_owner`), optional note — is persisted *before* it is published in
+  memory. Both are inherited when a continuation turn re-arms. Texts over 6000 characters are
+  stored as an exact prefix + suffix flagged `truncated` and are presented as excerpts with
+  their transcript row, never as verbatim; at continuation time the live task-intent contract
+  replaces the snapshot when it is still the same task.
+  `arm_and_restart` requests the restart (via `request_supervised_restart`, the `/restart`
+  transport, same `/restart` slash-access check) only after that save succeeded.
+- **Never early.** A marker whose boot id is the current process's is ignored, so adapter
+  reconnect passes cannot replay it before a restart. It expires with the auto-continue
+  freshness window and is dropped when the session lineage changed.
+- **One designated turn per process.** At startup (and on adapter reconnect) a session with a
+  pending marker gets one synthetic turn carrying it, deduplicated with any legacy
+  `resume_pending` dispatch for the same session; if the previous process's final answer is
+  being redelivered from the ledger, the continuation waits until that boot redelivery attempt
+  has finished (ordering of attempts only: a failed attempt goes back to the ledger's retry
+  path, so the answer can still arrive after the continuation). If a real user
+  message reaches the session first, that turn is designated instead and the user's words lead
+  it. The turn gets continue-work wording on every platform: the original request is quoted,
+  earlier actions' outcomes are treated as unknown and verified rather than replayed.
+- **Acknowledgement.** Only the designated turn clears the marker, by UUID compare-and-set, after
+  it completed successfully and its transcript was persisted. An interrupted or failed
+  continuation keeps the marker for the next process; a replacement armed meanwhile survives the
+  stale acknowledgement. `/stop` (idle, busy and pending-slot paths) clears it; `/new` and
+  `/reset` replace the entry and drop it.
+- **Guarantees.** At-least-once continuation, bounded by the freshness window and the existing
+  restart-loop breaker and stuck-loop suspension. Nothing makes the task's work or external
+  side effects exactly-once.
 
 ### Auto-Resume on Next Access
 

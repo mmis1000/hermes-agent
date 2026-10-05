@@ -277,6 +277,11 @@ _RAW_INLINE_TOOL_EXECUTORS: Dict[str, InlineToolExecutor] = {
     "manage_catalog": _manage_catalog,
     "setup_mcp": _setup_mcp_shim,
     "delegate_task": lambda agent, args, ctx: agent._dispatch_delegate_task(args),
+    # The gateway binds the marker to this exact agent, so it must not go through the registry.
+    "restart_continuation": _tool(
+        "tools.restart_continuation_tool", "restart_continuation_tool", ("action", "action", ""), ("note", "note"),
+        agent=lambda agent, ctx: agent,
+    ),
 }
 
 

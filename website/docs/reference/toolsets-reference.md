@@ -65,6 +65,7 @@ Or in-session:
 | `feishu_doc` | `feishu_doc_read` | Read Feishu/Lark document content. Used by the Feishu document-comment intelligent-reply handler. |
 | `feishu_drive` | `feishu_drive_add_comment`, `feishu_drive_list_comments`, `feishu_drive_list_comment_replies`, `feishu_drive_reply_comment` | Feishu/Lark drive comment operations. Scoped to the comment agent; not exposed on `hermes-cli` or other messaging toolsets. |
 | `file` | `patch`, `read_file`, `search_files`, `write_file` | File reading, writing, searching, and editing. |
+| `gateway_restart` | `restart_continuation` | Arm an explicit one-shot continuation of a messaging-gateway conversation across the next gateway restart, optionally requesting the restart (same permission as `/restart`). Part of every messaging-platform bundle; never on CLI, cron, API-server or webhook sessions, and only reachable inside a running gateway. Not configurable. |
 | `homeassistant` | `ha_call_service`, `ha_get_state`, `ha_list_entities`, `ha_list_services` | Smart home control via Home Assistant. Only available when `HASS_TOKEN` is set. |
 | `computer_use` | `computer_use` | Background desktop control via cua-driver — does not steal cursor/focus. Works with any tool-capable model. macOS, Windows, and Linux; requires `cua-driver` on `$PATH`. |
 | `context_engine` | (varies) | Runtime tools exposed by the active context-engine plugin (empty until a plugin populates it). |
@@ -91,7 +92,7 @@ Or in-session:
 
 ## Platform Toolsets
 
-Platform toolsets define the complete tool configuration for a deployment target. Most messaging platforms use the same set as `hermes-cli`:
+Platform toolsets define the complete tool configuration for a deployment target. Most messaging platforms use the same set as `hermes-cli`, plus the `gateway_restart` toolset (`restart_continuation`) that every messaging-platform bundle carries:
 
 | Toolset | Differences from `hermes-cli` |
 |---------|-------------------------------|

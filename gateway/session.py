@@ -18,6 +18,7 @@ from gateway.session_identity import transport_profile_of
 from gateway.session_persistence import SessionPersistenceMixin, _DB_UNPINNED
 from gateway.session_prompt_pin import SessionPromptPinMixin, sanitize_prompt_pin
 from gateway.session_recovery import SessionRecoveryMixin
+from gateway.restart_continuation import sanitize_restart_continuation
 from gateway.session_lifecycle import SessionLifecycleMixin, _iso, _new_session_id, _now, _parse_iso
 from gateway.session_transcript import SessionTranscriptMixin
 
@@ -537,6 +538,9 @@ class SessionEntry:
     # Exact session-context/channel inputs from the last human turn. Append-only dataclass field so
     # older positional construction of transport_profile keeps its meaning.
     prompt_pin: Optional[Dict[str, Any]] = None
+    # Explicit one-shot continuation across the next gateway restart (gateway/restart_continuation.py).
+    # Deliberately separate from ``resume_pending``: drain, redelivery and post-turn clears never touch it.
+    restart_continuation: Optional[Dict[str, Any]] = None
 
     # Fields (de)serialized verbatim, in wire order (``from_dict`` reads them with
     # ``data.get(name, <dataclass default>)``), split around the three ISO-datetime/token keys.
@@ -572,6 +576,9 @@ class SessionEntry:
                 result["prompt_pin"] = pin
         if self.transport_profile:
             result["transport_profile"] = self.transport_profile
+        if self.restart_continuation:
+            if marker := sanitize_restart_continuation(self.restart_continuation):
+                result["restart_continuation"] = marker
         if self.origin:
             result["origin"] = self.origin.to_dict()
         return result
@@ -613,6 +620,7 @@ class SessionEntry:
             active_turn_token=token, active_turn_started_at=started_at,
             model_override=sanitize_model_override(data.get("model_override")),
             prompt_pin=sanitize_prompt_pin(data.get("prompt_pin")),
+            restart_continuation=sanitize_restart_continuation(data.get("restart_continuation")),
             transport_profile=transport_profile if isinstance(transport_profile, str) and transport_profile else None,
             **plain,
         )

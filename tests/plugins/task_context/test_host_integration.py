@@ -100,6 +100,72 @@ def test_bundled_plugin_requires_enablement_and_selection(tmp_path, enabled, sel
         agent._session_db.close()
 
 
+def test_restart_and_status_guard_read_imported_identity(installation, tmp_path):
+    _, cfg = installation
+    from hermes_state import SessionDB
+    from task_context.policy import TaskIntentState, TaskContract
+    from hermes_cli.task_contracts import load_task_contract
+    from hermes_cli.pre_send_status_guard import active_task_payload_from_task_intent
+    from gateway.restart_continuation import _task_contract, hydrate_task
+    state = TaskIntentState(id="legacy-id", created_at=1, updated_at=1, status="active", task_contract=TaskContract(raw_primary_text="raw primary", raw_supplements=["keep β"]))
+    with SessionDB(db_path=tmp_path / "state.db") as db:
+        db.set_meta("task_intent:s", state.to_json())
+        contract = load_task_contract("s", db=db)
+        assert contract.id == "legacy-id"
+        payload = active_task_payload_from_task_intent(contract)
+        assert payload["raw_primary_text"] == "raw primary"
+        snapshot = _task_contract(db, "s")
+        assert snapshot["intent_id"] == "legacy-id"
+        runner = SimpleNamespace(session_store=SimpleNamespace(_db_for_key=lambda k: db))
+        hydrated = hydrate_task(runner, SimpleNamespace(session_id="s", session_key="key"), {"task": snapshot})
+        assert hydrated["task"]["supplements"][0]["text"] == "keep β"
+
+
+def _module(path, name):
+    spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+@pytest.mark.asyncio
+async def test_real_gateway_channel_routes_into_plugin_without_live_transport(installation, tmp_path, monkeypatch):
+    host, cfg = installation
+    monkeypatch.setenv("TELEGRAM_ALLOWED_USERS", "u1")
+    harness = _module(host / "tests/gateway/restart_continuation_harness.py", "task_context_gateway_harness")
+    from hermes_cli import task_contracts
+    real_reader = task_contracts.load_task_contract
+    import sys, run_agent
+    monkeypatch.setitem(sys.modules, "run_agent", run_agent)
+    harness.install_fakes(monkeypatch.setattr)
+    monkeypatch.setattr(task_contracts, "load_task_contract", real_reader)
+    base = harness.ScriptedAgent
+    class EngineAgent(base):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            built = build(cfg, tmp_path, sid=self.session_id)
+            self.context_compressor = built.context_compressor
+            self.platform = "telegram"
+        def _persist_user_row(self, message, kwargs):
+            from agent.input_provenance import notify_input
+            row = {"role": "user", "content": message, "display_metadata": kwargs.get("persist_user_display_metadata") or {}}
+            notify_input(self, row)
+            super()._persist_user_row(message, kwargs)
+    import sys
+    monkeypatch.setattr(sys.modules["run_agent"], "AIAgent", EngineAgent)
+    runner, adapter, restarts = harness.boot(monkeypatch.setattr)
+    harness.ScriptedAgent.script = [{"final": "Recorded."}]
+    source = harness.dm_source("group-channel")
+    source.chat_type = "group"
+    source.thread_id = "thread"
+    raw = "  Implement A + B\n後續不能只做 B  "
+    await harness.deliver(runner, adapter, raw, "platform-input-1", source)
+    snap = harness.session_snapshot(runner, source)
+    contract = Store(tmp_path, read_only=True).contract(snap["session_id"])
+    assert contract["raw_primary_text"] == raw
+    assert adapter.sent and not restarts
+
+
 @pytest.mark.parametrize("drain", ["pre_api", "post_tool"])
 def test_gateway_busy_steer_reaches_canonical_store(installation, tmp_path, drain):
     from agent.input_provenance import notify_input, event_display_metadata

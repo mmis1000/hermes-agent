@@ -1667,6 +1667,14 @@ class GatewayShutdownMixin:
         logger.info("Restart deferred wait complete — active work drained; proceeding to stop()")
         return True
 
+    def request_supervised_restart(self) -> bool:
+        """``request_restart`` with the transport /restart uses for this process: exit 75 under a service
+        manager (systemd/launchd) or Docker/Podman — detached setsid+bash fails there (systemd
+        KillMode=mixed kills the cgroup; tini exits with the gateway) — else a detached helper."""
+        from gateway.restart import is_container_restart_context, is_gateway_supervisor_process
+        via_service = is_gateway_supervisor_process() or is_container_restart_context()
+        return self.request_restart(detached=not via_service, via_service=via_service)
+
     def request_restart(self, *, detached: bool = False, via_service: bool = False) -> bool:
         if self._restart_task_started:
             return False

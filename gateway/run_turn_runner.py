@@ -1645,7 +1645,16 @@ class TurnRunner:
         mark_is_fresh = resume_pending and _is_fresh_gateway_interruption(
             getattr(entry, "last_resume_marked_at", None), window_secs=window,
         )
-        if resume_pending and (interruption_is_fresh or mark_is_fresh):
+        continuation = getattr(ctx, "restart_continuation", None)
+        if continuation:
+            # Explicit continuation: continue-work wording on every platform; it subsumes the
+            # legacy interrupted-turn notes, and real user text stays the persisted row.
+            from gateway.restart_continuation import build_continuation_message
+            has_user_text = isinstance(ctx.message, str) and bool(ctx.message.strip())
+            ctx.message = build_continuation_message(continuation, ctx.message)
+            if not has_user_text:
+                persist_override = ctx.message
+        elif resume_pending and (interruption_is_fresh or mark_is_fresh):
             # Empty message = the startup auto-resume turn; there is no NEW user message.
             ctx.message, persist_override = _prepare_resume_pending_message(
                 resume_reason, ctx.message, interactive=self._resume_note_interactive(),

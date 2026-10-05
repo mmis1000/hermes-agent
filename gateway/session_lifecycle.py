@@ -225,6 +225,37 @@ class SessionLifecycleMixin:
             entry.last_resume_marked_at = None
         return self._update_entry(session_key, _apply)
 
+    def _set_restart_continuation_locked(self, session_key: str, entry: SessionEntry, marker) -> None:
+        """Persist the continuation marker BEFORE publishing it in memory (a failed write raises
+        and leaves the live entry unchanged). Lock held."""
+        candidate = entry.to_dict()
+        candidate.pop("restart_continuation", None)
+        if marker is not None:
+            candidate["restart_continuation"] = dict(marker)
+        self._save_entry(session_key, entry_data=candidate, lock_held=True)
+        entry.restart_continuation = dict(marker) if marker is not None else None
+
+    def arm_restart_continuation(self, session_key: str, marker: dict) -> bool:
+        """Durably arm (or replace) the session's explicit restart continuation; False when the
+        entry is gone. Persistence failures propagate so callers never act on an unsaved marker."""
+        with self._lock:
+            entry = self._entry_locked(session_key)
+            if entry is None:
+                return False
+            self._set_restart_continuation_locked(session_key, entry, marker)
+        return True
+
+    def clear_restart_continuation(self, session_key: str, marker_id: Optional[str] = None) -> bool:
+        """Clear the continuation marker; with ``marker_id`` only while that exact marker is armed,
+        so a stale acknowledgement cannot erase a replacement. True if cleared."""
+        with self._lock:
+            entry = self._entry_locked(session_key)
+            current = getattr(entry, "restart_continuation", None) if entry is not None else None
+            if not current or (marker_id is not None and current.get("id") != marker_id):
+                return False
+            self._set_restart_continuation_locked(session_key, entry, None)
+        return True
+
     def prune_old_entries(self, max_age_days: int) -> int:
         """Drop routing entries idle (by ``updated_at``) for more than max_age_days; suspended
         entries and entries with active background processes are kept. Only the key -> session_id

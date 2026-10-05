@@ -1974,6 +1974,16 @@ class SessionMessagesMixin:
             "THEN json_extract(display_metadata, '$.gateway_input_owner') END = ? LIMIT 1",
             (session_id, owner)) is not None
 
+    def gateway_input_row(self, session_id: str, owner: str) -> Optional[Dict[str, Any]]:
+        """``{"id", "content"}`` of the user row a gateway turn persisted under input *owner*, or None."""
+        row = self._read_one(
+            "SELECT id, content FROM messages WHERE session_id = ? AND role = 'user' "
+            "AND observed = 0 AND (active = 1 OR compacted = 1) "
+            "AND CASE WHEN json_valid(display_metadata) "
+            "THEN json_extract(display_metadata, '$.gateway_input_owner') END = ? ORDER BY id DESC LIMIT 1",
+            (session_id, owner))
+        return {"id": row[0], "content": self._decode_content(row[1])} if row else None
+
     def has_platform_message_id(self, session_id: str, platform_message_id: str) -> bool:
         """True when *platform_message_id* exists (partial-index probe; the gateway's transient-failure dedupe).
 
