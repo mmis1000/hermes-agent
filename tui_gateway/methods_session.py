@@ -264,6 +264,7 @@ def _persist_branch(db, new_key: str, parent_key: str, title: str, history: list
         # Copy the whole parent history in bounded-chunk transactions — a branch seed can be hundreds of
         # rows, and per-row transactions were the write-amplification pattern removed in #23254.
         rows = [{"role": msg.get("role", "user"), "content": msg.get("content"),
+                 **{field: msg[field] for field in ("display_kind", "display_metadata") if field in msg},
                  **{field: msg.get(field) for field in copy_fields}, **message_identity(msg)} for msg in history]
         db.append_messages_batch(new_key, rows, chunk_rows=500)
         if title_source == "user":

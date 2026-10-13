@@ -3539,6 +3539,11 @@ class GatewayRunner(
         self._signal_interrupt_grace_timeout = self._load_signal_interrupt_grace_timeout()
         self._provider_routing = self._load_provider_routing()
         self._fallback_model = self._load_fallback_model()
+        # Tiny task-relationship judge state. This is deliberately separate
+        # from the AIAgent cache: the judge has no tools, transcript, or persona.
+        self._task_intent_judge_cache = OrderedDict()
+        self._task_intent_judge_signature = ""
+        self._task_intent_judge_cache_lock = threading.Lock()
 
     def _init_session_store(self) -> None:
         """Build the SessionStore (with process-registry reset guard), its async facade and the router."""

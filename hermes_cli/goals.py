@@ -632,17 +632,21 @@ def _warn_dropped_write(manager: str, kind: str, session_id: str) -> None:
     )
 
 
-def load_goal(session_id: str) -> Optional[GoalState]:
+def load_goal(session_id: str, *, db: Any = None, raise_on_error: bool = False) -> Optional[GoalState]:
     """Load the goal for a session, or None if none exists."""
     if not session_id:
         return None
-    db = _get_session_db()
-    if db is None:
+    database = db or _get_session_db()
+    if database is None:
+        if raise_on_error:
+            raise RuntimeError("goal database unavailable")
         return None
     try:
-        raw = db.get_meta(_meta_key(session_id))
+        raw = database.get_meta(_meta_key(session_id))
     except Exception as exc:
         logger.debug("GoalManager: get_meta failed: %s", exc)
+        if raise_on_error:
+            raise
         return None
     if not raw:
         return None
@@ -650,19 +654,21 @@ def load_goal(session_id: str) -> Optional[GoalState]:
         return GoalState.from_json(raw)
     except Exception as exc:
         logger.warning("GoalManager: could not parse stored goal for %s: %s", session_id, exc)
+        if raise_on_error:
+            raise
         return None
 
 
-def save_goal(session_id: str, state: GoalState) -> None:
+def save_goal(session_id: str, state: GoalState, *, db: Any = None) -> None:
     """Persist a goal to SessionDB. No-op if DB unavailable."""
     if not session_id:
         return
-    db = _get_session_db()
-    if db is None:
+    database = db or _get_session_db()
+    if database is None:
         _warn_dropped_write("GoalManager", "goal", session_id)
         return
     try:
-        db.set_meta(_meta_key(session_id), state.to_json())
+        database.set_meta(_meta_key(session_id), state.to_json())
     except Exception as exc:
         logger.debug("GoalManager: set_meta failed: %s", exc)
 
@@ -1093,10 +1099,22 @@ class GoalManager:
     canonical user-role message to feed back into ``run_conversation``.
     """
 
-    def __init__(self, session_id: str, *, default_max_turns: int = DEFAULT_MAX_TURNS):
+    def __init__(
+        self,
+        session_id: str,
+        *,
+        default_max_turns: int = DEFAULT_MAX_TURNS,
+        db: Any = None,
+        strict_load: bool = False,
+    ):
         self.session_id = session_id
         self.default_max_turns = int(default_max_turns or DEFAULT_MAX_TURNS)
-        self._state: Optional[GoalState] = load_goal(session_id)
+        self._db = db
+        self._state: Optional[GoalState] = load_goal(
+            session_id,
+            db=db,
+            raise_on_error=strict_load,
+        )
 
     # --- introspection ------------------------------------------------
 
@@ -1142,7 +1160,7 @@ class GoalManager:
     # --- mutation -----------------------------------------------------
 
     def _save(self) -> Optional[GoalState]:
-        save_goal(self.session_id, self._state)
+        save_goal(self.session_id, self._state, db=self._db)
         return self._state
 
     def _require_goal(self) -> GoalState:

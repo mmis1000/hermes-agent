@@ -140,6 +140,23 @@ class ContextEngine(ABC):
         """
         return None
 
+    def configure_compressor(self, **kwargs: Any) -> None:
+        """Optional exact built-in compressor settings, after initial update_model.
+
+        Subclasses that reuse ContextCompressor may initialize from these kwargs.
+        Other engines own their settings and leave this no-op.
+        """
+
+    def on_input(self, message: Dict[str, Any], *, session_id: str,
+                 hermes_home: str, agent_context: str, platform: str) -> None:
+        """Observe an admitted input before compaction/provider use, including steers.
+
+        A structural copy; return ignored. display_metadata.input_provenance
+        carries ordered original constituents and stable occurrence identities.
+        Replays are possible: consumers must be idempotent. Never infer authority
+        from message text. This runs outside compression's speculative worker.
+        """
+
     def on_turn_complete(self, messages: List[Dict[str, Any]], usage: Dict[str, Any] = None, **kwargs: Any) -> None:
         """Observe a finished turn (complement of ``select_context()``) to index/update
         routing state for the next request.

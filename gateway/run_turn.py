@@ -2192,6 +2192,7 @@ class GatewayTurnMixin:
                 # Persist the coherent context+channel pair before execution: a crash during the
                 # human turn may be followed by an internal startup-resume on the next process.
                 await self._persist_prompt_pins(session_key, _run_start_session_id)
+            from agent.input_provenance import event_display_metadata
             agent_result = await self._run_agent(
                 message=message_text, context_prompt=prepared.context_prompt, history=history, source=_turn_source,
                 session_id=_run_start_session_id, session_key=session_key,
@@ -2205,6 +2206,7 @@ class GatewayTurnMixin:
                 reply_expected=event.reply_expected,
                 persist_user_display_metadata={
                     "gateway_input_owner": prepared.persistence_owner,
+                    **event_display_metadata(event),
                     **reply_expected_metadata(event.reply_expected), **diagnostic_metadata(event)},
                 message_type=event.message_type,
                 scheduled_heartbeat=bool(getattr(event, "_heartbeat_session_id", None)),
@@ -3896,6 +3898,7 @@ class GatewayTurnMixin:
         try:
             await self._refresh_agent_cache_message_count(session_key, session_id)
 
+            from agent.input_provenance import event_display_metadata
             followup_result = await self._run_agent(
                 message=next_message, context_prompt=turn_ctx.context_prompt, history=updated_history,
                 source=next_source, session_id=session_id, session_key=next_session_key,
@@ -3906,6 +3909,8 @@ class GatewayTurnMixin:
                 persist_user_display_kind=next_display_kind,
                 reply_expected=next_reply_expected,
                 persist_user_display_metadata={
+                    **(event_display_metadata(pending_event) if pending_event is not None else
+                       {"input_provenance": pending.input_provenance} if getattr(pending, "input_provenance", None) else {}),
                     **reply_expected_metadata(next_reply_expected), **diagnostic_metadata(pending_event)} or None,
             )
         except asyncio.CancelledError:

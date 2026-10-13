@@ -4308,10 +4308,14 @@ Write only the summary body. Do not include any preamble or prefix."""
     @classmethod
     def _derive_auto_focus_topic(cls, messages: List[Dict[str, Any]]) -> Optional[str]:
         """Infer a compact focus hint from the most recent real user turns."""
+        from agent.conversation_compression import _is_real_user_message
+
         candidates: list[str] = []
         for msg in reversed(messages):
             # display_kind notices are operational traffic, not user intent.
             if msg.get("role") != "user" or cls._is_synthetic_compression_user_turn(msg) or msg.get("display_kind"):
+                continue
+            if not _is_real_user_message(msg):
                 continue
             text = _redact_compaction_text(_content_text_for_contains(msg.get("content")).strip())
             if not text:

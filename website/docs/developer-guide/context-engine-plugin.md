@@ -287,6 +287,21 @@ def register(ctx):
 
 Only one engine can be registered. A second plugin attempting to register is rejected with a warning.
 
+The bundled `task-context` plugin uses this path from `plugins/task-context/`
+because it also registers the generic `read_task_contract` hook used by retained
+guard/restart consumers. Enable both registration and selection:
+
+```yaml
+plugins:
+  enabled: [task-context]  # alongside other enabled plugins
+context:
+  engine: task-context
+```
+
+It is bundled, not automatically enabled. Its implementation and migration logic
+stay plugin-local; host consumers use the generic interfaces. See
+`plugins/task-context/README.md` for behavior and migration constraints.
+
 The registered instance is shared process-wide, but every `AIAgent` (parent, subagents, gateway
 sessions) needs its own engine so a child's `update_model()` cannot mutate the parent's budget.
 Hermes therefore calls `engine.clone_for_agent()` on the registered instance at each agent init.
@@ -345,6 +360,53 @@ def test_compress_returns_valid_messages():
 ```
 
 See `tests/agent/test_context_engine.py` for the full ABC contract test suite.
+
+## Admitted-input observation (fork host extension)
+
+This fork adds optional `on_input(message, *, session_id, hermes_home,
+agent_context, platform)` and `configure_compressor(**kwargs)` methods. Both
+have no-op defaults. `configure_compressor` receives the exact effective
+constructor arguments used by the native compressor after initial
+`update_model`, before session binding and startup. Engines reusing the native
+compressor can initialize it with those arguments; other engines ignore them.
+`on_session_start` also receives `agent_context` when its signature accepts it.
+
+`on_input` observes a structural copy of an admitted user row before preflight
+compression and at in-loop steer/redirect consumption. Native Codex redirects
+are observed after the server acknowledges them; native owns that transcript,
+so the host does not append another row. The observer runs outside the
+speculative compression worker. A failed observer emits a warning and leaves
+the transcript intact. Consumers must bound external work and make transitions
+idempotent; provider retries and transcript replay are not fresh commands.
+
+`display_metadata.input_provenance` holds an ordered list of host-captured
+constituents. Each has `occurrence_id`, exact adapter `text`, `source_kind`
+(`human`, `machine`, `unknown`), `source_id`, `platform`, and `message_id`.
+`platform_text`, when available, is a separate original platform field. Capture
+occurs before gateway enrichment and batching; capture itself performs no
+admission, plugin call, persistence, or classification. Batched and merged rows
+retain constituent identities. During `select_context`, request clones regain
+their exact source metadata through an object-identity handoff; both no-op and
+replacement results remain stripped before provider dispatch (including MoA).
+Keyless inputs receive a random occurrence ID;
+platform deliveries use scoped message identity. Storage is additionally scoped
+by the owning Hermes home and session. Provenance is durable display metadata,
+stripped from provider payloads and excluded from token estimates. Once the row
+is persisted, consumers may link its `message_uid` to these occurrences.
+
+Only host admission may establish source authority. Never reconstruct authority
+from decorated text or imported history, or treat a delegated/auxiliary brief as
+a primary human input. A human `display_kind="steer"` remains human.
+
+The fork's separate execution/delivery guards consume the `read_task_contract`
+general-plugin hook via `hermes_cli.task_contracts.load_task_contract`. Its
+kwargs are `session_id`, `session_db`, `hermes_home`; a reader returns
+`{"status": "ok", "contract": null}` or a contract with string `id`, `status`,
+`raw_primary_text`, and lists `raw_supplements`, `session_lineage`. An inactive
+reader returns `{"status": "disabled"}`; a failed reader returns
+`{"status": "error"}` or raises. No provider means feature-off; registered
+failure is surfaced as degraded protection rather than an empty active task.
+The plugin owns policy and storage; core consumers only read this DTO.
 
 ## Thread safety
 

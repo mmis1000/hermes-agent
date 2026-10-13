@@ -2283,6 +2283,12 @@ def _is_real_user_message(message: Any) -> bool:
     anchor restoration."""
     if not isinstance(message, dict) or message.get("role") != "user":
         return False
+    provenance = (message.get("display_metadata") or {}).get("input_provenance")
+    if provenance and not any(r.get("source_kind") == "human" for r in provenance):
+        return False
+    legacy = message.get("_task_intent")
+    if isinstance(legacy, dict) and (legacy.get("synthetic") is True or legacy.get("source_kind") == "machine_continuation"):
+        return False
     if any(message.get(flag) for flag in _SYNTHETIC_USER_FLAGS):
         return False
     text = _message_text(message).strip()

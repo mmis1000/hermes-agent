@@ -133,12 +133,16 @@ def _steer_envelope(text: str, mailbox_id: Optional[str] = None, outcome_callbac
         "text": text,
         "mailbox_id": mailbox_id if isinstance(mailbox_id, str) else None,
         "outcome_callback": outcome_callback if callable(outcome_callback) else None,
+        "input_provenance": getattr(text, "input_provenance", []),
     }
 
 
 def steer_envelope_text(envelopes: list) -> Optional[str]:
     """Newline-joined text of ``envelopes``; None when there is none."""
-    return "\n".join(str(item.get("text") or "") for item in envelopes if item.get("text")) or None
+    from agent.input_provenance import InputText
+    text = "\n".join(str(item.get("text") or "") for item in envelopes if item.get("text"))
+    records = [r for item in envelopes for r in item.get("input_provenance", [])]
+    return InputText(text, records) if text else None
 
 
 def ack_steer_envelopes(envelopes: list, outcome: str) -> None:
@@ -324,7 +328,13 @@ class InterruptControlMixin:
         reports how its envelope resolved (``injected``, ``superseded_by_interrupt``, ...)."""
         if not isinstance(text, str) or not text.strip():
             return False
-        envelope = _steer_envelope(text.strip(), mailbox_id, outcome_callback)
+        from agent.input_provenance import InputText, input_record, agent_input_context
+        records = getattr(text, "input_provenance", None)
+        if records is None:
+            ctx = agent_input_context(self)
+            human = not mailbox_id and ctx["agent_context"] == "primary" and ctx["platform"] in {"cli", "tui", "desktop", "acp"}
+            records = [input_record(text, platform=ctx["platform"], source_kind="human" if human else "unknown")]
+        envelope = _steer_envelope(InputText(text.strip(), records), mailbox_id, outcome_callback)
         with _ic_lock(self, "_pending_steer_lock"):
             if envelope["mailbox_id"] and getattr(self, "_interrupt_requested", False):
                 ack_steer_envelopes([envelope], "superseded_by_interrupt")
@@ -368,7 +378,13 @@ class InterruptControlMixin:
         to ``steer()``; Codex app-server uses native ``turn/steer``. False when no live turn / empty text."""
         if not text or not text.strip():
             return False
-        cleaned = text.strip()
+        from agent.input_provenance import InputText, input_record, agent_input_context
+        records = getattr(text, "input_provenance", None)
+        if records is None:
+            ctx = agent_input_context(self)
+            human = ctx["agent_context"] == "primary" and ctx["platform"] in {"cli", "tui", "desktop", "acp"}
+            records = [input_record(text, platform=ctx["platform"], source_kind="human" if human else "unknown")]
+        cleaned = InputText(text.strip(), records)
 
         _native_steer = _ic_codex_method(self, "request_steer")
         if _native_steer is not None:
@@ -376,10 +392,17 @@ class InterruptControlMixin:
                 if self._interrupt_requested:
                     return False
             try:
-                return bool(_native_steer(cleaned))
+                accepted = bool(_native_steer(cleaned))
             except Exception:
                 logger.debug("Codex app-server turn/steer failed", exc_info=True)
                 return False
+            if accepted:
+                # Native Codex owns its transcript; observe the acknowledged
+                # input without adding a second user row or altering RPC text.
+                from agent.input_provenance import notify_input
+                notify_input(self, {"role": "user", "content": str(cleaned),
+                                    "display_metadata": {"input_provenance": records}})
+            return accepted
 
         # Never kill a tool to deliver guidance; the steer drain puts it on the final tool result.
         # A foreground terminal command would park that delivery until it exits (a 5-minute
@@ -404,8 +427,9 @@ class InterruptControlMixin:
             existing = _ic_slot(self, "_pending_redirect_lock", "_pending_redirect")
             if self._interrupt_requested and not existing:
                 return False
-            self._pending_redirect = (
-                f"{existing}\n\n[Additional user correction]\n{cleaned}" if existing else cleaned
+            self._pending_redirect = InputText(
+                f"{existing}\n\n[Additional user correction]\n{cleaned}" if existing else cleaned,
+                [*getattr(existing, "input_provenance", []), *records],
             )
             self._interrupt_requested = True
             self._interrupt_message = None

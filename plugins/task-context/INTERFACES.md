@@ -1,0 +1,26 @@
+# Integration contract / checkpoints
+
+Implementation lives in `plugins/task-context/` in the Hermes repository; host
+consumers use generic interfaces rather than importing this implementation.
+
+Required activation configuration (not applied to a live profile):
+
+```yaml
+plugins:
+  enabled: [task-context]  # add alongside other enabled plugins
+context:
+  engine: task-context
+```
+
+Required host additions (not present at the inspected base c5eb526bf471e229cea683c334cdb28bee7adf87):
+- `ContextEngine.configure_compressor(**kwargs)` with EXACT native constructor kwargs, after update_model, before lifecycle. Plugin calls native constructor; never fabricates an AIAgent.
+- Synchronous `on_input(message, *, session_id, hermes_home, agent_context, platform)` before preflight and drained human steers, outside compression worker lease. `display_metadata.input_provenance` is an ordered list of occurrence_id/text/platform_text/source_kind/source_id/platform/message_id records. Only explicit primary + human can mutate.
+- `read_task_contract` general hook, kwargs session_id/session_db/hermes_home, result status ok + contract or error + error; registered-but-unselected callback returns `{'status': 'disabled'}`. Provider absence is host-owned and distinct from provider error. Root registration uses `task_context.migration.contract_provider`, which gates on effective `context.engine` using read-only config under explicit home.
+- ACTIVATION REQUIREMENT: configure both `plugins.enabled: [task-context]` (alongside other enabled plugins) and `context.engine: task-context`. General bundled discovery registers the engine and its `read_task_contract` hook; engine selection clones the registered engine for each agent. Neither setting alone activates both surfaces. No loader widening is required.
+- REQUEST IDENTITY REQUIREMENT: the candidate host's `selection_metadata` exact object-to-source mapping restores `message_uid`/constituent occurrence IDs to selection-hook copies, including the current request row. Provider-bound copies remain stripped before and after selection. The plugin uses this supported handoff for conditional resume restoration, never newest-text, row-position or time heuristics; missing identity still warns and leaves the request unchanged.
+- Lifecycle start must carry real agent_context to prevent child migration; `on_input` also enforces it. Existing boundary_reason='compression'/old_session_id/session_db support suffices for rotation. `bind_session_state` supplies actual read-only SessionDB for import and persisted parent lineage. New/reset IDs do not inherit; branches inherit isolated snapshots and compression children alias one conversation authority (CAS prevents loss of an in-flight parent judge). Native startup also recognizes persisted `model_config._branched_from == parent_session_id`; an ancestor-valued inherited marker does not define a new branch, and an immediate `_delegate_from` edge is excluded. Same-ID rewind retains canonical state and receipts as approved baseline parity; missing history is not a task rollback.
+- Branch reconstruction is plugin-local: copied occurrence IDs or uniquely linked message/absorbed UIDs identify a complete parent input prefix. Stored decisions replay from the import anchor with original task IDs; a durable boundary receipt prevents later re-import from following the live parent. No extra generic host hook is required for those paths. The patched generic branch-copy boundaries preserve `display_kind`, `display_metadata` (including constituent input IDs), and message identity on TUI/Desktop `_persist_branch`, CLI `_BRANCH_COPY_KEYS`, and gateway `_branch_row` (with tool UIDs). Modern copies therefore retain the occurrence witness before later parent UID merges. Historical UID-only copies linked to several inputs remain version-ambiguous and return a degraded provider error instead of guessing. The compatibility fixture explicitly strips source metadata to test that historical path. Identity-free legacy/empty copies retain current obligations with an explicit `no_identity_conservative` receipt, not a claimed historical cutoff.
+
+- Narrow legacy availability: unmatched UID-only branches can inherit the nonempty pre-journal legacy anchor with an empty input prefix and `pre_journal_anchor` receipt only if no copied occurrence IDs exist, all journal decisions are published, and every human input has a UID link absent from the copy. Unlinked/unpublished human inputs and missing/empty/later anchors remain degraded. This excludes later journal work without inventing a precise pre-cutover boundary: the retained legacy snapshot may contain later pre-cutover parent changes. The anchor, original IDs and boundary evidence round-trip through export; no new host interface is required.
+
+Existing subclass coupling: native ContextCompressor init/update_model/compress/lifecycle, valid summary detection, summary prefix/end marker and native token estimator. No host consumer imports the plugin implementation. Auxiliary classifier uses `agent.auxiliary_client.call_llm(task='task_intent', main_runtime=..., temperature=0)` under explicit profile scope and an outer bounded deadline; config remains task_intents.relationship_judge.

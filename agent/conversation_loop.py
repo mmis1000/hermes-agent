@@ -353,7 +353,13 @@ def _apply_active_turn_redirect(agent: Any, messages: List[Dict[str, Any]], text
             placeholder["api_content"] = _INTERRUPTED_PLACEHOLDER
         append_message(messages, placeholder)
     # Transcript shows the user's own words; the provider replays the scaffolded form.
-    append_message(messages, {"role": "user", "content": text, "api_content": correction})
+    row: Dict[str, Any] = {"role": "user", "content": str(text), "api_content": correction}
+    records = getattr(text, "input_provenance", None)
+    if records:
+        row["display_metadata"] = {"input_provenance": records}
+    append_message(messages, row)
+    from agent.input_provenance import notify_input
+    notify_input(agent, row)
 
     # Stateful scrubber for <memory-context> spans split across stream deltas (#5719).  sanitize_context()
     # alone can't survive chunk boundaries because the block regex needs both tags in one string.
@@ -1281,6 +1287,7 @@ def _engine_overrides_hook(engine: Any, name: str) -> bool:
 def _apply_context_engine_selection(
     agent: Any, api_messages: List[Dict[str, Any]], conversation_messages: List[Dict[str, Any]],
     incoming_message: Optional[Dict[str, Any]], *, logger: Any,
+    selection_metadata: Optional[Dict[int, Dict[str, Any]]] = None,
 ) -> List[Dict[str, Any]]:
     """Run the optional per-turn ``ContextEngine.select_context()`` hook, fail-open: any
     exception or invalid return yields ``api_messages`` unchanged; history is never mutated."""
@@ -1292,8 +1299,12 @@ def _apply_context_engine_selection(
     # Structural clones: the engine must not be able to write through nested
     # containers into persisted history; only the request list is acted on (#80498).
     try:
+        hook_messages = (
+            [_clone_message_for_send({**m, **selection_metadata.get(id(m), {})}) for m in api_messages]
+            if selection_metadata is not None else api_messages
+        )
         selected = engine.select_context(
-            api_messages,
+            hook_messages,
             conversation_messages=(
                 [_clone_message_for_send(m) for m in conversation_messages]
                 if conversation_messages is not None else None

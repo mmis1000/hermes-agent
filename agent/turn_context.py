@@ -1038,6 +1038,7 @@ def build_turn_context(
     _publish_runtime_main(agent)
     _refresh_mcp_tools_between_turns(agent)
 
+    incoming_provenance = getattr(user_message, "input_provenance", None)
     if isinstance(user_message, str):
         user_message = sanitize_surrogates(user_message)
     if isinstance(persist_user_message, str):
@@ -1072,6 +1073,10 @@ def build_turn_context(
         agent, user_message, persist_user_message, persist_user_timestamp,
         persist_user_platform_id, persist_user_display_kind, persist_user_display_metadata,
     )
+    from agent.input_provenance import prepare_local_input, notify_input
+    if incoming_provenance:
+        user_msg.setdefault("display_metadata", {})["input_provenance"] = incoming_provenance
+    prepare_local_input(agent, user_msg, persist_user_message if persist_user_message is not None else user_message)
     _hydrate_from_history(agent, conversation_history)
     # Every estimator this turn prices images at the cost learned from this model's real usage.
     bind_image_token_cost(agent)
@@ -1123,6 +1128,7 @@ def build_turn_context(
     ):
         agent._flush_messages_to_session_db(conversation_history, conversation_history)
 
+    notify_input(agent, user_msg)
     compaction = run_turn_start_compaction(
         agent, messages=messages, system_message=system_message,
         active_system_prompt=active_system_prompt, conversation_history=conversation_history,
@@ -1198,6 +1204,7 @@ def _sanitize_model_for(agent: Any, moa_config: Any) -> Any:
 def build_api_messages(
     agent: Any, messages: List[Dict[str, Any]], *, current_turn_user_idx: Any,
     ext_prefetch_cache: Any, plugin_user_context: Any, moa_config: Any, active_system_prompt: Any,
+    selection_metadata: Optional[Dict[int, Dict[str, Any]]] = None,
 ) -> Tuple[List[Dict[str, Any]], str]:
     """Build the wire copy of ``messages`` for one API call plus the effective system
     message. Returns ``(api_messages, effective_system)``.
@@ -1290,6 +1297,11 @@ def build_api_messages(
         # 'reasoning_details' is kept here; the chat-completions transport drops it on the
         # wire for every route that does not replay it (OpenRouter/Nous do).
         api_messages.append(api_msg)
+        if selection_metadata is not None:
+            # Keep an exact object-to-source link, out of every provider-bound
+            # copy (including MoA reference calls before engine selection).
+            selection_metadata[id(api_msg)] = _clone_message_for_send(
+                {k: v for k, v in msg.items() if k in PERSISTENCE_ONLY_MESSAGE_FIELDS})
 
     # Final system message = cached prompt + ephemeral additions (API-time only).
     # Plugin/recall context goes into the user message, never the system prompt: the

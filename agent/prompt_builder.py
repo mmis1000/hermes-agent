@@ -572,8 +572,13 @@ def steer_user_row(steer_text: str) -> Dict[str, Any]:
     result). Its own row — never smeared onto the already-persisted tool row, which append-only
     persistence would leave divergent from the live request — and typed so the alternation repair
     never merges the next real prompt into it and history renderers can label it."""
-    return {"role": "user", "content": format_steer_marker(steer_text).lstrip(),
-            "display_kind": STEER_DISPLAY_KIND}
+    row: Dict[str, Any] = {"role": "user", "content": format_steer_marker(steer_text).lstrip(),
+           "display_kind": STEER_DISPLAY_KIND}
+    records = getattr(steer_text, "input_provenance", None)
+    if records:
+        from copy import deepcopy
+        row["display_metadata"] = {"input_provenance": deepcopy(records)}
+    return row
 
 
 STEER_CHANNEL_NOTE = (

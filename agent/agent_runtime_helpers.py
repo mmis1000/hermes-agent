@@ -3545,7 +3545,10 @@ def apply_pending_steer_to_tool_results(agent, messages: list, num_tool_msgs: in
         # user message (which persists like any other user turn).
         requeue_steer_envelopes(agent, steer_envelopes)
         return
-    messages.append(steer_user_row(steer_text))
+    row = steer_user_row(steer_text)
+    messages.append(row)
+    from agent.input_provenance import notify_input
+    notify_input(agent, row)
     ack_steer_envelopes(steer_envelopes, "injected")
     _ra().logger.info(
         "Delivered /steer to agent after tool batch (%d chars) as new user message: %s", len(steer_text),

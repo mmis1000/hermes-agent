@@ -98,8 +98,16 @@ class MessageEvent:
     # Run-owned final presentation snapshot; never deserialized from ingress metadata.
     _notification_reply_muted: Optional[bool] = field(default=None, init=False, repr=False, compare=False)
 
+    _input_provenance: Optional[list] = field(default=None, repr=False, compare=False)
+
+    def __post_init__(self):
+        from agent.input_provenance import event_inputs
+        event_inputs(self)
+
     def absorb_reply_expected(self, other: "MessageEvent") -> None:
         """One turn now answers *other* too: an addressed message wins, then an unknown one."""
+        from agent.input_provenance import merge_event_inputs
+        merge_event_inputs(self, other)
         if self.reply_expected is not True and other.reply_expected is not False:
             self.reply_expected = other.reply_expected
 

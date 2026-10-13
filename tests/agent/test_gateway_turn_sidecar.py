@@ -115,6 +115,27 @@ def _build(agent, **overrides):
     return build_turn_context(**kwargs)
 
 
+def test_input_admission_precedes_preflight_and_survives_text_sanitization(monkeypatch):
+    from agent.input_provenance import InputText, input_record
+    from agent import turn_context_compaction
+    agent = _FakeAgent()
+    records = [input_record("  Raw Ω  ", source_kind="human")]
+    seen = []
+    agent.context_compressor.on_input = lambda message, **kw: seen.append((message, kw))
+    real_preflight = turn_context_compaction.run_turn_start_compaction
+
+    def preflight(*args, **kwargs):
+        assert len(seen) == 1
+        assert seen[0][0]["display_metadata"]["input_provenance"] == records
+        assert seen[0][1]["agent_context"] == "primary"
+        return real_preflight(*args, **kwargs)
+
+    monkeypatch.setattr(turn_context_compaction, "run_turn_start_compaction", preflight)
+    with patch("hermes_cli.plugins.invoke_hook", return_value=[]):
+        ctx = _build(agent, user_message=InputText("wrapper", records), sanitize_surrogates=lambda s: str(s))
+    assert ctx.messages[ctx.current_turn_user_idx]["display_metadata"]["input_provenance"] == records
+
+
 @pytest.fixture(autouse=True)
 def _stub_runtime_main():
     with patch("agent.auxiliary_client.set_runtime_main", lambda *a, **k: None):

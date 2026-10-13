@@ -1,0 +1,4 @@
+name: task-context
+version: 0.1.0
+description: Exact human task contracts retained across native context compression
+platforms: [linux]

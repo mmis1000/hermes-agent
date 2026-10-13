@@ -246,6 +246,7 @@ SCHEMA_HISTORY: dict[str, _TableHistory] = {
             ('+', 'tool_call_uids', 'absorbed_message_uids'),
             ('+', 'tool_call_uid', 'tool_call_uids'),
         )),
+        ('17 2026-07-21T20:20Z task-intent raw ingress', (('+', 'task_intent_metadata', 'tool_call_uid'),)),
         ),
     ),
     "session_model_usage": _TableHistory(

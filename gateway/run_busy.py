@@ -645,6 +645,9 @@ class GatewayBusySessionMixin:
         """Call ``running_agent.<verb>(text)`` (steer/redirect); False + warning on failure."""
         try:
             call_text = self._steer_text_with_origin(text, event) if event else text
+            if event is not None:
+                from agent.input_provenance import InputText, event_display_metadata
+                call_text = InputText(call_text, event_display_metadata(event)["input_provenance"])
             if verb == "steer":
                 return self._steer_running_agent(running_agent, call_text)
             return bool(getattr(running_agent, verb)(call_text))

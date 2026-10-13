@@ -470,7 +470,8 @@ CREATE TABLE IF NOT EXISTS messages (
     message_uid TEXT,
     absorbed_message_uids TEXT,
     tool_call_uids TEXT,
-    tool_call_uid TEXT
+    tool_call_uid TEXT,
+    task_intent_metadata TEXT
 );
 
 CREATE TABLE IF NOT EXISTS session_model_usage (

@@ -2039,6 +2039,21 @@ def _compressor_max_tokens(agent):
 
 
 def _build_context_engine(agent, _agent_cfg, cs, _custom_providers, _effective_context_length, session_db):
+    compressor_settings: Dict[str, Any] = dict(
+        model=agent.model, threshold_percent=cs.threshold, protect_first_n=cs.protect_first,
+        protect_last_n=cs.protect_last, summary_target_ratio=cs.target_ratio,
+        summary_model_override=None, quiet_mode=agent.quiet_mode, base_url=agent.base_url,
+        api_key=getattr(agent, "api_key", ""), config_context_length=_effective_context_length,
+        provider=agent.provider, api_mode=agent.api_mode,
+        abort_on_summary_failure=cs.abort_on_summary_failure,
+        max_tokens=_compressor_max_tokens(agent), model_thresholds=cs.model_thresholds,
+        threshold_tokens_cap=cs.threshold_tokens,
+        proactive_prune_tokens=cs.proactive_prune_tokens,
+        proactive_prune_min_result_chars=cs.proactive_prune_min_chars,
+        proactive_prune_min_reclaim_tokens=cs.proactive_prune_min_reclaim,
+        min_tail_user_messages=cs.min_tail_users, tail_mode=cs.tail_mode,
+        custom_providers=_custom_providers,
+    )
     _selected_engine = _select_context_engine(_agent_cfg)
     if _selected_engine is not None:
         agent.context_compressor = _selected_engine
@@ -2062,24 +2077,13 @@ def _build_context_engine(agent, _agent_cfg, cs, _custom_providers, _effective_c
             model=agent.model, context_length=_plugin_ctx_len, base_url=agent.base_url,
             api_key=getattr(agent, "api_key", ""), provider=agent.provider, api_mode=agent.api_mode,
         )
+        configure = getattr(agent.context_compressor, "configure_compressor", None)
+        if callable(configure):
+            configure(**compressor_settings)
         if not agent.quiet_mode:
             _ra().logger.info("Using context engine: %s", _selected_engine.name)
     else:
-        agent.context_compressor = ContextCompressor(
-            model=agent.model, threshold_percent=cs.threshold, protect_first_n=cs.protect_first,
-            protect_last_n=cs.protect_last, summary_target_ratio=cs.target_ratio,
-            summary_model_override=None, quiet_mode=agent.quiet_mode, base_url=agent.base_url,
-            api_key=getattr(agent, "api_key", ""), config_context_length=_effective_context_length,
-            provider=agent.provider, api_mode=agent.api_mode,
-            abort_on_summary_failure=cs.abort_on_summary_failure,
-            max_tokens=_compressor_max_tokens(agent), model_thresholds=cs.model_thresholds,
-            threshold_tokens_cap=cs.threshold_tokens,
-            proactive_prune_tokens=cs.proactive_prune_tokens,
-            proactive_prune_min_result_chars=cs.proactive_prune_min_chars,
-            proactive_prune_min_reclaim_tokens=cs.proactive_prune_min_reclaim,
-            min_tail_user_messages=cs.min_tail_users, tail_mode=cs.tail_mode,
-            custom_providers=_custom_providers,
-        )
+        agent.context_compressor = ContextCompressor(**compressor_settings)
     _bind_session_state = getattr(agent.context_compressor, "bind_session_state", None)
     if callable(_bind_session_state):
         with suppress(Exception):
@@ -2220,11 +2224,19 @@ def _inject_context_engine_tools(agent):
 
     if agent.context_compressor:
         try:
-            agent.context_compressor.on_session_start(
+            from agent.input_provenance import agent_input_context
+            import inspect
+            start = agent.context_compressor.on_session_start
+            params = inspect.signature(start).parameters
+            optional = {}
+            if "agent_context" in params or any(p.kind == p.VAR_KEYWORD for p in params.values()):
+                optional["agent_context"] = agent_input_context(agent)["agent_context"]
+            start(
                 agent.session_id, hermes_home=str(get_hermes_home()),
                 platform=agent.platform or "cli", model=agent.model,
                 context_length=getattr(agent.context_compressor, "context_length", 0),
                 conversation_id=getattr(agent, "_gateway_session_key", None),
+                **optional,
             )
         except Exception as _ce_err:
             _ra().logger.debug("Context engine on_session_start: %s", _ce_err)

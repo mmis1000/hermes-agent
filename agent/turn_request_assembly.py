@@ -113,14 +113,15 @@ def assemble_api_request(
     user merge and surrogate stripping, so the same row's bytes never vary across turns."""
     from agent.conversation_loop import (
         _CODEX_INCOMPLETE_NUDGE, _apply_context_engine_selection, _canonicalize_api_tool_calls,
-        _clone_message_for_send, _midturn_request_pressure_tokens, _pressure_with_real_floor,
+        _clone_message_for_send, _midturn_request_pressure_tokens, _pressure_with_real_floor, _engine_overrides_hook,
     )
     from agent.model_metadata import estimate_messages_tokens_rough
 
+    selection_metadata = {} if _engine_overrides_hook(getattr(agent, "context_compressor", None), "select_context") else None
     api_messages, effective_system = build_api_messages(
         agent, messages, current_turn_user_idx=current_turn_user_idx,
         ext_prefetch_cache=_ext_prefetch_cache, plugin_user_context=_plugin_user_context,
-        moa_config=moa_config, active_system_prompt=active_system_prompt,
+        moa_config=moa_config, active_system_prompt=active_system_prompt, selection_metadata=selection_metadata,
     )
 
     if moa_config:
@@ -140,7 +141,7 @@ def assemble_api_request(
         messages[current_turn_user_idx] if 0 <= current_turn_user_idx < len(messages) else None
     )
     api_messages = _apply_context_engine_selection(
-        agent, api_messages, messages, _sel_incoming, logger=request_logger
+        agent, api_messages, messages, _sel_incoming, logger=request_logger, selection_metadata=selection_metadata
     )
 
     # Runs unconditionally (not gated on context_compressor) so orphaned tool

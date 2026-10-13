@@ -121,6 +121,19 @@ def record_absorbed_message(
     A dict without a uid (unflushed, scaffolding, engine-authored) contributes nothing; an empty result
     leaves the survivor untouched.
     """
+    from copy import deepcopy
+    first, second = (dropped, survivor) if dropped_leads else (survivor, dropped)
+    records = []
+    seen = set()
+    for row in (first, second):
+        for record in (row.get("display_metadata") or {}).get("input_provenance", []):
+            if record.get("occurrence_id") not in seen:
+                seen.add(record.get("occurrence_id"))
+                records.append(deepcopy(record))
+    if records:
+        metadata = dict(survivor.get("display_metadata") or {})
+        metadata["input_provenance"] = records
+        survivor["display_metadata"] = metadata
     survivor_uid = message_uid_or_none(survivor)
     dropped_uid = message_uid_or_none(dropped)
     own = uid_list(survivor.get(ABSORBED_MESSAGE_UIDS))

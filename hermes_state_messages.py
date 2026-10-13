@@ -33,8 +33,8 @@ _INSERT_MESSAGE_SQL = """INSERT INTO messages (session_id, role, content, tool_c
                    reasoning, reasoning_content, reasoning_details, codex_reasoning_items,
                    codex_message_items, platform_message_id, observed, _compressed_summary, active, api_content, display_kind,
                    display_metadata, display_identity, message_uid, absorbed_message_uids, tool_call_uids,
-                   tool_call_uid)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"""
+                   tool_call_uid, task_intent_metadata)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"""
 # Every column this module knows how to read: the ones it writes plus the three SQLite/compaction
 # owns. `_row_to_message_dict` drops raw bytes ONLY outside this set — a schema column keeps its
 # key (and its typed decoder) even when a row holds a BLOB, so no reader ever loses msg["content"].
@@ -283,7 +283,8 @@ class SessionMessagesMixin:
             _str_or_none(msg.get("api_content")), _str_or_none(msg.get("display_kind")),
             display_metadata, self._display_identity(self._display_dedupe_key(identity_row)),
             message_uid_or_none(msg), _absorbed_uids_json(msg),
-            _tool_call_uids_json(msg), _tool_call_uid_or_none(msg))
+            _tool_call_uids_json(msg), _tool_call_uid_or_none(msg),
+            _scrub_surrogates(json.dumps(msg.get("_task_intent") or msg.get("task_intent_metadata"), ensure_ascii=False)) if isinstance(msg.get("_task_intent") or msg.get("task_intent_metadata"), dict) else None)
 
     @staticmethod
     def _stamp_tool_call_uids(msg: Dict[str, Any], tool_calls: Any, batch_index: Dict[str, str]) -> None:
@@ -349,6 +350,13 @@ class SessionMessagesMixin:
             msg["api_content"] = row["api_content"]
         if row["display_kind"] is not None:
             msg["display_kind"] = row["display_kind"]
+        if row["task_intent_metadata"]:
+            try:
+                sidecar = json.loads(row["task_intent_metadata"])
+                if isinstance(sidecar, dict):
+                    msg["_task_intent"] = sidecar
+            except (json.JSONDecodeError, TypeError):
+                logger.warning("Failed to deserialize task_intent_metadata; ignoring sidecar")
         if row["display_metadata"] is not None:
             metadata = self._decode_display_metadata(row["display_metadata"])
             if metadata is not None:
@@ -386,7 +394,7 @@ class SessionMessagesMixin:
         api_content: Optional[str] = None, display_kind: Optional[str] = None,
         display_metadata: Optional[Dict[str, Any]] = None, compression_lock_holder: Optional[str] = None,
         turn_lease_holder: Optional[str] = None, turn_lease_ttl_seconds: float = 300.0,
-        message_uid: Optional[str] = None) -> int:
+        message_uid: Optional[str] = None, task_intent_metadata: Optional[Dict[str, Any]] = None) -> int:
         """Append one message; returns the row id and bumps the session counters. ``platform_message_id``:
         the platform's own id. ``api_content``: byte-fidelity sidecar, the exact string sent to the API when
         it differed from ``content``, stored as sent except lone surrogates. ``message_uid``: the id a caller
@@ -1666,6 +1674,10 @@ class SessionMessagesMixin:
             # (ACP, gateway, CLI, TUI, compression adoption), never opt-in like ``_row_id``.
             _restore_identity_columns(row, msg)
             msg.update((col, row[col]) for col in ("api_content", "display_kind") if row[col])
+            if row["task_intent_metadata"]:
+                sidecar = _json_or(row["task_intent_metadata"], None, "Invalid task intent sidecar")
+                if isinstance(sidecar, dict):
+                    msg["_task_intent"] = sidecar
             if row["display_metadata"] and (decoded := self._decode_display_metadata(row["display_metadata"])) is not None:
                 msg["display_metadata"] = decoded
             if include_summary_markers and row["_compressed_summary"]:
